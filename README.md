@@ -128,13 +128,13 @@ Prompt → Hook binding → Task Contract → FORK
 MERGE → Context Assembly → Agent Execution → Writeback → Audit → Answer
 ```
 
-![EP 5.1 data-rich flow evidence](docs/assets/ep51-flow-data-zh.png)
+![EP 5.1 data-rich flow evidence](docs/assets/ep51-flow-data-en.png)
 
 This is a real localized console capture, not a synthetic benchmark. It shows
 large indexed-memory counts, route branches, context decisions, and the visible
 distinction between waiting, observed, delivered, and unknown answer-use states.
 
-![EP 5.1 receipt detail evidence](docs/assets/ep51-receipt-detail-zh.png)
+![EP 5.1 receipt detail evidence](docs/assets/ep51-receipt-detail-en.png)
 
 Clicking a node exposes relevance floor, memory plane, returned/excluded counts,
 relevance bands, filtering reasons, policy version, and source-readback state.
