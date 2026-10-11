@@ -12,6 +12,78 @@ from unittest.mock import patch
 
 
 class McpToolActivityTests(unittest.TestCase):
+    def test_user_return_body_preview_is_kept_without_claiming_host_delivery(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(self.module, 'project_tool_review', return_value={'status':'disabled'}):
+            self._invoke_reply(home,'user_recall',{}, {'content':[{'type':'text','text':json.dumps({'memories':[{'id':'m1','text':'这次真实返回的候选正文'}], 'delivery':{'host_visibility':'unknown','answer_use':'not_measured'}})}]})
+            event=json.loads((Path(home)/'.evolving-profile/audit/mcp-tool-activity.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(event['mapping_items'][0]['id'],'m1')
+        self.assertEqual(event['mapping_items'][0]['text'],'这次真实返回的候选正文')
+        self.assertEqual(event['delivery']['host_visibility'],'unknown')
+
+    def test_preference_preview_preserves_returned_conditions_and_not_deferred_units(self):
+        value={'included':[{'id':'p1','text':'偏好正文','applies_when':['页面交付'],'exceptions':['纯文本不适用']}],
+               'stable_profile':[{'id':'stable','text':'稳定参考'}],
+               'deferred':[{'id':'later','text':'未返回正文'}]}
+        items=self.module._process_mapping_items(value)
+        self.assertEqual([item['id'] for item in items],['p1','stable'])
+        self.assertEqual(items[0]['applies_when'],['页面交付'])
+        self.assertEqual(items[0]['exceptions'],['纯文本不适用'])
+
+    def test_returned_source_navigation_stays_separate_from_body_and_delivery(self):
+        navigation = {'memory_id':'nav','document_id':'doc','chunk_id':'chunk','source_revision':'revision',
+            'subject_relation':'unverified','claim_verification':'not_performed','authority':'unverified_source_claim',
+            'next_action':{'tool':'read_source','arguments':{'memory_id':'nav','scope':'chunk'}}}
+        with tempfile.TemporaryDirectory() as home, patch.object(self.module, 'project_tool_review', return_value={'status':'disabled'}):
+            result = {'content':[{'type':'text','text':json.dumps({'memories':[],
+                'source_navigation':[navigation],'source_navigation_reference_count':191,'source_navigation_returned_count':1,
+                'delivery':{'host_visibility':'unknown','answer_use':'not_measured'}})}]}
+            self._invoke_reply(home, 'user_recall', {}, result)
+            event = json.loads((Path(home)/'.evolving-profile/audit/mcp-tool-activity.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(event['returned_count'], 0)
+        self.assertEqual(event['memory_ids'], [])
+        self.assertEqual(event['mapping_items'], [])
+        self.assertEqual(event['source_navigation_returned_count'], 1)
+        self.assertEqual(event['source_navigation_returned_ids'], ['nav'])
+        self.assertEqual(event['source_navigation'], [navigation])
+        self.assertEqual(event['delivery'], {'host_visibility':'unknown','answer_use':'not_measured'})
+        route = self.module._route_receipt_counts({'tool_events':[event]})
+        self.assertEqual(route['delivery_state'], 'source_navigation_returned')
+        self.assertEqual(route['returned_count'], 0)
+        self.assertEqual(route['source_navigation_returned_count'], 1)
+
+    def test_agent_activity_keeps_query_and_workspace_for_pool_deduplication(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(self.module, 'project_tool_review', return_value={'status': 'disabled'}):
+            result = {'content': [{'type': 'text', 'text': json.dumps({'source': 'agent_process_memory',
+                'workspace_id': 'shared-pool', 'candidate_count': 144, 'returned_count': 1, 'records': []})}]}
+            self._invoke_reply(home, 'agent_recall', {'query': '同一个历史查询'}, result)
+            event = json.loads((Path(home) / '.evolving-profile/audit/mcp-tool-activity.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(event['workspace_id'], 'shared-pool')
+        self.assertEqual(event['query'], '同一个历史查询')
+
+    def test_process_candidates_are_available_in_receipt_preview_without_fake_delivery(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(self.module, 'project_tool_review', return_value={'status': 'disabled'}):
+            result = {'content': [{'type': 'text', 'text': json.dumps({'source': 'agent_process_memory', 'records': [
+                {'process_memory_id': 'pm_trace_test', 'text': '实际候选正文', 'readback_tool': 'read_agent_process_memory'}], 'returned_count': 1, 'candidate_count': 80})}]}
+            self._invoke_reply(home, 'agent_recall', {}, result)
+            event = json.loads((Path(home) / '.evolving-profile/audit/mcp-tool-activity.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(event['mapping_items'][0]['text'], '实际候选正文')
+        self.assertEqual(event['mapping_items'][0]['id'], 'pm_trace_test')
+        self.assertNotEqual(event.get('delivery', {}).get('host_visibility'), 'observed')
+
+    def test_process_read_reply_reports_record_and_original_message_counts_separately(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(self.module, 'project_tool_review', return_value={'status': 'disabled'}):
+            payload = self._invoke_reply(home, 'read_agent_process_memory', {}, {'content': [{'type': 'text', 'text': json.dumps({
+                'record': {'process_memory_id': 'pm_trace_test'}, 'source': 'agent_process_memory',
+                'raw_source': {'text': 'original messages'}, 'raw_source_status': 'source_read',
+            })}]})
+        value = json.loads(payload['content'][0]['text'])
+        self.assertEqual(value['returned_count'], 1)
+        self.assertEqual(value['original_message_readback_count'], 1)
+
+    def test_agent_result_count_reads_records_instead_of_reporting_zero(self):
+        self.assertEqual(self.module._returned_count({"returned_count": 6, "records": [{"process_memory_id": "p"}]}, "agent_recall"), 6)
+        self.assertEqual(self.module._returned_count({"record": {"process_memory_id": "p"}}, "read_agent_process_memory"), 1)
+
     @classmethod
     def setUpClass(cls):
         cls.module = importlib.import_module('evolving_profile_controller_mcp')
@@ -44,6 +116,16 @@ class McpToolActivityTests(unittest.TestCase):
         value = json.loads(payload['content'][0]['text'])
         digest = hashlib.sha256(Path(self.module.__file__).read_bytes()).hexdigest()
         self.assertEqual(value.get('adapter_build_sha256'), digest)
+
+    def test_internal_judge_receipt_is_delivered_and_recorded_without_deleting_candidates(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(self.module, 'project_tool_review', return_value={'status': 'ok', 'mode': 'assist', 'answers': {'evidence': {'choice': 'needs_source'}}, 'calls': 1}):
+            result = {'content': [{'type': 'text', 'text': json.dumps({'memories': [{'id': 'm1', 'text': 'unchanged candidate'}], 'returned_count': 1})}]}
+            payload = self._invoke_reply(home, 'user_recall', {}, result)
+            value = json.loads(payload['content'][0]['text'])
+            event = json.loads((Path(home) / '.evolving-profile/audit/mcp-tool-activity.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(value['memories'], [{'id': 'm1', 'text': 'unchanged candidate'}])
+        self.assertEqual(value['jev_review']['answers']['evidence']['choice'], 'needs_source')
+        self.assertEqual(event['jev_review']['calls'], 1)
 
     def test_scenario_read_reports_summary_count_not_original_source_reads(self):
         with tempfile.TemporaryDirectory() as home:

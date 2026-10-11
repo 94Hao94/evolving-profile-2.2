@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { useLocale } from "next-intl";
+import { createContext, useContext, useCallback, useEffect, useState, type ReactNode } from "react";
+import { useLocale, useTranslations } from "next-intl";
 import {
   Activity,
   Bot,
@@ -15,7 +15,14 @@ import {
   ShieldCheck,
 } from "lucide-react";
 
-import { inlineUiText } from "@/lib/inline-i18n";
+import { inlineUiText, enumUiText } from "@/lib/inline-i18n";
+import { configurationSaveFeedback } from "@/lib/configuration-save-feedback";
+import { ActionButton, FeedbackButton } from "@/components/ui/action-button";
+import { useActionFeedback } from "@/lib/action-feedback";
+import { JEV_BASE_URL, JEV_MODEL, JEV_SCOPE_DEFAULTS } from "@/lib/jev-provider";
+import { RecallPolicySettings, updateRecallPolicy, RagMinimumRelevanceField, updateRagMinimumRelevance } from "./recall-policy-settings";
+import { normalizeRecallPolicy } from "@/lib/recall-policy";
+import { modelIdentityMatches } from "@/lib/retrieval-model-identity";
 type Section = "runtime" | "memory" | "models" | "rag" | "providers" | "scenario" | "backup";
 
 type RuntimeState = any;
@@ -60,10 +67,13 @@ export function RuntimeSectionsView({ section }: { section: Section }) {
     void load();
   }, [load]);
   if (!state)
-    return <div className="rounded-lg border p-6 text-sm text-muted-foreground">{english ? "Loading configuration…" : inlineUiText("正在读取配置…")}</div>;
+    return (
+      <div className="rounded-lg border p-6 text-sm text-muted-foreground">
+        {english ? "Loading configuration…" : inlineUiText("正在读取配置…")}
+      </div>
+    );
 
-  const save = async (event: FormEvent) => {
-    event.preventDefault();
+  const save = async () => {
     setMessage(null);
     const response = await fetch("/api/evolving-profile/runtime-settings", {
       method: "POST",
@@ -71,8 +81,25 @@ export function RuntimeSectionsView({ section }: { section: Section }) {
       body: JSON.stringify(state.runtimeSettings),
     });
     const body = await response.json();
-    setMessage(response.ok ? inlineUiText("配置已保存，新一轮入口生效") : body.error || inlineUiText("保存失败"));
-    if (response.ok) await load();
+    if (!response.ok || body.saved === false)
+      throw new Error(body.error || inlineUiText("保存失败"));
+    setMessage(inlineUiText("配置已保存，新一轮入口生效"));
+  };
+
+  const saveRecallPolicy = async () => {
+    const submitted = normalizeRecallPolicy(state.runtimeSettings.recall_policy);
+    setMessage(null);
+    const response = await fetch("/api/evolving-profile/runtime-settings", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ recall_policy: submitted }),
+    });
+    const body = await response.json();
+    if (!response.ok || body.saved === false) throw new Error(body.error || inlineUiText("保存失败"));
+    const saved = normalizeRecallPolicy(body.recall_policy ?? submitted);
+    setState((previous: RuntimeState) => {
+      if (!previous || JSON.stringify(normalizeRecallPolicy(previous.runtimeSettings.recall_policy)) !== JSON.stringify(submitted)) return previous;
+      return { ...previous, runtimeSettings: { ...previous.runtimeSettings, recall_policy: saved } };
+    });
+    setMessage(inlineUiText("配置已保存，新一轮入口生效"));
   };
 
   const updateModule = (name: string, action: string, checked: boolean) =>
@@ -82,7 +109,11 @@ export function RuntimeSectionsView({ section }: { section: Section }) {
         ...state.runtimeSettings,
         modules: {
           ...state.runtimeSettings.modules,
-          [name]: { ...state.runtimeSettings.modules[name], [action]: checked, ...(action === "retrieve" && !checked ? { inject: false } : {}) },
+          [name]: {
+            ...state.runtimeSettings.modules[name],
+            [action]: checked,
+            ...(action === "retrieve" && !checked ? { inject: false } : {}),
+          },
         },
       },
     });
@@ -90,8 +121,11 @@ export function RuntimeSectionsView({ section }: { section: Section }) {
     setDirectoryMessage(inlineUiText("正在打开系统目录选择器…"));
     const response = await fetch("/api/evolving-profile/select-directory", { method: "POST" });
     const body = await response.json();
-    if (body.canceled) return setDirectoryMessage(inlineUiText("已取消选择"));
-    if (!response.ok) return setDirectoryMessage(body.error || inlineUiText("目录选择失败"));
+    if (body.canceled) {
+      setDirectoryMessage(inlineUiText("已取消选择"));
+      return false;
+    }
+    if (!response.ok || !body.path) throw new Error(body.error || inlineUiText("目录选择失败"));
     setState({
       ...state,
       runtimeSettings: {
@@ -103,20 +137,126 @@ export function RuntimeSectionsView({ section }: { section: Section }) {
     setDirectoryMessage(inlineUiText("目录已选择，请保存配置"));
   };
 
-  if (section === "runtime") return <RuntimeOverview state={state} />;
+  if (section === "runtime") return <div className="space-y-6"><RuntimeOverview state={state} /><RecallPolicySettings value={state.runtimeSettings.recall_policy} onChange={(patch) => setState((previous: RuntimeState) => ({ ...previous, runtimeSettings: updateRecallPolicy(previous.runtimeSettings, patch) }))} onSave={saveRecallPolicy} /></div>;
   if (section === "memory") {
-    const userModules = Object.entries(state.runtimeSettings.modules).filter(([name]) => !name.startsWith("agent_process_"));
-    const agentSettings = state.runtimeSettings.modules.agent_process_memory ?? { record: true, retrieve: true, inject: true };
-    const agentDimensions = Object.entries(state.runtimeSettings.modules).filter(([name]) => name.startsWith("agent_process_") && name !== "agent_process_memory");
-    const moduleCard = ([name, settings]: [string, any]) => <div className="rounded-lg border p-4" key={name}><div className="font-medium">{moduleLabels[name] ?? name}</div><div className="mt-3 flex flex-wrap gap-3 text-xs">{(["record", "retrieve", "inject"] as const).map((action) => <label key={action} className={action === "inject" && !settings.retrieve ? "text-muted-foreground" : undefined}><input type="checkbox" checked={Boolean(settings[action])} disabled={action === "inject" && !settings.retrieve} onChange={(e) => updateModule(name, action, e.target.checked)} /> {action === "record" ? inlineUiText("记录") : action === "retrieve" ? inlineUiText("检索") : inlineUiText("注入")}</label>)}</div>{name.startsWith("agent_process_") && name !== "agent_process_memory" && !settings.record && <p className="mt-2 text-[11px] text-amber-700">{inlineUiText("已关闭记录：不会产生新的该类过程记忆，已有数据不会删除。")}</p>}</div>;
-    return <section className="space-y-5"><form onSubmit={save} className="space-y-5">
-      <SectionHeading icon={<Database className="h-4 w-4" />} title={english ? "User memory" : inlineUiText("用户记忆")} description={english ? "Runtime switches for facts, experiences, entities, preferences, scenario summaries, and source readback." : inlineUiText("事实、经历、实体、偏好、情景摘要和原文回读的运行开关。")} message={message} />
-      <div className="grid gap-3 md:grid-cols-2">{userModules.map((entry) => moduleCard(entry as [string, any]))}</div>
-      <BudgetFields state={state} setState={setState} />
-      <SaveButton />
-    </form>
-    <form onSubmit={save} className="rounded-lg border p-5"><SectionHeading icon={<Bot className="h-4 w-4" />} title={inlineUiText("智能体记忆")} description={inlineUiText("总控下按原始轨迹、失败事件、修复模式、能力观测、过程策略和再验证分别控制记录、检索与注入；关闭不会删除已有数据。")} message={message} /><div className="rounded-lg border p-4">{moduleCard(["agent_process_memory", agentSettings])}</div><div className="mt-3 grid gap-3 md:grid-cols-2">{agentDimensions.map((entry) => <div key={entry[0]}>{moduleCard(entry as [string, any])}</div>)}</div><div className="mt-3 rounded border bg-muted/30 p-3 text-xs text-muted-foreground">{inlineUiText("依赖提示：原始轨迹和过程观察是失败事件的来源；失败事件支撑修复模式；修复模式与验证结果支撑可复用过程策略。关闭上游记录不会删除下游历史，但会停止新增派生记录。")}</div><div className="mt-4 grid grid-cols-2 gap-2 text-sm"><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("过程记录")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.record_count ?? 0}</div></div><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("失败事件")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.by_kind?.episode ?? 0}</div></div><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("修复模式")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.by_kind?.pattern ?? 0}</div></div><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("可复用过程策略")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.by_kind?.skill ?? 0}</div></div></div><div className="mt-4"><SaveButton /></div></form>
-    </section>;
+    const userModules = Object.entries(state.runtimeSettings.modules).filter(
+      ([name]) => !name.startsWith("agent_process_")
+    );
+    const agentSettings = state.runtimeSettings.modules.agent_process_memory ?? {
+      record: true,
+      retrieve: true,
+      inject: true,
+    };
+    const agentDimensions = Object.entries(state.runtimeSettings.modules).filter(
+      ([name]) => name.startsWith("agent_process_") && name !== "agent_process_memory"
+    );
+    const moduleCard = ([name, settings]: [string, any]) => (
+      <div className="rounded-lg border p-4" key={name}>
+        <div className="font-medium">{moduleLabels[name] ?? name}</div>
+        <div className="mt-3 flex flex-wrap gap-3 text-xs">
+          {(["record", "retrieve", "inject"] as const).map((action) => (
+            <label
+              key={action}
+              className={
+                action === "inject" && !settings.retrieve ? "text-muted-foreground" : undefined
+              }
+            >
+              <input
+                type="checkbox"
+                checked={Boolean(settings[action])}
+                disabled={action === "inject" && !settings.retrieve}
+                onChange={(e) => updateModule(name, action, e.target.checked)}
+              />{" "}
+              {action === "record"
+                ? inlineUiText("记录")
+                : action === "retrieve"
+                  ? inlineUiText("检索")
+                  : inlineUiText("注入")}
+            </label>
+          ))}
+        </div>
+        {name.startsWith("agent_process_") &&
+          name !== "agent_process_memory" &&
+          !settings.record && (
+            <p className="mt-2 text-[11px] text-amber-700">
+              {inlineUiText("已关闭记录：不会产生新的该类过程记忆，已有数据不会删除。")}
+            </p>
+          )}
+      </div>
+    );
+    return (
+      <section className="space-y-5">
+        <ConfigSaveForm onSave={save} className="space-y-5">
+          <SectionHeading
+            icon={<Database className="h-4 w-4" />}
+            title={english ? "User memory" : inlineUiText("用户记忆")}
+            description={
+              english
+                ? "Runtime switches for facts, experiences, entities, preferences, scenario summaries, and source readback."
+                : inlineUiText("事实、经历、实体、偏好、情景摘要和原文回读的运行开关。")
+            }
+            message={message}
+          />
+          <div className="grid gap-3 md:grid-cols-2">
+            {userModules.map((entry) => moduleCard(entry as [string, any]))}
+          </div>
+          <BudgetFields state={state} setState={setState} />
+          <SaveButton />
+        </ConfigSaveForm>
+        <ConfigSaveForm onSave={save} className="rounded-lg border p-5">
+          <SectionHeading
+            icon={<Bot className="h-4 w-4" />}
+            title={inlineUiText("智能体记忆")}
+            description={inlineUiText(
+              "总控下按原始轨迹、失败事件、修复模式、能力观测、过程策略和再验证分别控制记录、检索与注入；关闭不会删除已有数据。"
+            )}
+            message={message}
+          />
+          <div className="rounded-lg border p-4">
+            {moduleCard(["agent_process_memory", agentSettings])}
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            {agentDimensions.map((entry) => (
+              <div key={entry[0]}>{moduleCard(entry as [string, any])}</div>
+            ))}
+          </div>
+          <div className="mt-3 rounded border bg-muted/30 p-3 text-xs text-muted-foreground">
+            {inlineUiText(
+              "依赖提示：原始轨迹和过程观察是失败事件的来源；失败事件支撑修复模式；修复模式与验证结果支撑可复用过程策略。关闭上游记录不会删除下游历史，但会停止新增派生记录。"
+            )}
+          </div>
+          <div className="mt-4 grid grid-cols-2 gap-2 text-sm">
+            <div className="rounded border p-3">
+              <div className="text-xs text-muted-foreground">{inlineUiText("过程记录")}</div>
+              <div className="mt-1 text-lg font-semibold">
+                {state.processMemory?.record_count ?? 0}
+              </div>
+            </div>
+            <div className="rounded border p-3">
+              <div className="text-xs text-muted-foreground">{inlineUiText("失败事件")}</div>
+              <div className="mt-1 text-lg font-semibold">
+                {state.processMemory?.by_kind?.episode ?? 0}
+              </div>
+            </div>
+            <div className="rounded border p-3">
+              <div className="text-xs text-muted-foreground">{inlineUiText("修复模式")}</div>
+              <div className="mt-1 text-lg font-semibold">
+                {state.processMemory?.by_kind?.pattern ?? 0}
+              </div>
+            </div>
+            <div className="rounded border p-3">
+              <div className="text-xs text-muted-foreground">{inlineUiText("可复用过程策略")}</div>
+              <div className="mt-1 text-lg font-semibold">
+                {state.processMemory?.by_kind?.skill ?? 0}
+              </div>
+            </div>
+          </div>
+          <div className="mt-4">
+            <SaveButton />
+          </div>
+        </ConfigSaveForm>
+      </section>
+    );
   }
   if (section === "models") return <RetrievalModelsPanel state={state} setState={setState} />;
   if (section === "rag")
@@ -143,9 +283,7 @@ export function RuntimeSectionsView({ section }: { section: Section }) {
           body: JSON.stringify(state.backup.settings),
         });
         const body = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(body.error || inlineUiText("备份设置保存失败"));
-        setMessage(inlineUiText("备份设置已保存并应用"));
-        await load();
+        setMessage(configurationSaveFeedback(response.ok, body, english ? "en" : "zh-CN"));
       }}
       message={message}
     />
@@ -162,7 +300,7 @@ function RagPanel({ state, setState, chooseDirectory, directoryMessage, onSave, 
     });
   const rerankReady = Boolean(models?.reranker?.enabled && models?.reranker?.model);
   return (
-    <form onSubmit={onSave} className="space-y-4">
+    <ConfigSaveForm onSave={onSave} className="space-y-4">
       <SectionHeading
         icon={<FolderOpen className="h-4 w-4" />}
         title={inlineUiText("外部 RAG")}
@@ -199,14 +337,15 @@ function RagPanel({ state, setState, chooseDirectory, directoryMessage, onSave, 
               value={rag.root_path}
               placeholder={inlineUiText("点击按钮选择目录")}
             />
-            <button
+            <ActionButton
               type="button"
-              onClick={() => void chooseDirectory()}
+              onAction={chooseDirectory}
+              variant="outline"
               className="inline-flex items-center gap-1 rounded border px-3 text-xs"
             >
               <FolderOpen className="h-3.5 w-3.5" />
               {inlineUiText("选择目录")}
-            </button>
+            </ActionButton>
           </div>
           {directoryMessage && (
             <span className="text-xs text-muted-foreground">{directoryMessage}</span>
@@ -249,6 +388,7 @@ function RagPanel({ state, setState, chooseDirectory, directoryMessage, onSave, 
         </label>
       </div>
       <div className="grid gap-3 rounded-lg border p-4 md:grid-cols-2">
+        <RagMinimumRelevanceField value={rag.minimum_relevance} onChange={(level) => setState((previous: RuntimeState) => ({ ...previous, runtimeSettings: updateRagMinimumRelevance(previous.runtimeSettings, level) }))} />
         <label className="space-y-1 text-xs">
           <span>{inlineUiText("绑定 Embedding 配置")}</span>
           <select
@@ -256,11 +396,13 @@ function RagPanel({ state, setState, chooseDirectory, directoryMessage, onSave, 
             value={rag.embedding_profile_id ?? models?.embedding?.profile_id}
             onChange={(e) => update("embedding_profile_id", e.target.value)}
           >
-            {(models?.embedding_profiles?.length ? models.embedding_profiles : [models?.embedding]).filter(Boolean).map((profile:any) => (
-              <option key={profile.profile_id} value={profile.profile_id}>
-                {profile.profile_id} · {profile.model}
-              </option>
-            ))}
+            {(models?.embedding_profiles?.length ? models.embedding_profiles : [models?.embedding])
+              .filter(Boolean)
+              .map((profile: any) => (
+                <option key={profile.profile_id} value={profile.profile_id}>
+                  {profile.profile_id} · {profile.model}
+                </option>
+              ))}
           </select>
         </label>
         <label className="space-y-1 text-xs">
@@ -270,11 +412,13 @@ function RagPanel({ state, setState, chooseDirectory, directoryMessage, onSave, 
             value={rag.reranker_profile_id ?? models?.reranker?.profile_id}
             onChange={(e) => update("reranker_profile_id", e.target.value)}
           >
-            {(models?.reranker_profiles?.length ? models.reranker_profiles : [models?.reranker]).filter(Boolean).map((profile:any) => (
-              <option key={profile.profile_id} value={profile.profile_id}>
-                {profile.profile_id} · {profile.model}
-              </option>
-            ))}
+            {(models?.reranker_profiles?.length ? models.reranker_profiles : [models?.reranker])
+              .filter(Boolean)
+              .map((profile: any) => (
+                <option key={profile.profile_id} value={profile.profile_id}>
+                  {profile.profile_id} · {profile.model}
+                </option>
+              ))}
           </select>
         </label>
       </div>
@@ -282,12 +426,16 @@ function RagPanel({ state, setState, chooseDirectory, directoryMessage, onSave, 
         className={`rounded-lg border p-4 text-xs ${rag.rerank_enabled && !rerankReady ? "border-amber-300 bg-amber-50 text-amber-900" : "border-dashed text-muted-foreground"}`}
       >
         {rag.rerank_enabled && !rerankReady
-          ? inlineUiText("当前 Re-rank 开关已打开，但未启用可加载的 Rerank 模型；实际检索会回退为候选顺序，建议先到“检索与判断模型”启用并验证模型。")
-          : inlineUiText("RAG 会按上面的绑定读取检索与判断模型；更换 Embedding 后需重建外部索引，避免旧向量与新维度混用。")}
+          ? inlineUiText(
+              "当前 Re-rank 开关已打开，但未启用可加载的 Rerank 模型；实际检索会回退为候选顺序，建议先到“检索与判断模型”启用并验证模型。"
+            )
+          : inlineUiText(
+              "RAG 会按上面的绑定读取检索与判断模型；更换 Embedding 后需重建外部索引，避免旧向量与新维度混用。"
+            )}
       </div>
       <BudgetFields state={state} setState={setState} />
       <SaveButton />
-    </form>
+    </ConfigSaveForm>
   );
 }
 function SectionHeading({ icon, title, description, message }: any) {
@@ -300,16 +448,52 @@ function SectionHeading({ icon, title, description, message }: any) {
         </div>
         <p className="mt-1 text-xs text-muted-foreground">{description}</p>
       </div>
-      {message && <span className="text-xs text-emerald-700">{message}</span>}
+      {message && <span className="text-xs text-muted-foreground">{message}</span>}
     </div>
   );
 }
-function SaveButton() {
+const SaveFeedbackContext = createContext<ReturnType<typeof useActionFeedback> | null>(null);
+function ConfigSaveForm({
+  onSave,
+  className,
+  children,
+}: {
+  onSave: () => Promise<unknown>;
+  className?: string;
+  children: ReactNode;
+}) {
+  const feedback = useActionFeedback();
   return (
-    <button className="inline-flex items-center gap-2 rounded bg-primary px-4 py-2 text-sm text-primary-foreground">
+    <SaveFeedbackContext.Provider value={feedback}>
+      <form
+        className={className}
+        onChange={feedback.reset}
+        onSubmit={(event) => {
+          event.preventDefault();
+          void feedback.run(onSave);
+        }}
+      >
+        {children}
+      </form>
+    </SaveFeedbackContext.Provider>
+  );
+}
+function SaveButton() {
+  const feedback = useContext(SaveFeedbackContext);
+  const actionText = useTranslations("actionFeedback");
+  const commonText = useTranslations("common");
+  return (
+    <FeedbackButton
+      type="submit"
+      status={feedback?.status ?? "idle"}
+      error={feedback?.error}
+      pendingLabel={commonText("saving")}
+      successLabel={actionText("saved")}
+      errorLabel={actionText("saveFailed")}
+    >
       <Save className="h-4 w-4" />
       {inlineUiText("保存配置")}
-    </button>
+    </FeedbackButton>
   );
 }
 function BudgetFields({ state, setState }: any) {
@@ -379,8 +563,41 @@ function NumberField({
   );
 }
 function RetrievalModelsPanel({ state, setState }: any) {
+  const jevText = useTranslations("jevConnection");
+  const actionText = useTranslations("actionFeedback");
+  const commonText = useTranslations("common");
+  const scopeText = useTranslations("jevScopes");
+  const locale = useLocale();
   const [message, setMessage] = useState<string | null>(null);
+  const [jevTesting, setJevTesting] = useState(false);
+  const [jevResult, setJevResult] = useState<{
+    ok: boolean;
+    code: string;
+    status?: number | string;
+    latency_ms?: number;
+    checked_at?: string;
+    usage?: { input_tokens?: number | null };
+  } | null>(null);
   const models = state.runtimeSettings.retrieval_models;
+  useEffect(() => {
+    let active = true;
+    fetch("/api/evolving-profile/retrieval-model-settings", { cache: "no-store" })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload) => {
+        if (!active || !payload) return;
+        setState((previous: any) => ({
+          ...previous,
+          runtimeSettings: {
+            ...previous.runtimeSettings,
+            retrieval_models: { ...previous.runtimeSettings.retrieval_models, ...payload },
+          },
+        }));
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [setState]);
   const update = (group: string, field: string, value: any) =>
     setState({
       ...state,
@@ -396,20 +613,61 @@ function RetrievalModelsPanel({ state, setState }: any) {
       body: JSON.stringify(models),
     });
     const body = await response.json();
-    setMessage(response.ok ? body.message || inlineUiText("检索与判断模型配置已保存") : body.error || inlineUiText("保存失败"));
+    setMessage(configurationSaveFeedback(response.ok, body, locale));
   };
+  const testJev = async () => {
+    if (jevTesting) return;
+    setJevResult(null);
+    setJevTesting(true);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch("/api/evolving-profile/jev-test", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ api_key: models.judge.api_key ?? "" }),
+        signal: controller.signal,
+      });
+      const body = await response.json().catch(() => null);
+      const ok = response.ok && body?.ok === true && body?.response_verified === true;
+      setJevResult({
+        ok,
+        code: ok ? "connected" : body?.code || "invalid_response",
+        status: body?.status ?? response.status,
+        latency_ms: body?.latency_ms,
+        checked_at: body?.checked_at || new Date().toISOString(),
+        usage: body?.usage,
+      });
+    } catch (error) {
+      setJevResult({
+        ok: false,
+        code: error instanceof Error && error.name === "AbortError" ? "timeout" : "network_error",
+        checked_at: new Date().toISOString(),
+      });
+    } finally {
+      window.clearTimeout(timeout);
+      setJevTesting(false);
+    }
+  };
+  useEffect(() => {
+    setJevResult(null);
+  }, [models.judge.api_key]);
   const cloneProfile = (kind: "embedding" | "reranker", profile: any) => {
     const key = `${kind}_profiles`;
     const profiles = Array.isArray(models[key]) ? models[key] : [models[kind]];
     const baseId = String(profile?.profile_id || kind);
     let profileId = `${baseId}-copy`;
     let index = 2;
-    while (profiles.some((item: any) => item.profile_id === profileId)) profileId = `${baseId}-copy-${index++}`;
+    while (profiles.some((item: any) => item.profile_id === profileId))
+      profileId = `${baseId}-copy-${index++}`;
     setState({
       ...state,
       runtimeSettings: {
         ...state.runtimeSettings,
-        retrieval_models: { ...models, [key]: [...profiles, { ...profile, profile_id: profileId, status: "draft" }] },
+        retrieval_models: {
+          ...models,
+          [key]: [...profiles, { ...profile, profile_id: profileId, status: "draft" }],
+        },
       },
     });
   };
@@ -421,15 +679,19 @@ function RetrievalModelsPanel({ state, setState }: any) {
         retrieval_models: { ...models, [kind]: { ...profile, status: "configured" } },
       },
     });
-    setMessage(`${kind === "embedding" ? "Embedding" : "Rerank"} 档案已设为当前，点击保存配置后应用`);
+    setMessage(
+      `${kind === "embedding" ? "Embedding" : "Rerank"} · ${inlineUiText("档案已选择，保存后应用；身份变化需要重建索引")}`
+    );
   };
   return (
     <section className="space-y-4">
       <SectionHeading
         icon={<Bot className="h-4 w-4" />}
         title={inlineUiText("检索与判断模型")}
-        description={inlineUiText("统一管理 Embedding、Rerank、融合算法，以及可选的 JEV 判断服务。")}
-        message={message}
+        description={inlineUiText(
+          "统一管理 Embedding、Rerank、融合算法，以及可选的 JEV 判断服务。"
+        )}
+        message={message || (models.configuration_status === "unconfigured" ? enumUiText("unconfigured") : null)}
       />
       <div className="grid gap-4 md:grid-cols-2">
         <ModelCard
@@ -437,34 +699,72 @@ function RetrievalModelsPanel({ state, setState }: any) {
           model={models.embedding}
           update={(f: string, v: any) => update("embedding", f, v)}
           fields={["model", "local_path", "dimensions", "device"]}
+          kind="embedding"
+          inventory={models.local_inventory}
         />
         <ModelCard
           title={inlineUiText("重排模型（Rerank）")}
           model={models.reranker}
           update={(f: string, v: any) => update("reranker", f, v)}
           fields={["model", "local_path", "device"]}
+          kind="reranker"
+          inventory={models.local_inventory}
         />
       </div>
       <div className="grid gap-4 md:grid-cols-2">
         {(["embedding", "reranker"] as const).map((kind) => {
           const key = `${kind}_profiles` as const;
-          const profiles = Array.isArray(models[key]) && models[key].length ? models[key] : [models[kind]];
-          return <div key={kind} className="rounded-lg border p-4">
-            <div className="flex items-center justify-between gap-3">
-              <div className="font-medium">{kind === "embedding" ? inlineUiText("Embedding 配置档案") : inlineUiText("Rerank 配置档案")}</div>
-              <span className="text-xs text-muted-foreground">{profiles.length} 个</span>
-            </div>
-            <div className="mt-3 space-y-2">
-              {profiles.map((profile:any) => <div key={profile.profile_id} className="flex items-center justify-between gap-2 rounded border px-3 py-2 text-xs">
-                <div className="min-w-0"><div className="truncate font-mono">{profile.profile_id}</div><div className="truncate text-muted-foreground">{profile.model} · {profile.status || "configured"}</div></div>
-                <div className="flex shrink-0 gap-1">
-                  <button type="button" className="rounded border px-2 py-1" onClick={() => activateProfile(kind, profile)} disabled={profile.profile_id === models[kind]?.profile_id}>{inlineUiText("设为当前")}</button>
-                  <button type="button" className="rounded border px-2 py-1" onClick={() => cloneProfile(kind, profile)}>{inlineUiText("复制")}</button>
+          const profiles =
+            Array.isArray(models[key]) && models[key].length ? models[key] : [models[kind]];
+          return (
+            <div key={kind} className="rounded-lg border p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="font-medium">
+                  {kind === "embedding"
+                    ? inlineUiText("Embedding 配置档案")
+                    : inlineUiText("Rerank 配置档案")}
                 </div>
-              </div>)}
+                <span className="text-xs text-muted-foreground">{profiles.length} {inlineUiText("条")}</span>
+              </div>
+              <div className="mt-3 space-y-2">
+                {profiles.map((profile: any) => (
+                  <div
+                    key={profile.profile_id}
+                    className="flex items-center justify-between gap-2 rounded border px-3 py-2 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate font-mono">{profile.profile_id}</div>
+                      <div className="truncate text-muted-foreground">
+                        {profile.model} · {enumUiText(profile.status || "configured")}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 gap-1">
+                      <button
+                        type="button"
+                        className="rounded border px-2 py-1"
+                        onClick={() => activateProfile(kind, profile)}
+                        disabled={modelIdentityMatches(profile, models[kind])}
+                      >
+                        {inlineUiText("设为当前")}
+                      </button>
+                      <button
+                        type="button"
+                        className="rounded border px-2 py-1"
+                        onClick={() => cloneProfile(kind, profile)}
+                      >
+                        {inlineUiText("复制")}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-3 text-[11px] text-muted-foreground">
+                {inlineUiText(
+                  "档案保存后可在外部 RAG 页面选择；更换 Embedding 会触发索引重建提示。"
+                )}
+              </p>
             </div>
-            <p className="mt-3 text-[11px] text-muted-foreground">{inlineUiText("档案保存后可在外部 RAG 页面选择；更换 Embedding 会触发索引重建提示。")}</p>
-          </div>;
+          );
         })}
       </div>
       <div className="rounded-lg border p-4">
@@ -490,20 +790,74 @@ function RetrievalModelsPanel({ state, setState }: any) {
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="font-medium">{inlineUiText("JEV 判断服务")}</div>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {inlineUiText("用于证据审查、路由复核、故障归因和文档分类；不参与 Recall 候选检索。风险判断默认关闭。")}
-            </p>
+            <p className="mt-1 text-xs text-muted-foreground">{scopeText("note")}</p>
           </div>
           <label className="flex items-center gap-2 text-xs">
             <input
               type="checkbox"
               checked={Boolean(models.judge.enabled)}
-              onChange={(e) => update("judge", "enabled", e.target.checked)}
+              onChange={(e) =>
+                setState({
+                  ...state,
+                  runtimeSettings: {
+                    ...state.runtimeSettings,
+                    retrieval_models: {
+                      ...models,
+                      judge: {
+                        ...models.judge,
+                        enabled: e.target.checked,
+                        mode_policy:
+                          e.target.checked && models.judge.mode_policy === "off"
+                            ? "assist"
+                            : models.judge.mode_policy,
+                      },
+                    },
+                  },
+                })
+              }
             />
             {inlineUiText("启用")}
           </label>
         </div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
+          <div className="space-y-2 md:col-span-2" data-testid="jev-usage-scopes">
+            <div className="text-sm font-medium">{scopeText("title")}</div>
+            {(["internal_memory", "quality_diagnosis", "external_rag"] as const).map((scope) => (
+              <label key={scope} className="flex gap-3 rounded border p-3 text-xs">
+                <input
+                  type="checkbox"
+                  checked={Boolean(models.judge.scopes?.[scope] ?? JEV_SCOPE_DEFAULTS[scope])}
+                  onChange={(e) =>
+                    update("judge", "scopes", {
+                      ...JEV_SCOPE_DEFAULTS,
+                      ...models.judge.scopes,
+                      [scope]: e.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  <span className="block font-medium">{scopeText(scope)}</span>
+                  <span className="mt-1 block text-muted-foreground">
+                    {scopeText(`${scope}Hint`)}
+                  </span>
+                </span>
+              </label>
+            ))}
+            <label className="flex gap-3 rounded border p-3 text-xs">
+              <input
+                type="checkbox"
+                checked={Boolean(models.judge.risk_gate_enabled)}
+                onChange={(e) => update("judge", "risk_gate_enabled", e.target.checked)}
+              />
+              <span>
+                <span className="block font-medium">{scopeText("operation_risk")}</span>
+                <span className="mt-1 block text-muted-foreground">
+                  {scopeText("operation_riskHint")}
+                </span>
+              </span>
+            </label>
+            <p className="text-xs text-muted-foreground">{scopeText("modeHint")}</p>
+          </div>
           <label className="space-y-1 text-xs">
             <span>{inlineUiText("运行模式")}</span>
             <select
@@ -517,41 +871,81 @@ function RetrievalModelsPanel({ state, setState }: any) {
               <option value="enforce">{inlineUiText("强制门控")}</option>
             </select>
           </label>
-          <label className="space-y-1 text-xs">
-            <span>{inlineUiText("模型名称")}</span>
-            <input
-              className="h-9 w-full rounded border bg-background px-2"
-              value={models.judge.model}
-              onChange={(e) => update("judge", "model", e.target.value)}
-              placeholder={inlineUiText("JEV 模型 ID")}
-            />
-          </label>
-          <label className="space-y-1 text-xs md:col-span-2">
-            <span>{inlineUiText("API 地址")}</span>
-            <input
-              className="h-9 w-full rounded border bg-background px-2 font-mono"
-              value={models.judge.base_url}
-              onChange={(e) => update("judge", "base_url", e.target.value)}
-              placeholder="https://…"
-            />
-          </label>
+          <div className="rounded border bg-muted/40 p-3 text-xs md:col-span-2">
+            <div>
+              {inlineUiText("固定服务地址")}：<span className="font-mono">{JEV_BASE_URL}</span>
+            </div>
+            <div className="mt-1">
+              {inlineUiText("固定模型")}：<span className="font-mono">{JEV_MODEL}</span>
+            </div>
+            <p className="mt-1 text-muted-foreground">
+              {inlineUiText("地址和模型由 EP 固定管理，无需填写。")}
+            </p>
+          </div>
+          <div data-testid="jev-connection-test" className="space-y-2 md:col-span-2">
+            <button
+              type="button"
+              onClick={() => void testJev()}
+              disabled={jevTesting}
+              aria-busy={jevTesting}
+              aria-describedby="jev-connection-result"
+              className={`rounded border px-3 py-2 text-xs disabled:opacity-60 ${jevTesting ? "bg-blue-50 text-blue-800" : jevResult ? (jevResult.ok ? "border-emerald-500 bg-emerald-50 text-emerald-800" : "border-rose-500 bg-rose-50 text-rose-800") : "hover:bg-accent"}`}
+            >
+              {jevTesting
+                ? jevText("testing")
+                : jevResult
+                  ? jevResult.ok
+                    ? jevText("successButton")
+                    : jevText("failureButton")
+                  : jevText("testButton")}
+            </button>
+            <div
+              id="jev-connection-result"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className={`rounded border p-3 text-xs ${jevTesting ? "border-blue-200 bg-blue-50 text-blue-800" : jevResult ? (jevResult.ok ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-rose-200 bg-rose-50 text-rose-800") : "border-dashed text-muted-foreground"}`}
+            >
+              {jevTesting ? (
+                jevText("testing")
+              ) : jevResult ? (
+                <>
+                  <div className="font-medium">
+                    {jevText(jevText.has(jevResult.code) ? jevResult.code : "network_error")}
+                  </div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
+                    {typeof jevResult.status === "number" && <span>HTTP {jevResult.status}</span>}
+                    {typeof jevResult.latency_ms === "number" && (
+                      <span>{jevResult.latency_ms} ms</span>
+                    )}
+                    {typeof jevResult.usage?.input_tokens === "number" && (
+                      <span>{jevText("inputTokens", { count: jevResult.usage.input_tokens })}</span>
+                    )}
+                    {jevResult.checked_at && (
+                      <span>
+                        {jevText("checkedAt", {
+                          time: new Date(jevResult.checked_at).toLocaleTimeString(locale),
+                        })}
+                      </span>
+                    )}
+                  </div>
+                </>
+              ) : (
+                jevText("idle")
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">{jevText("testHint")}</p>
+          </div>
           <label className="space-y-1 text-xs md:col-span-2">
             <span>{inlineUiText("JEV API Key")}</span>
             <input
               type="password"
               className="h-9 w-full rounded border bg-background px-2 font-mono"
               value={models.judge.api_key ?? ""}
+              disabled={jevTesting}
               onChange={(e) => update("judge", "api_key", e.target.value)}
               placeholder={inlineUiText("留空表示保留已保存密钥")}
             />
-          </label>
-          <label className="flex items-center gap-2 text-xs md:col-span-2">
-            <input
-              type="checkbox"
-              checked={Boolean(models.judge.risk_gate_enabled)}
-              onChange={(e) => update("judge", "risk_gate_enabled", e.target.checked)}
-            />
-            {inlineUiText("启用高风险操作确认门（默认关闭）")}
           </label>
           <label className="space-y-1 text-xs md:col-span-2">
             <span>{inlineUiText("失败回退")}</span>
@@ -563,24 +957,30 @@ function RetrievalModelsPanel({ state, setState }: any) {
           </label>
         </div>
       </div>
-      <button
+      <ActionButton
         type="button"
-        onClick={() => void save()}
+        onAction={save}
+        resetKey={models}
+        pendingLabel={commonText("saving")}
+        successLabel={actionText("saved")}
+        errorLabel={actionText("saveFailed")}
         className="inline-flex items-center gap-2 rounded bg-primary px-4 py-2 text-sm text-primary-foreground"
       >
         <Save className="h-4 w-4" />
         {inlineUiText("保存配置")}
-      </button>
+      </ActionButton>
     </section>
   );
 }
-function ModelCard({ title, model, update, fields }: any) {
+function ModelCard({ title, model, update, fields, inventory = [], kind }: any) {
   const choose = async () => {
     const response = await fetch("/api/evolving-profile/select-model-directory", {
       method: "POST",
     });
     const body = await response.json();
-    if (body.path) update("local_path", body.path);
+    if (body.canceled) return false;
+    if (!response.ok || !body.path) throw new Error(body.error || inlineUiText("目录选择失败"));
+    update("local_path", body.path);
   };
   return (
     <div className="rounded-lg border p-4">
@@ -631,13 +1031,14 @@ function ModelCard({ title, model, update, fields }: any) {
                   }
                 />
                 {field === "local_path" && (
-                  <button
+                  <ActionButton
                     type="button"
+                    variant="outline"
                     className="rounded border px-3 text-xs"
-                    onClick={() => void choose()}
+                    onAction={choose}
                   >
                     {inlineUiText("选择目录")}
-                  </button>
+                  </ActionButton>
                 )}
               </div>
             </label>
@@ -665,6 +1066,48 @@ function ModelCard({ title, model, update, fields }: any) {
           </>
         )}
       </div>
+      {model.mode === "local" && (
+        <div
+          className={`mt-3 rounded border p-3 text-xs ${model.status === "model_path_missing" ? "border-amber-300 bg-amber-50 text-amber-900" : "border-emerald-200 bg-emerald-50 text-emerald-900"}`}
+        >
+          <div className="font-medium">
+            {!model.enabled
+              ? enumUiText("configured_but_inactive")
+              : model.status === "auto_detected_local"
+              ? inlineUiText("已自动匹配本地目录")
+              : model.status === "auto_detected_fallback"
+                ? inlineUiText("已按维度自动匹配本地模型")
+                : model.status === "model_path_missing"
+                  ? inlineUiText("未找到当前模型的本地目录")
+                  : inlineUiText("本地模型状态")}
+          </div>
+          {model.local_path && <div className="mt-1 break-all font-mono">{model.local_path}</div>}
+          {model.enabled && model.profile_identity === "drifted" && <p className="mt-2 text-amber-800">{inlineUiText("模型档案身份不一致")}</p>}
+          <p className="mt-2">{inlineUiText("索引签名与服务加载状态未核验")}</p>
+          {model.status === "auto_detected_fallback" && model.previous_model && (
+            <div className="mt-1">
+              {inlineUiText("原配置")}: <span className="font-mono">{model.previous_model}</span> ·{" "}
+              {inlineUiText("保存后将使用上方已匹配模型")}
+            </div>
+          )}
+          {model.status === "model_path_missing" && (
+            <div className="mt-1 text-amber-800">
+              {inlineUiText(
+                "系统已扫描本机模型目录；请从下方真实候选中选择，不会把不同模型静默当成同一个模型。"
+              )}
+            </div>
+          )}
+          {inventory
+            .filter(
+              (item: any) => item.kind === kind
+            )
+            .map((item: any) => (
+              <div key={item.path} className="mt-1 break-all text-[11px]">
+                {inlineUiText("发现建议；尚未应用")}: {item.model} · {item.path}
+              </div>
+            ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -682,7 +1125,7 @@ function RuntimeOverview({ state }: { state: any }) {
       <SectionHeading
         icon={<Activity className="h-4 w-4" />}
         title={inlineUiText("运行配置概览")}
-        description={`查看当前实际使用的模型、宿主和本机服务。版本 ${state.release?.product_version ?? "5.0"}`}
+        description={`${inlineUiText("查看当前实际使用的模型、宿主和本机服务。版本")} ${state.release?.product_version ?? "5.1"}`}
       />
       <div className="grid gap-4 md:grid-cols-2">
         <div className="rounded-lg border p-4">
@@ -706,7 +1149,8 @@ function RuntimeOverview({ state }: { state: any }) {
           </div>
           <p className="mt-3 text-xs">{state.hostIntegration.hosts.join(" · ")}</p>
           <p className="mt-2 text-xs text-muted-foreground">
-            {inlineUiText("入口：")}{state.hostIntegration.entry} · MCP：{state.hostIntegration.mcpServer}
+            {inlineUiText("入口：")}
+            {state.hostIntegration.entry} · MCP：{state.hostIntegration.mcpServer}
           </p>
         </div>
       </div>
@@ -729,6 +1173,8 @@ function RuntimeOverview({ state }: { state: any }) {
   );
 }
 function ProviderPanel({ state }: { state: any }) {
+  const actionText = useTranslations("actionFeedback");
+  const commonText = useTranslations("common");
   const [draft, setDraft] = useState(state.runtimeSettings.providers);
   useEffect(() => setDraft(state.runtimeSettings.providers), [state.runtimeSettings.providers]);
   const [message, setMessage] = useState<string | null>(null);
@@ -767,13 +1213,10 @@ function ProviderPanel({ state }: { state: any }) {
         body: JSON.stringify(value),
       });
       const body = await response.json();
-      setMessage(
-        body.ok
-          ? `${value.name || "Provider"} 连接正常`
-          : body.error || inlineUiText("连接测试失败，请检查配置后重试。")
-      );
+      if (!response.ok || body.ok !== true)
+        throw new Error(body.error || inlineUiText("连接测试失败，请检查配置后重试。"));
     } catch (error) {
-      setMessage(friendlyProviderClientError(error));
+      throw new Error(friendlyProviderClientError(error));
     } finally {
       setTesting(null);
     }
@@ -785,14 +1228,18 @@ function ProviderPanel({ state }: { state: any }) {
       body: JSON.stringify({ ...state.runtimeSettings, providers: draft }),
     });
     const body = await response.json();
-    setMessage(response.ok ? inlineUiText("Provider 配置已保存") : body.error || inlineUiText("保存失败"));
+    if (!response.ok || body.saved === false)
+      throw new Error(body.error || inlineUiText("保存失败"));
+    setMessage(inlineUiText("Provider 配置已保存"));
   };
   return (
     <section className="space-y-4">
       <SectionHeading
         icon={<Bot className="h-4 w-4" />}
         title={inlineUiText("Provider 与 Fallback")}
-        description={inlineUiText("主 Provider 失败时按顺序切换备用 Provider；API Key 只显示掩码。")}
+        description={inlineUiText(
+          "主 Provider 失败时按顺序切换备用 Provider；API Key 只显示掩码。"
+        )}
         message={message}
       />
       {providers.map(({ key, value }) => (
@@ -850,14 +1297,17 @@ function ProviderPanel({ state }: { state: any }) {
               />
             </label>
             <div className="flex items-end gap-2">
-              <button
+              <ActionButton
                 type="button"
-                onClick={() => void test(key, value)}
+                variant="outline"
+                onAction={() => test(key, value)}
+                resetKey={value}
+                successLabel={actionText("connected")}
                 disabled={testing !== null}
                 className="rounded border px-3 py-2 text-xs"
               >
-                {testing === key ? inlineUiText("测试中…") : inlineUiText("测试连接")}
-              </button>
+                {actionText("testConnection")}
+              </ActionButton>
             </div>
           </div>
         </div>
@@ -866,13 +1316,17 @@ function ProviderPanel({ state }: { state: any }) {
         <button type="button" onClick={addFallback} className="rounded border px-3 py-2 text-xs">
           {inlineUiText("添加 Fallback")}
         </button>
-        <button
+        <ActionButton
           type="button"
-          onClick={() => void save()}
+          onAction={save}
+          resetKey={draft}
+          pendingLabel={commonText("saving")}
+          successLabel={actionText("saved")}
+          errorLabel={actionText("saveFailed")}
           className="rounded bg-primary px-4 py-2 text-xs text-primary-foreground"
         >
           {inlineUiText("保存 Provider 配置")}
-        </button>
+        </ActionButton>
       </div>
       <p className="text-xs text-muted-foreground">
         {inlineUiText("连接测试只访问 Provider 的模型列表接口，不会发送 EP 记忆内容。")}
@@ -889,24 +1343,30 @@ function ScenarioPanel({ state }: { state: any }) {
         description={inlineUiText("Session/Project 情境摘要、复核状态和图谱读取状态。")}
       />
       <div className="grid gap-4 md:grid-cols-3">
-          <div className="rounded-lg border p-4 text-sm">{inlineUiText("Session：")}{state.context.sessionCount}</div>
-        <div className="rounded-lg border p-4 text-sm">{inlineUiText("待复核：")}{state.context.pendingReview}</div>
         <div className="rounded-lg border p-4 text-sm">
-          {inlineUiText("质量状态：")}{state.context.qualityStatus ?? inlineUiText("未知")}
+          {inlineUiText("Session：")}
+          {state.context.sessionCount}
+        </div>
+        <div className="rounded-lg border p-4 text-sm">
+          {inlineUiText("待复核：")}
+          {state.context.pendingReview}
+        </div>
+        <div className="rounded-lg border p-4 text-sm">
+          {inlineUiText("质量状态：")}
+          {enumUiText(state.context.qualityStatus || "unknown")}
         </div>
       </div>
       <div className="rounded-lg border p-4 text-xs text-muted-foreground">
-        {inlineUiText("图谱节点")} {state.context.graph?.nodes.length ?? 0} {inlineUiText("· 关系边")}{" "}
-        {state.context.graph?.edges.length ?? 0} {inlineUiText("· 时间线")}{" "}
-        {state.context.graph?.timeline.length ?? 0}
+        {inlineUiText("图谱节点")} {state.context.graphStats?.nodes ?? 0}{" "}
+        {inlineUiText("· 关系边")} {state.context.graphStats?.edges ?? 0}{" "}
+        {inlineUiText("· 时间线")} {state.context.graphStats?.timeline ?? 0}
       </div>
     </section>
   );
 }
 function BackupPanel({ state, setState, onSave, message }: any) {
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const actionText = useTranslations("actionFeedback");
+  const commonText = useTranslations("common");
   const settings = state.backup.settings || {};
   const update = (group: string, field: string, value: any) =>
     setState({
@@ -916,29 +1376,14 @@ function BackupPanel({ state, setState, onSave, message }: any) {
         settings: { ...settings, [group]: { ...settings[group], [field]: value } },
       },
     });
-  const handleSave = async () => {
-    setSaving(true);
-    setSaveState("saving");
-    setSaveError(null);
-    try {
-      await onSave();
-      setSaveState("saved");
-      window.setTimeout(() => setSaveState("idle"), 2400);
-    } catch (error) {
-      setSaveError(error instanceof Error ? error.message : inlineUiText("备份设置保存失败"));
-      setSaveState("error");
-    } finally {
-      setSaving(false);
-    }
-  };
   return (
     <section className="space-y-4">
       <SectionHeading
         icon={<HardDrive className="h-4 w-4" />}
         title={inlineUiText("备份")}
         description={inlineUiText("分别设置执行计划、保留期限和自动清理规则。")}
+        message={message}
       />
-      {saveError && <p className="text-xs text-rose-700">{saveError}</p>}
       <div className="grid gap-4 md:grid-cols-2">
         <div className="rounded-lg border p-4 space-y-3">
           <div className="font-medium">{inlineUiText("执行计划")}</div>
@@ -1030,15 +1475,17 @@ function BackupPanel({ state, setState, onSave, message }: any) {
           </label>
         </div>
       </div>
-      <button
+      <ActionButton
         type="button"
-        onClick={() => void handleSave()}
-        disabled={saving}
-        className={`inline-flex items-center gap-2 rounded px-4 py-2 text-sm text-primary-foreground ${saveState === "error" ? "bg-rose-600" : saveState === "saved" ? "bg-emerald-600" : "bg-primary"}`}
+        onAction={onSave}
+        resetKey={settings}
+        pendingLabel={commonText("saving")}
+        successLabel={actionText("saved")}
+        errorLabel={actionText("saveFailed")}
       >
-        {saveState === "saved" ? <CheckCircle2 className="h-4 w-4" /> : <Save className="h-4 w-4" />}
-        {saving ? inlineUiText("保存中…") : saveState === "saved" ? inlineUiText("已保存") : saveState === "error" ? inlineUiText("保存失败，重试") : inlineUiText("保存备份设置")}
-      </button>
+        <Save className="h-4 w-4" />
+        {inlineUiText("保存备份设置")}
+      </ActionButton>
     </section>
   );
 }

@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import { useTranslations } from "next-intl";
@@ -1397,8 +1399,11 @@ export function Constellation({
         }}
       >
         {/* Share as SVG */}
-        <button
-          onClick={handleExportSvg}
+        <ActionButton
+          variant="ghost"
+          size="icon"
+          aria-label={t("exportSvgTitle")}
+          onAction={handleExportSvg}
           style={toolbarBtnStyle(isDark)}
           onMouseEnter={(e) => {
             (e.currentTarget as HTMLButtonElement).style.opacity = "1";
@@ -1423,7 +1428,7 @@ export function Constellation({
             <line x1="12" y1="4" x2="12" y2="15" />
           </svg>
           {t("exportSvgLabel")}
-        </button>
+        </ActionButton>
 
         {/* Fullscreen toggle */}
         <button

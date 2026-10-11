@@ -1,6 +1,6 @@
 {
   "$schema": "evolving-profile.route-registry.v1",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "routes": [
     {"canonical_route":"user_recall","display_name":{"zh-CN":"User Recall · 用户召回","en":"User Recall"},"legacy_tools":["recall"],"lane":"user_memory","receipt_schema":"evolving-profile.route-receipt.v1"},
     {"canonical_route":"user_research","display_name":{"zh-CN":"User Research · 用户研究","en":"User Research"},"legacy_tools":["research","read_research"],"lane":"user_memory","receipt_schema":"evolving-profile.route-receipt.v1"},

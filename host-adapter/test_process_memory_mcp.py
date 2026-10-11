@@ -111,6 +111,65 @@ def test_prepare_process_context_returns_explicit_hint_packet(tmp_path, monkeypa
     assert packet["automatic_injection"] is False
 
 
+def test_agent_recall_paginates_without_semantic_total_cap_and_persists_workspace(tmp_path, monkeypatch):
+    import evolving_profile_controller_mcp as mcp
+    monkeypatch.setattr(mcp, "PROCESS_MEMORY_PATH", tmp_path / "records.json")
+    monkeypatch.setattr(mcp, "PROCESS_MEMORY_WORKSPACE_ROOT", tmp_path / "workspaces")
+    monkeypatch.setattr(mcp, "runtime_disabled", lambda *_args: None)
+    for index in range(7):
+        mcp.record_agent_trajectory({
+            "task_archetype": ["web_ui_operation"], "phase": "recover",
+            "text": f"拖动框缩放手柄视觉检查第{index}次",
+        })
+    first = json.loads(mcp.search_agent_process_memory({
+        "query": "框无法拖动 缩放手柄 视觉检查", "task_archetype": "web_ui_operation", "limit": 2,
+    })["content"][0]["text"])
+    second = json.loads(mcp.search_agent_process_memory({
+        "query": "框无法拖动 缩放手柄 视觉检查", "task_archetype": "web_ui_operation", "limit": 2,
+        "offset": first["next_offset"], "workspace_id": first["workspace_id"],
+    })["content"][0]["text"])
+    assert first["total_count"] == 7
+    assert first["next_offset"] == 2
+    assert second["offset"] == 2
+    assert not ({row["process_memory_id"] for row in first["records"]} & {row["process_memory_id"] for row in second["records"]})
+    assert first["workspace"]["path"]
+    assert (tmp_path / "workspaces" / f"{first['workspace_id']}.json").exists()
+
+
+def test_agent_recall_keeps_unrelated_query_empty(tmp_path, monkeypatch):
+    import evolving_profile_controller_mcp as mcp
+    monkeypatch.setattr(mcp, "PROCESS_MEMORY_PATH", tmp_path / "records.json")
+    monkeypatch.setattr(mcp, "PROCESS_MEMORY_WORKSPACE_ROOT", tmp_path / "workspaces")
+    monkeypatch.setattr(mcp, "runtime_disabled", lambda *_args: None)
+    mcp.record_agent_trajectory({"task_archetype": ["web_ui_operation"], "phase": "observe", "text": "拖动框缩放手柄视觉检查"})
+    result = json.loads(mcp.search_agent_process_memory({"query": "家庭旅行 美食 景点", "limit": 2})["content"][0]["text"])
+    assert result["returned_count"] == 0
+    assert result["total_count"] == 0
+    assert result["next_offset"] is None
+
+
+def test_agent_process_scenario_followup_only_requires_summary_for_ambiguous_scope(tmp_path, monkeypatch):
+    import evolving_profile_controller_mcp as mcp
+    context_path = tmp_path / "context-index.json"
+    context_path.write_text(json.dumps({
+        "sessions": [
+            {"context_id": "session:s1", "context_type": "session", "session_id": "s1", "project_key": "p1", "title": "项目一"},
+            {"context_id": "session:s2", "context_type": "session", "session_id": "s2", "project_key": "p2", "title": "项目二"},
+        ], "projects": [],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(mcp, "CONTEXT_INDEX_PATH", context_path)
+    one = mcp.agent_process_scenario_followup([{"process_memory_id": "pm1", "primary_context": {"session_id": "s1"}}])
+    assert one["required"] is False
+    assert one["next_tool"] is None
+    many = mcp.agent_process_scenario_followup([
+        {"process_memory_id": "pm1", "primary_context": {"session_id": "s1"}},
+        {"process_memory_id": "pm2", "primary_context": {"session_id": "s2"}},
+    ])
+    assert many["required"] is True
+    assert many["next_tool"] == "read_scenario_summary"
+    assert len(many["scenarios"]) == 2
+
+
 def test_revalidation_handler_requires_evidence_to_restore(tmp_path, monkeypatch):
     import evolving_profile_controller_mcp as mcp
     monkeypatch.setattr(mcp, "PROCESS_MEMORY_PATH", tmp_path / "records.json")

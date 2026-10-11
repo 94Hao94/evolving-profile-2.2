@@ -16,26 +16,81 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Mapping
+from typing import Any
 
 from pydantic import BaseModel
 
-from evolving_profile_api.engine.llm_wrapper import create_llm_provider
+from evolving_profile_api.engine.llm_wrapper import create_llm_provider, requires_api_key
 
 logger = logging.getLogger(__name__)
 
-# Judge model configuration — always uses Gemini by default since GEMINI_API_KEY
-# is available in all CI jobs. The judge must be independent of the test provider
-# (hs_llm_mat tests run across openai, groq, bedrock, etc.).
-# Override with HINDSIGHT_TEST_JUDGE_PROVIDER / MODEL / API_KEY env vars.
-_JUDGE_PROVIDER = os.getenv("HINDSIGHT_TEST_JUDGE_PROVIDER", "gemini")
-_raw_model = os.getenv("HINDSIGHT_TEST_JUDGE_MODEL", "gemini-2.5-flash-lite")
-# Strip "google/" prefix — gemini API key auth expects bare model names.
-_JUDGE_MODEL = _raw_model.removeprefix("google/") if _JUDGE_PROVIDER == "gemini" else _raw_model
-_JUDGE_API_KEY = os.getenv(
-    "HINDSIGHT_TEST_JUDGE_API_KEY",
-    os.getenv("GEMINI_API_KEY", os.getenv("EVOLVING_PROFILE_API_LLM_API_KEY", "")),
-)
-_JUDGE_BASE_URL = os.getenv("HINDSIGHT_TEST_JUDGE_BASE_URL", "")
+def _resolve_judge_configuration(env: Mapping[str, str]) -> dict[str, Any]:
+    """Resolve provider, endpoint and credentials as one authentication boundary.
+
+    An unspecified judge reuses the entire primary configuration. A different
+    provider needs its own credential and explicit model; it can never borrow
+    the primary key. Same-provider endpoint/key overrides must be supplied as a
+    pair, so a custom-endpoint key cannot silently move to a canonical endpoint.
+    """
+    primary_provider = env.get("EVOLVING_PROFILE_API_LLM_PROVIDER", "openai").lower()
+    primary_model = env.get("EVOLVING_PROFILE_API_LLM_MODEL", "")
+    primary_base = env.get("EVOLVING_PROFILE_API_LLM_BASE_URL", "")
+    primary_key = env.get("EVOLVING_PROFILE_API_LLM_API_KEY", "")
+    provider = env.get("HINDSIGHT_TEST_JUDGE_PROVIDER", primary_provider).lower()
+    same_provider = provider == primary_provider
+    model = env.get("HINDSIGHT_TEST_JUDGE_MODEL", primary_model if same_provider else "")
+    if provider == "gemini":
+        model = model.removeprefix("google/")
+    reason = ""
+    if same_provider:
+        has_base = "HINDSIGHT_TEST_JUDGE_BASE_URL" in env
+        has_key = "HINDSIGHT_TEST_JUDGE_API_KEY" in env
+        if has_base != has_key:
+            base, key = "", ""
+            reason = "judge endpoint and credential overrides must be configured together"
+        else:
+            base = env.get("HINDSIGHT_TEST_JUDGE_BASE_URL", primary_base)
+            key = env.get("HINDSIGHT_TEST_JUDGE_API_KEY", primary_key)
+            if primary_key and base != primary_base and key == primary_key:
+                key = ""
+                reason = "the primary credential cannot be rebound to a different judge endpoint"
+    else:
+        provider_key_names = {
+            "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+            "openai": ("OPENAI_API_KEY",), "anthropic": ("ANTHROPIC_API_KEY",),
+            "groq": ("GROQ_API_KEY",), "deepseek": ("DEEPSEEK_API_KEY",),
+        }
+        base = env.get("HINDSIGHT_TEST_JUDGE_BASE_URL", "")
+        key = env.get("HINDSIGHT_TEST_JUDGE_API_KEY", "") or next(
+            (env[name] for name in provider_key_names.get(provider, ()) if env.get(name)), ""
+        )
+        if primary_key and key == primary_key:
+            key = ""
+            reason = "a different judge provider requires a dedicated credential distinct from the primary key"
+        elif requires_api_key(provider) and not key:
+            reason = "a different judge provider requires a dedicated credential"
+    if not reason and not model:
+        reason = "judge model is not configured"
+    if not reason and requires_api_key(provider) and not key:
+        reason = "judge credential is not configured"
+    independence = (
+        "same_model_not_independent"
+        if same_provider and model == primary_model and base == primary_base
+        else "different_model_or_endpoint" if same_provider else "different_provider"
+    )
+    return {
+        "provider": provider, "model": model, "base_url": base, "api_key": key,
+        "configured": not reason, "reason": reason, "independence": independence,
+    }
+
+
+_JUDGE_CONFIG = _resolve_judge_configuration(os.environ)
+_JUDGE_PROVIDER = _JUDGE_CONFIG["provider"]
+_JUDGE_MODEL = _JUDGE_CONFIG["model"]
+_JUDGE_API_KEY = _JUDGE_CONFIG["api_key"]
+_JUDGE_BASE_URL = _JUDGE_CONFIG["base_url"]
+_JUDGE_INDEPENDENCE = _JUDGE_CONFIG["independence"]
 
 # Flakiness hardening. A single temperature-0 judge call still occasionally flips
 # its verdict on borderline phrasing — the dominant source of hs_llm_core
@@ -62,6 +117,9 @@ _judge_instance = None
 def _get_judge():
     global _judge_instance
     if _judge_instance is None:
+        if not _JUDGE_CONFIG["configured"]:
+            raise RuntimeError(f"Judge not configured: {_JUDGE_CONFIG['reason']}")
+        logger.info("Judge provider=%s model=%s independence=%s", _JUDGE_PROVIDER, _JUDGE_MODEL, _JUDGE_INDEPENDENCE)
         _judge_instance = create_llm_provider(
             provider=_JUDGE_PROVIDER,
             api_key=_JUDGE_API_KEY,

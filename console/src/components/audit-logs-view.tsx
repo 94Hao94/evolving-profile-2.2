@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect, useCallback } from "react";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
@@ -278,7 +280,8 @@ export function AuditLogsView() {
       newActionFilter: string | null = actionFilter,
       newTransportFilter: string | null = transportFilter,
       newDateRange: string = dateRange,
-      newOffset: number = offset
+      newOffset: number = offset,
+      throwOnError = false
     ) => {
       if (!currentBank) return;
 
@@ -297,6 +300,7 @@ export function AuditLogsView() {
         setTotal(data.total || 0);
       } catch (error) {
         console.error("Error loading audit logs:", error);
+        if (throwOnError) throw error;
       } finally {
         setLoading(false);
       }
@@ -326,7 +330,7 @@ export function AuditLogsView() {
 
   const handlePageChange = (newOffset: number) => {
     setOffset(newOffset);
-    loadLogs(actionFilter, transportFilter, dateRange, newOffset);
+    return loadLogs(actionFilter, transportFilter, dateRange, newOffset, true);
   };
 
   const handleLogClick = (log: AuditLogEntry) => {
@@ -391,15 +395,15 @@ export function AuditLogsView() {
           </SelectContent>
         </Select>
 
-        <Button
+        <ActionButton
           variant="outline"
           size="sm"
-          onClick={() => loadLogs(actionFilter, transportFilter, dateRange, offset)}
+          onAction={() => loadLogs(actionFilter, transportFilter, dateRange, offset, true)}
           disabled={loading}
         >
           <RefreshCw className={`w-4 h-4 mr-1 ${loading ? "animate-spin" : ""}`} />
           {t("refresh")}
-        </Button>
+        </ActionButton>
 
         <span className="text-sm text-muted-foreground ml-auto">
           {t("entryCount", { count: total })}
@@ -453,24 +457,24 @@ export function AuditLogsView() {
             {t("paginationPage", { current: currentPage, total: totalPages })}
           </span>
           <div className="flex gap-2">
-            <Button
+            <ActionButton
               variant="outline"
               size="sm"
-              onClick={() => handlePageChange(Math.max(0, offset - limit))}
+              preserveLabel onAction={() => handlePageChange(Math.max(0, offset - limit))}
               disabled={offset === 0}
             >
               <ChevronLeft className="w-4 h-4 mr-1" />
               {t("previous")}
-            </Button>
-            <Button
+            </ActionButton>
+            <ActionButton
               variant="outline"
               size="sm"
-              onClick={() => handlePageChange(offset + limit)}
+              preserveLabel onAction={() => handlePageChange(offset + limit)}
               disabled={offset + limit >= total}
             >
               {t("next")}
               <ChevronRight className="w-4 h-4 ml-1" />
-            </Button>
+            </ActionButton>
           </div>
         </div>
       )}

@@ -21,8 +21,9 @@ class McpToolCatalogTest(unittest.TestCase):
                 "task": {"objective": "恢复视觉验收", "current_user_message": "恢复视觉验收", "phase": "verify"},
                 "runtime_event": {"capability": "computer_use", "failure": "transport_closed", "occurrence": 1, "required_for": "visual_acceptance"},
             }}},
-            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "get_preference", "arguments": {
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "user_preference", "arguments": {
                 "memory_policy": "allowed", "loaded": [], "task": {"objective": "偏好", "phase": "understand", "current_constraints": [], "domains": [], "media": [], "resolved_entities": [], "unresolved_references": []},
+                "check_id": "catalog-check-1",
             }}},
             {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "search_scenario_summary", "arguments": {
                 "query": "天津财经大学 商务智能与数据分析", "context_type": "session", "limit": 8,
@@ -43,7 +44,7 @@ class McpToolCatalogTest(unittest.TestCase):
         rows = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
         tools = {item["name"] for item in next(row for row in rows if row.get("id") == 2)["result"]["tools"]}
         self.assertIn("refresh_runtime_guidance", tools)
-        self.assertTrue({'catalog_list','catalog_search','catalog_read','record_evidence_decision','update_task_state'} <= tools)
+        self.assertTrue({'catalog_list','catalog_search','catalog_read','record_evidence_decision','update_task_state','user_recall','user_research','user_preference','agent_recall','agent_research'} <= tools)
         self.assertNotIn('read_context_summary', tools)
         self.assertIn('search_scenario_summary', tools)
         self.assertNotIn('get_task_guidance', tools)
@@ -56,14 +57,14 @@ class McpToolCatalogTest(unittest.TestCase):
             self.assertIn(tool, listed)
             self.assertIn('check_id', listed[tool]['inputSchema']['properties'])
         self.assertIn('episode_id', listed['read_scenario_summary']['inputSchema']['properties'])
-        preference = next(item for item in next(row for row in rows if row.get("id") == 2)["result"]["tools"] if item["name"] == "get_preference")
+        preference = next(item for item in next(row for row in rows if row.get("id") == 2)["result"]["tools"] if item["name"] == "user_preference")
         self.assertIn("check_id", preference["inputSchema"]["required"])
         self.assertEqual(preference["inputSchema"]["properties"]["check_id"]["type"], "string")
         payload = json.loads(next(row for row in rows if row.get("id") == 3)["result"]["content"][0]["text"])
         self.assertEqual(payload["mode"], "runtime_guidance_refresh")
         self.assertEqual(payload["persistence"], "none_current_turn_only")
-        error = next(row for row in rows if row.get("id") == 4)
-        self.assertIn("requires the current Prompt check_id", error["error"]["message"])
+        preference_reply = next(row for row in rows if row.get("id") == 4)
+        self.assertIn("content", preference_reply["result"])
         scenario = json.loads(next(row for row in rows if row.get("id") == 5)["result"]["content"][0]["text"])
         self.assertEqual(scenario["schema"], "evolving-profile.search-scenario-summary.v1")
         self.assertTrue(scenario["coverage"]["navigation_only"])

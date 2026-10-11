@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
@@ -60,7 +62,7 @@ export function EntitiesView() {
   const totalPages = Math.ceil(total / ITEMS_PER_PAGE);
   const offset = (currentPage - 1) * ITEMS_PER_PAGE;
 
-  const loadEntities = async (page: number = 1) => {
+  const loadEntities = async (page: number = 1, throwOnError = false) => {
     if (!currentBank) return;
 
     setLoading(true);
@@ -74,7 +76,7 @@ export function EntitiesView() {
       setEntities(result.items || []);
       setTotal(result.total || 0);
     } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
+      if (throwOnError) throw error;
     } finally {
       setLoading(false);
     }
@@ -89,6 +91,8 @@ export function EntitiesView() {
       setSelectedEntity(result);
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setLoadingDetail(false);
     }
@@ -97,7 +101,7 @@ export function EntitiesView() {
   // Handle page change
   const handlePageChange = (newPage: number) => {
     setCurrentPage(newPage);
-    loadEntities(newPage);
+    return loadEntities(newPage, true);
   };
 
   const loadGraph = useCallback(async () => {
@@ -317,7 +321,7 @@ export function EntitiesView() {
                     {entities.map((entity) => (
                       <TableRow
                         key={entity.id}
-                        onClick={() => loadEntityDetail(entity.id)}
+                        onClick={() => { void loadEntityDetail(entity.id).catch(() => undefined); }}
                         className={`cursor-pointer hover:bg-muted/50 ${
                           selectedEntity?.id === entity.id ? "bg-primary/10" : ""
                         }`}
@@ -347,45 +351,45 @@ export function EntitiesView() {
                     {offset + 1}-{Math.min(offset + ITEMS_PER_PAGE, total)} of {total}
                   </div>
                   <div className="flex items-center gap-1">
-                    <Button
+                    <ActionButton
                       variant="outline"
                       size="sm"
-                      onClick={() => handlePageChange(1)}
+                      preserveLabel onAction={() => handlePageChange(1)}
                       disabled={currentPage === 1 || loading}
                       className="h-7 w-7 p-0"
                     >
                       <ChevronsLeft className="h-3 w-3" />
-                    </Button>
-                    <Button
+                    </ActionButton>
+                    <ActionButton
                       variant="outline"
                       size="sm"
-                      onClick={() => handlePageChange(currentPage - 1)}
+                      preserveLabel onAction={() => handlePageChange(currentPage - 1)}
                       disabled={currentPage === 1 || loading}
                       className="h-7 w-7 p-0"
                     >
                       <ChevronLeft className="h-3 w-3" />
-                    </Button>
+                    </ActionButton>
                     <span className="text-xs px-2">
                       {currentPage} / {totalPages}
                     </span>
-                    <Button
+                    <ActionButton
                       variant="outline"
                       size="sm"
-                      onClick={() => handlePageChange(currentPage + 1)}
+                      preserveLabel onAction={() => handlePageChange(currentPage + 1)}
                       disabled={currentPage === totalPages || loading}
                       className="h-7 w-7 p-0"
                     >
                       <ChevronRight className="h-3 w-3" />
-                    </Button>
-                    <Button
+                    </ActionButton>
+                    <ActionButton
                       variant="outline"
                       size="sm"
-                      onClick={() => handlePageChange(totalPages)}
+                      preserveLabel onAction={() => handlePageChange(totalPages)}
                       disabled={currentPage === totalPages || loading}
                       className="h-7 w-7 p-0"
                     >
                       <ChevronsRight className="h-3 w-3" />
-                    </Button>
+                    </ActionButton>
                   </div>
                 </div>
               )}

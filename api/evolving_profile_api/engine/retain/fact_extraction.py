@@ -28,6 +28,19 @@ from .entity_labels import (
     is_label_entity,
     parse_entity_labels,
 )
+from .source_attribution import (
+    _text as source_message_text,
+)
+from .source_attribution import (
+    attribution_schema,
+    fragment_source_message,
+    is_source_message,
+    iter_source_fragments,
+    requires_attribution,
+    validate_write_policy,
+    verbatim_witnesses,
+    verify_attribution,
+)
 
 
 def _extract_map_entities(
@@ -169,6 +182,7 @@ class Fact(BaseModel):
     # Optional structured data
     entities: list[str] | None = None
     causal_relations: list["CausalRelation"] | None = None
+    metadata: dict[str, str] = Field(default_factory=dict)
 
 
 class CausalRelation(BaseModel):
@@ -265,6 +279,15 @@ def _split_chunk_for_output_retry(chunk: str) -> tuple[str, str] | None:
 
         if len(parsed) == 1 and isinstance(parsed[0], dict):
             turn = parsed[0]
+            if is_source_message(turn):
+                content = source_message_text(turn)
+                if len(content) <= 1:
+                    return None
+                cut = len(content) // 2
+                return (
+                    json.dumps([fragment_source_message(turn, 0, cut)], ensure_ascii=False),
+                    json.dumps([fragment_source_message(turn, cut, len(content))], ensure_ascii=False),
+                )
             content = turn.get("content")
             if isinstance(content, str) and len(content) > 1:
                 cut = len(content) // 2
@@ -687,12 +710,16 @@ def _iter_conversation_chunks(turns: list[dict], max_chars: int, structured_limi
         turn_unit_size = len(turn_json)
         turn_size = turn_unit_size + 1  # +1 for comma
 
-        # A turn too large to keep whole even alone: flush, then split it as
-        # text. Fragment within min(structured_limit, max_chars) so no fragment
-        # exceeds the chunk budget — otherwise a downstream re-chunk would split
-        # it again and collide on chunk_id (issue #2301).
-        if turn_unit_size > structured_limit:
+        # Source messages retain an independently valid JSON envelope and
+        # original witness when split. Generic JSON retains its legacy text
+        # fallback. Every fragment stays bounded and stable under re-chunking.
+        if turn_unit_size > structured_limit or (is_source_message(turn) and turn_unit_size + 2 > structured_limit):
             yield from _flush()
+            if is_source_message(turn):
+                for fragment in iter_source_fragments(turn, min(structured_limit, max_chars)):
+                    emitted = True
+                    yield fragment
+                continue
             for fragment in _iter_recursive_splits(
                 turn_json, min(structured_limit, max_chars), _RECURSIVE_TEXT_SEPARATORS
             ):
@@ -1476,7 +1503,9 @@ async def _extract_facts_from_chunk(
     logger = logging.getLogger(__name__)
 
     # Build prompt and schema using helper function
+    validate_write_policy(chunk, metadata)
     prompt, response_schema = _build_extraction_prompt_and_schema(config)
+    prompt, response_schema = attribution_schema(prompt, response_schema, metadata)
 
     # Check config for extraction mode and causal link extraction
     extraction_mode = config.retain_extraction_mode
@@ -1788,6 +1817,9 @@ async def _extract_facts_from_chunk(
 
                 # Build Fact model instance
                 try:
+                    witness = verify_attribution(chunk, llm_fact, metadata)
+                    if witness is not None:
+                        combined_text, fact_type, fact_data["metadata"] = witness
                     fact = Fact(fact=combined_text, fact_type=fact_type, **fact_data)
                     chunk_facts.append(fact)
                 except Exception as e:
@@ -1813,7 +1845,7 @@ async def _extract_facts_from_chunk(
             if has_malformed_facts and not chunk_facts:
                 raise RuntimeError(
                     f"Fact extraction failed: all {len(raw_facts)} facts returned by the LLM were "
-                    f"unusable after {outer_attempts} attempts (wrong shape or missing required fields). "
+                    f"unusable after {outer_attempts} attempts (wrong shape, missing required fields or invalid source attribution). "
                     f"Model '{llm_config.model}' may not honour the extraction schema — consider enabling "
                     f"EVOLVING_PROFILE_API_LLM_STRICT_SCHEMA_RETAIN or using a model with strict schema support."
                 )
@@ -2261,6 +2293,7 @@ async def extract_facts_from_contents_batch_api(
     prompt, response_schema = _build_extraction_prompt_and_schema(config)
 
     for content_index, item in enumerate(contents):
+        validate_write_policy(item.content, item.metadata)
         chunks = chunk_text(
             item.content,
             max_chars=config.retain_chunk_size,
@@ -2286,7 +2319,8 @@ async def extract_facts_from_contents_batch_api(
             )
 
             # Build request body using helper function
-            request_body = _build_request_body(batch_impl, config, prompt, user_message, response_schema)
+            chunk_prompt, chunk_schema = attribution_schema(prompt, response_schema, item.metadata)
+            request_body = _build_request_body(batch_impl, config, chunk_prompt, user_message, chunk_schema)
 
             batch_requests.append(
                 {"custom_id": custom_id, "method": "POST", "url": "/v1/chat/completions", "body": request_body}
@@ -2616,6 +2650,9 @@ async def extract_facts_from_contents_batch_api(
             fact_data["mentioned_at"] = event_date.isoformat() if event_date is not None else None
 
             try:
+                witness = verify_attribution(chunk_content, llm_fact, contents[content_index].metadata)
+                if witness is not None:
+                    combined_text, fact_type, fact_data["metadata"] = witness
                 fact = Fact(fact=combined_text, fact_type=fact_type, **fact_data)
                 chunk_facts.append(fact)
             except Exception as e:
@@ -2675,7 +2712,7 @@ async def extract_facts_from_contents_batch_api(
                 chunk_index=chunk_meta.chunk_index,
                 context=content.context,
                 mentioned_at=content.event_date,
-                metadata=content.metadata,
+                metadata={**content.metadata, **fact_from_llm.metadata},
                 tags=content.tags,
                 observation_scopes=content.observation_scopes,
             )
@@ -2718,6 +2755,26 @@ def _extract_facts_chunks(
             structured_chunk_size=config.retain_structured_chunk_size,
         )
         for chunk in chunks:
+            validate_write_policy(chunk, content.metadata)
+            if requires_attribution(content.metadata):
+                witnesses = verbatim_witnesses(chunk, content.metadata)
+                chunks_metadata.append(ChunkMetadata(chunk, len(witnesses), content_index, global_chunk_idx))
+                for canonical, fact_type, witness_metadata in witnesses:
+                    extracted_facts.append(
+                        ExtractedFactType(
+                            fact_text=canonical,
+                            fact_type=fact_type,
+                            content_index=content_index,
+                            chunk_index=global_chunk_idx,
+                            context=content.context,
+                            mentioned_at=content.event_date,
+                            metadata={**content.metadata, **witness_metadata},
+                            tags=content.tags,
+                            observation_scopes=content.observation_scopes,
+                        )
+                    )
+                global_chunk_idx += 1
+                continue
             chunks_metadata.append(
                 ChunkMetadata(
                     chunk_text=chunk,
@@ -2876,7 +2933,7 @@ async def extract_facts_from_contents(
                     context=content.context,
                     # mentioned_at: always the event_date (when the conversation/document occurred)
                     mentioned_at=content.event_date,
-                    metadata=content.metadata,
+                    metadata={**content.metadata, **fact_from_llm.metadata},
                     tags=content.tags,
                     observation_scopes=content.observation_scopes,
                 )
@@ -2911,6 +2968,10 @@ def _collapse_to_verbatim(facts: list[ExtractedFactType], chunks: list[ChunkMeta
     result: list[ExtractedFactType] = []
 
     for fact in facts:
+        if fact.metadata.get("source_role"):
+            # A whole mixed chunk cannot borrow the first witness's authority.
+            result.append(fact)
+            continue
         if fact.chunk_index not in seen:
             fact.fact_text = chunk_text_map.get(fact.chunk_index, fact.fact_text)
             seen[fact.chunk_index] = fact

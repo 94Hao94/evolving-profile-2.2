@@ -14,11 +14,13 @@ import re
 import sys
 import uuid
 import datetime
+import tempfile
+import fcntl
 import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
-GUIDANCE_V1_SRC = os.environ.get("EVOLVING_PROFILE_GUIDANCE_SRC", str(Path.home() / ".evolving-profile/runtime/guidance"))
+GUIDANCE_V1_SRC = os.environ.get("EVOLVING_PROFILE_GUIDANCE_SRC", "/Users/apple/.evolving-profile/runtime/guidance")
 if GUIDANCE_V1_SRC not in sys.path:
     sys.path.insert(0, GUIDANCE_V1_SRC)
 from evidence_workspace import discover, search, read_page, source_witness, record_stdout, DEFAULT_ROOT
@@ -33,13 +35,15 @@ from lib.scenario_gate import decide_scenario_summary
 from lib.context_associations import project_key
 from lib.scope_hypotheses import search_contexts, build_hypotheses
 from lib.external_rag import search_external_rag
-from lib.process_memory import ProcessMemoryStore, compute_intervention
+from lib.jev_judge import project_tool_review, review as jev_review, caller_view as jev_caller_view, audit_external_review
+from lib.process_memory import ProcessMemoryStore, compute_intervention, OUTCOMES, INDEPENDENT_VERIFIERS
+from lib.recall_relevance import resolve_min_relevance, apply_relevance_policy, classify_candidate, adaptive_recall_hint
 from lib.process_memory_evaluation import evaluate_ab, transfer_gate, build_revalidation_queue
 from runtime_settings import load_runtime_settings, module_enabled, route_policy
 
 CONTROLLER = os.environ.get("EVOLVING_PROFILE_CONTROLLER_URL", "http://127.0.0.1:12079")
 BANK = "personal-memory"
-VERSION = "5.0.0-dev-scenario-quality"
+VERSION = "5.1.0-dev-memory-quality"
 ADAPTER_BUILD_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 CURRENT_TOOL_CALL = None
 
@@ -74,8 +78,184 @@ def _process_store() -> ProcessMemoryStore:
     return ProcessMemoryStore(PROCESS_MEMORY_PATH)
 
 
-def _process_reply(value: dict) -> dict:
+def _process_reply(value: dict, recall_arguments: dict | None = None) -> dict:
+    if recall_arguments is not None and isinstance(value.get('relevance_audit'), dict):
+        _recall_controls(value, value['relevance_audit'], recall_arguments)
+    if value.get('source') == 'agent_process_memory' and isinstance(value.get('total_count'), int):
+        value = {**value, 'candidate_count': value['total_count'],
+                 'candidate_count_semantics': 'policy_eligible_total_not_visible_page'}
     return {'content': [{'type': 'text', 'text': json.dumps(value, ensure_ascii=False)}], 'isError': False}
+
+
+def _process_mapping_items(value: dict) -> list:
+    """Preview only this return, including user memory and conditional preferences."""
+    from lib.returned_content import returned_items, preview_items
+    return preview_items(returned_items(value))
+
+
+def _safe_workspace_id(value: object, prefix: str = 'agent-process') -> str:
+    """Return a stable, filesystem-safe task workspace identifier."""
+    raw = str(value or '').strip()
+    if not raw:
+        raw = f'{prefix}-{uuid.uuid4().hex[:16]}'
+    raw = re.sub(r'[^A-Za-z0-9._-]+', '-', raw).strip('.-')[:96]
+    return raw or f'{prefix}-{uuid.uuid4().hex[:16]}'
+
+
+def _process_workspace_path(workspace_id: str) -> Path:
+    root = Path(PROCESS_MEMORY_WORKSPACE_ROOT).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f'{_safe_workspace_id(workspace_id)}.json'
+
+
+def _read_process_workspace(workspace_id: str) -> dict:
+    path = _process_workspace_path(workspace_id)
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_process_workspace(workspace_id: str, payload: dict) -> dict:
+    path = _process_workspace_path(workspace_id)
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _merge_process_workspace(workspace_id, payload)
+
+
+def _merge_process_workspace(workspace_id: str, payload: dict) -> dict:
+    """Atomically persist task-local candidate references, never private chain-of-thought."""
+    path = _process_workspace_path(workspace_id)
+    current = _read_process_workspace(workspace_id)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    merged = {**current, **payload, 'workspace_id': _safe_workspace_id(workspace_id), 'updated_at': now}
+    merged['query_snapshots'] = {**(current.get('query_snapshots') or {}), **(payload.get('query_snapshots') or {})}
+    # Paging calls append/refresh candidate references instead of discarding
+    # the previous page.  The stable ID is the merge key, so an Agent can keep
+    # a growing intermediate shortlist without duplicating records.
+    previous_refs = {str(item.get('process_memory_id')): item for item in (current.get('candidate_refs') or []) if isinstance(item, dict) and item.get('process_memory_id')}
+    seen_ids = set(previous_refs)
+    incoming_ids = []
+    for item in (payload.get('candidate_refs') or []):
+        if isinstance(item, dict) and item.get('process_memory_id'):
+            incoming_ids.append(str(item['process_memory_id']))
+            previous_refs[str(item['process_memory_id'])] = item
+    if previous_refs:
+        merged['candidate_refs'] = list(previous_refs.values())
+    merged.setdefault('created_at', now)
+    fd, temporary = tempfile.mkstemp(prefix='.workspace-', suffix='.json', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(merged, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return {'workspace_id': merged['workspace_id'], 'path': str(path), 'updated_at': merged['updated_at'], 'selected_count': len(merged.get('selected_ids') or []), 'candidate_count': len(merged.get('candidate_refs') or []),
+            'new_candidate_ids': list(dict.fromkeys(i for i in incoming_ids if i not in seen_ids)),
+            'repeated_candidate_ids': list(dict.fromkeys(i for i in incoming_ids if i in seen_ids))}
+
+
+def _workspace_signature(query: str, facets: list[str]) -> str:
+    return hashlib.sha256(json.dumps({'query': query, 'facets': facets}, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()[:24]
+
+
+def _snapshot_page(store: ProcessMemoryStore, workspace_id: str, signature: str, *, query: str, facets: list[str], compatibility: dict, task_archetype: str | None, primary_context: dict | None, include_unverified: bool, offset: int, limit: int, relevance_policy: dict | None = None) -> tuple[dict, dict]:
+    """Use a stable candidate ID order for all pages in one task workspace."""
+    policy = relevance_policy or resolve_min_relevance(load_runtime_settings(), 'agent_memory')
+    if primary_context:
+        policy = {**policy, 'required_scope': dict(primary_context)}
+    signature = hashlib.sha256(json.dumps({'query_signature': signature, 'relevance_policy': policy,'compatibility':compatibility,'task_archetype':task_archetype,'primary_context':primary_context,'include_unverified':include_unverified,'store_path':str(store.path)}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
+    current = _read_process_workspace(workspace_id)
+    snapshots = current.get('query_snapshots') or {}
+    snapshot_state = snapshots.get(signature) or (current if current.get('query_signature') == signature else {})
+    changed = bool(current.get('query_signature')) and not snapshot_state
+    if changed and offset:
+        raise ValueError('query_or_relevance_policy_changed_restart_at_offset_zero')
+    order = list(snapshot_state.get('candidate_order') or [])
+    # A single current read validates scope, maturity and links for every page.
+    records, audit = store._ranked_search_with_audit(query, main_query=query if facets else None, policy=policy, compatibility=compatibility, task_archetype=task_archetype, primary_context=primary_context, include_unverified=include_unverified)
+    for record in records:
+        record['matched_facets'] = [facet for facet in facets if classify_candidate(facet,record)['level'] not in {'none','unknown'}]
+    if facets:
+        records.sort(key=lambda row: (-float(row.get('relevance_score') or 0), -len(row.get('matched_facets') or []), str(row.get('process_memory_id') or '')))
+    if not order:
+        order = [str(row.get('process_memory_id')) for row in records if row.get('process_memory_id')]
+        annotations = {str(row.get('process_memory_id')): {
+            'recall_strength': row.get('recall_strength'),
+            'recall_match_audit': row.get('recall_match_audit') or {},
+            'readback_tool': row.get('readback_tool') or 'read_agent_process_memory',
+            'readback_boundary': row.get('readback_boundary') or 'Agent Process Memory record; use read_agent_process_memory.',
+            'matched_facets': row.get('matched_facets') or [],
+            'relevance_level': row.get('relevance_level'),
+            'relevance_score': row.get('relevance_score'),
+            'relevance_reasons': row.get('relevance_reasons') or [],
+            'relevance_match_signals': row.get('relevance_match_signals') or {},
+            'source_integrity': row.get('source_integrity'),
+        } for row in records if row.get('process_memory_id')}
+        _write_process_workspace(workspace_id, {'query': query, 'facets': facets, 'query_signature': signature, 'candidate_order': order, 'candidate_annotations': annotations, 'relevance_audit': audit, 'total_count': len(order), 'scope': 'task_local_candidate_workspace',
+                                               'query_snapshots': {signature: {'candidate_order': order}}})
+        current = _read_process_workspace(workspace_id)
+    by_id = {str(row.get('process_memory_id')):row for row in records if row.get('process_memory_id')}
+    snapshot = [by_id[item] for item in order if item in by_id]
+    start = max(0, int(offset or 0)); size = max(1, min(int(limit or 8), 50)); page = snapshot[start:start + size]
+    next_offset = start + len(page) if start + len(page) < len(snapshot) else None
+    audit = {**audit, 'returned_count': len(page), 'admitted_count': len(snapshot), 'offset': start, 'next_offset': next_offset, 'facets': facets, 'source': 'agent_memory'}
+    return {'records': page, 'total_count': len(snapshot), 'offset': start, 'page_size': size, 'next_offset': next_offset, 'relevance_audit': audit}, current
+
+
+def _workspace_candidate_refs(rows: list[dict]) -> list[dict]:
+    refs = []
+    for row in rows:
+        refs.append({
+            'process_memory_id': row.get('process_memory_id'),
+            'kind': row.get('kind'),
+            'text_preview': str(row.get('text') or '')[:1200],
+            'recall_strength': row.get('recall_strength'),
+            'recall_match_audit': row.get('recall_match_audit') or {},
+            'readback_tool': row.get('readback_tool') or 'read_agent_process_memory',
+            'readback_boundary': row.get('readback_boundary') or 'Agent Process Memory record; use read_agent_process_memory.',
+            'task_archetype': row.get('task_archetype') or [],
+            'primary_context': row.get('primary_context') or {},
+            'maturity': row.get('maturity'),
+        })
+    return refs
+
+
+def write_agent_process_workspace(args: dict) -> dict:
+    """Let the Agent keep a task-local working set while it pages through candidates."""
+    workspace_id = _safe_workspace_id(args.get('workspace_id'), 'agent-process')
+    selected = [str(item) for item in (args.get('selected_ids') or []) if str(item).strip()]
+    rejected = [str(item) for item in (args.get('rejected_ids') or []) if str(item).strip()]
+    previous_path = _process_workspace_path(workspace_id)
+    previous = {}
+    if previous_path.exists():
+        try:
+            previous = json.loads(previous_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError, TypeError):
+            previous = {}
+    payload = {
+        'query': str(args.get('query') or previous.get('query') or ''),
+        'facets': list(args.get('facets') or previous.get('facets') or []),
+        'selected_ids': sorted(set((previous.get('selected_ids') or []) + selected)),
+        'rejected_ids': sorted(set((previous.get('rejected_ids') or []) + rejected)),
+        'notes': str(args.get('notes') or previous.get('notes') or '')[:4000],
+        'candidate_refs': list(args.get('candidate_refs') or previous.get('candidate_refs') or [])[:10000],
+        'total_count': int(args.get('total_count') if args.get('total_count') is not None else previous.get('total_count') or 0),
+        'next_offset': args.get('next_offset') if args.get('next_offset') is not None else previous.get('next_offset'),
+        'scope': 'task_local_candidate_workspace',
+        'retention': 'until_task_cleanup',
+    }
+    receipt = _write_process_workspace(workspace_id, payload)
+    return _process_reply({'schema': 'evolving-profile.agent-process-workspace.v1', 'status': 'saved', 'workspace': receipt, 'selected_ids': payload['selected_ids'], 'rejected_ids': payload['rejected_ids'], 'automatic_injection': False})
 
 
 def record_agent_trajectory(args: dict) -> dict:
@@ -117,16 +297,99 @@ def promote_agent_process_memory(args: dict) -> dict:
     return _process_reply({'schema': 'evolving-profile.agent-process-receipt.v1', 'status': 'promoted', 'record': record, 'injection': 'disabled_by_default'})
 
 
+def agent_research_gate(records, scenario_followup, query=''):
+    """Recommend escalation without silently spending another research call."""
+    rows = list(records or [])
+    direct = sum(1 for row in rows if row.get('recall_strength') == 'direct')
+    weak = sum(1 for row in rows if row.get('recall_strength') == 'weak_background')
+    contexts = set()
+    for row in rows:
+        context = row.get('primary_context') or {}
+        for key in ('session_id', 'project_key', 'project_id', 'project'):
+            if context.get(key):
+                contexts.add(str(context[key]))
+    text = str(query or '').casefold()
+    cross_markers = ('跨项目', '跨任务', '跨会话', '模型迁移', '工具迁移', '重复失败', '根因', '泛化', '比较不同')
+    readback_markers = ('具体步骤', '验证状态', '原始来源', '回读', '详细过程', '适用条件', '反例', '已验证', '证明')
+    reasons = []
+    if not rows or direct == 0:
+        reasons.append('direct_candidate_insufficient')
+    if len(contexts) > 1:
+        reasons.append('multiple_process_contexts')
+    if any(marker in text for marker in cross_markers):
+        reasons.append('cross_task_or_transfer_request')
+    if isinstance(scenario_followup, dict) and scenario_followup.get('required'):
+        reasons.append('scenario_scope_unresolved')
+    needs = bool(reasons)
+    readback_required = bool(rows) and any(marker in text for marker in readback_markers)
+    return {'status': 'recommended' if needs else 'not_needed', 'needs_research': needs,
+            'recommended_tool': 'agent_research' if needs else None, 'reasons': reasons,
+            'direct_count': direct, 'weak_background_count': weak, 'context_count': len(contexts),
+            'readback_required': readback_required,
+            'readback_tool': 'read_agent_process_memory' if readback_required else None,
+            'readback_reason': '当前问题要求具体过程、验证或适用条件；候选摘要不足以支持结论。' if readback_required else None,
+            'boundary': 'Routing recommendation only; it is not an automatic call or proof of fact.'}
+
+
 def search_agent_process_memory(args: dict) -> dict:
     gate = process_runtime_disabled('retrieve', args.get('kind'))
     if gate:
         return gate
     compatibility = {key: args[key] for key in ('model_family', 'model_version', 'capability_fingerprint', 'toolchain') if args.get(key)}
     store = _process_store()
-    rows = store.search(str(args.get('query') or ''), compatibility=compatibility, task_archetype=args.get('task_archetype'), primary_context=args.get('primary_context'), include_unverified=bool(args.get('include_unverified', False)), limit=int(args.get('limit') or 8))
+    default_workspace = 'agent-process-' + hashlib.sha256(str(args['check_id']).encode()).hexdigest()[:16] if args.get('check_id') else None
+    workspace_id = _safe_workspace_id(args.get('workspace_id') or default_workspace, 'agent-recall')
+    query = str(args.get('query') or '')
+    policy = resolve_min_relevance(load_runtime_settings(), 'agent_memory', args.get('minimum_relevance'))
+    page, _ = _snapshot_page(store, workspace_id, _workspace_signature(query, []), query=query, facets=[], compatibility=compatibility, task_archetype=args.get('task_archetype'), primary_context=args.get('primary_context'), include_unverified=bool(args.get('include_unverified', True)), offset=int(args.get('offset') or 0), limit=int(args.get('limit') or 8), relevance_policy=policy)
+    rows = page['records']
+    workspace = _write_process_workspace(workspace_id, {
+        'query': str(args.get('query') or ''),
+        'facets': [],
+        'offset': page['offset'],
+        'page_size': page['page_size'],
+        'total_count': page['total_count'],
+        'next_offset': page['next_offset'],
+        'candidate_refs': _workspace_candidate_refs(rows),
+        'scope': 'task_local_candidate_workspace',
+    })
     profile = store.capability_profile(str(args.get('model_family') or 'unknown'), str(args.get('task_archetype') or 'other'), str(args.get('phase') or 'observe'), args.get('model_version'))
     intervention = compute_intervention(profile, {'complexity': args.get('complexity', 'normal')})
-    return _process_reply({'schema': 'evolving-profile.agent-process-search.v1', 'status': 'observed', 'returned_count': len(rows), 'records': rows, 'capability_profile': profile, 'intervention': intervention, 'source': 'agent_process_memory', 'automatic_injection': False})
+    scenario_followup = agent_process_scenario_followup(rows)
+    return _process_reply({'schema': 'evolving-profile.agent-process-search.v1', 'status': 'observed', 'returned_count': len(rows), 'records': rows, 'total_count': page['total_count'], 'offset': page['offset'], 'page_size': page['page_size'], 'next_offset': page['next_offset'], 'relevance_audit': page['relevance_audit'], 'workspace_id': workspace['workspace_id'], 'workspace': workspace, 'scenario_followup': scenario_followup, 'research_gate': agent_research_gate(rows, scenario_followup, args.get('query')), 'recall_policy': 'recall_first_weak_background_no_global_cap', 'capability_profile': profile, 'intervention': intervention, 'source': 'agent_process_memory', 'automatic_injection': False}, args)
+
+
+def research_agent_process_memory(args: dict) -> dict:
+    """Research multiple process-memory facets under the public Agent Research tool name."""
+    gate = process_runtime_disabled('retrieve', args.get('kind'))
+    if gate:
+        return gate
+    compatibility = {key: args[key] for key in ('model_family', 'model_version', 'capability_fingerprint', 'toolchain') if args.get(key)}
+    store = _process_store()
+    queries = [str(item.get('query') if isinstance(item, dict) else item).strip() for item in (args.get('facets') or [])]
+    if not queries:
+        queries = [str(args.get('query') or '').strip()]
+    default_workspace = 'agent-process-' + hashlib.sha256(str(args['check_id']).encode()).hexdigest()[:16] if args.get('check_id') else None
+    workspace_id = _safe_workspace_id(args.get('workspace_id') or default_workspace, 'agent-research')
+    query = str(args.get('query') or '')
+    signature = _workspace_signature(query, queries)
+    policy = resolve_min_relevance(load_runtime_settings(), 'agent_memory', args.get('minimum_relevance'))
+    page, _ = _snapshot_page(store, workspace_id, signature, query=query, facets=queries, compatibility=compatibility, task_archetype=args.get('task_archetype'), primary_context=args.get('primary_context'), include_unverified=bool(args.get('include_unverified', True)), offset=int(args.get('offset') or 0), limit=int(args.get('limit') or 8), relevance_policy=policy)
+    page_rows = page['records']; next_offset = page['next_offset']; start = page['offset']; size = page['page_size']
+    workspace = _write_process_workspace(workspace_id, {
+        'query': str(args.get('query') or ''),
+        'facets': queries,
+        'offset': start,
+        'page_size': size,
+        'total_count': page['total_count'],
+        'next_offset': next_offset,
+        'candidate_refs': _workspace_candidate_refs(page_rows),
+        'scope': 'task_local_candidate_workspace',
+    })
+    scenario_followup = agent_process_scenario_followup(page_rows)
+    gate = agent_research_gate(page_rows, scenario_followup, args.get('query'))
+    gate.update({'status': 'completed_research', 'needs_research': False, 'recommended_tool': None})
+    return _process_reply({'schema': 'evolving-profile.agent-process-research.v1', 'status': 'observed', 'mode': 'graph_research', 'facets': queries, 'returned_count': len(page_rows), 'records': page_rows, 'total_count': page['total_count'], 'offset': start, 'page_size': size, 'next_offset': next_offset, 'relevance_audit': page['relevance_audit'], 'workspace_id': workspace['workspace_id'], 'workspace': workspace, 'scenario_followup': scenario_followup, 'research_gate': gate, 'recall_policy': 'recall_first_weak_background_no_global_cap', 'source': 'agent_process_memory', 'automatic_injection': False}, args)
 
 
 def prepare_agent_process_context(args: dict) -> dict:
@@ -136,7 +399,11 @@ def prepare_agent_process_context(args: dict) -> dict:
         return gate
     compatibility = {key: args[key] for key in ('model_family', 'model_version', 'capability_fingerprint', 'toolchain') if args.get(key)}
     store = _process_store()
-    rows = store.search(str(args.get('query') or ''), compatibility=compatibility, task_archetype=args.get('task_archetype'), primary_context=args.get('primary_context'), limit=int(args.get('limit') or 3))
+    policy = resolve_min_relevance(load_runtime_settings(), 'agent_memory', args.get('minimum_relevance'))
+    if args.get('primary_context'):
+        policy = {**policy, 'required_scope': dict(args['primary_context'])}
+    page = store.search_page(str(args.get('query') or ''), policy=policy, compatibility=compatibility, task_archetype=args.get('task_archetype'), primary_context=args.get('primary_context'), include_unverified=bool(args.get('include_unverified', True)), offset=int(args.get('offset') or 0), limit=int(args.get('limit') or 3))
+    rows = page['records']
     profile = store.capability_profile(str(args.get('model_family') or 'unknown'), str(args.get('task_archetype') or 'other'), str(args.get('phase') or 'observe'), args.get('model_version'))
     intervention = compute_intervention(profile, {'complexity': args.get('complexity', 'normal')})
     hints = [{
@@ -145,7 +412,7 @@ def prepare_agent_process_context(args: dict) -> dict:
         'suggested_checks': row.get('verification_evidence', []), 'evidence_links': row.get('source_trace_ids', []),
         'confidence': row.get('maturity'), 'intervention_level': row.get('intervention_level', intervention['intervention_level']),
     } for row in rows]
-    return _process_reply({'schema': 'evolving-profile.agent-process-context.v1', 'status': 'prepared' if hints else 'no_candidate', 'returned_count': len(hints), 'hints': hints, 'capability_profile': profile, 'intervention': intervention, 'automatic_injection': False, 'source': 'agent_process_memory'})
+    return _process_reply({'schema': 'evolving-profile.agent-process-context.v1', 'status': 'prepared' if hints else 'no_candidate', 'returned_count': len(hints), 'hints': hints, 'total_count': page['total_count'], 'offset': page['offset'], 'page_size': page['page_size'], 'next_offset': page['next_offset'], 'relevance_audit': page['relevance_audit'], 'capability_profile': profile, 'intervention': intervention, 'automatic_injection': False, 'source': 'agent_process_memory'}, args)
 
 
 def revalidate_agent_process_memory(args: dict) -> dict:
@@ -178,8 +445,21 @@ def read_agent_process_memory(args: dict) -> dict:
     if gate:
         return gate
     wanted = str(args.get('process_memory_id') or '')
-    record = next((item for item in _process_store().all() if item.get('process_memory_id') == wanted), None)
-    return _process_reply({'schema': 'evolving-profile.agent-process-read.v1', 'status': 'observed' if record else 'not_found', 'record': record, 'source': 'agent_process_memory', 'automatic_injection': False})
+    store = _process_store()
+    record = next((item for item in store.all() if item.get('process_memory_id') == wanted), None)
+    if record is not None:
+        record = store.audit_source_integrity(record)
+    raw = {}
+    context = (record or {}).get('primary_context') or {}
+    if context.get('session_id') and context.get('turn_id'):
+        from lib.raw_session_evidence import read_evidence
+        try:
+            raw = read_evidence(context['session_id'], THREAD_SESSION_ROOT, turn_id=context['turn_id'])
+        except (ValueError, OSError) as error:
+            raw = {'status': 'source_unavailable', 'error_type': type(error).__name__, 'source': {}}
+    return _process_reply({'schema': 'evolving-profile.agent-process-read.v1', 'status': 'observed' if record else 'not_found', 'record': record, 'source': 'agent_process_memory', 'automatic_injection': False,
+                           'raw_source': raw.get('source') or {}, 'raw_source_status': raw.get('status') or 'locator_unavailable',
+                           'raw_source_coverage': raw.get('coverage') or {}, 'claims_independently_verified': False})
 
 
 def record_agent_capability_observation(args: dict) -> dict:
@@ -190,33 +470,54 @@ def record_agent_capability_observation(args: dict) -> dict:
     return _process_reply({'schema': 'evolving-profile.agent-capability-receipt.v1', 'status': 'recorded', 'record': record, 'source': 'agent_process_memory'})
 
 
-def capture_tool_trajectory(tool_name: str, arguments: dict, *, outcome: str = 'ambiguous', error: str | None = None) -> None:
+def capture_tool_trajectory(tool_name: str, arguments: dict, *, outcome: str = 'ambiguous', error: str | None = None,
+                            binding=None, result=None, tool_call_id=None) -> None:
     """Capture bounded tool metadata; never copy prompt or Bank bodies into process memory."""
     if tool_name.startswith('record_agent_') or tool_name.startswith('promote_agent_'):
         return
     if process_runtime_disabled('record', 'trace'):
         return
     dimensions = ['tool_use']
-    if tool_name in {'recall', 'research', 'read_research', 'read_source', 'rag_search'}:
+    if tool_name in {'user_recall', 'user_research', 'user_preference', 'agent_recall', 'agent_research', 'recall', 'research', 'read_research', 'read_source', 'read_scenario_summary', 'read_context_summary', 'search_scenario_summary', 'search_scenario_contexts', 'scenario_gate', 'rag_search'}:
         dimensions.append('retrieval')
-    if tool_name in {'read_source', 'read_scenario_summary'}:
+    if tool_name in {'read_source', 'read_scenario_summary', 'read_context_summary'}:
         dimensions.append('context_management')
     text = f"tool={tool_name}; outcome={outcome}"
     if error:
         text += f"; error={str(error)[:240]}"
     try:
         store = _process_store()
+        context = {key: arguments.get(key) for key in ('project_id', 'session_id', 'turn_id', 'task_id') if arguments.get(key)}
+        bound = dict(binding or {})
+        if bound.get('state') == 'prompt_bound':
+            from lib.process_context import resolve_source_metadata
+            native = resolve_source_metadata(bound, THREAD_SESSION_ROOT)
+            bound.update({key: value for key, value in native.items() if not bound.get(key)})
+        if bound.get('state') == 'prompt_bound':
+            context.update({key: bound[key] for key in ('session_id', 'turn_id', 'project_id', 'project_key', 'cwd') if bound.get(key)})
+        locator = {key: bound[key] for key in ('session_id', 'turn_id', 'hook_invocation_id', 'transcript_path') if bound.get(key)}
+        locator.update(tool_call_id=tool_call_id, check_id=arguments.get('check_id'),
+                       activity_path=str(Path.home()/'.evolving-profile/audit/mcp-tool-activity.jsonl'))
+        if bound.get('raw_context_locator'): locator['raw_context_locator'] = bound['raw_context_locator']
+        body = result if isinstance(result, dict) else {}
         store.record_trajectory({
-            'task_archetype': ['coordination_multi_agent'],
+            'task_archetype': [arguments.get('task_archetype') or ('information_retrieval' if 'retrieval' in dimensions else 'other')],
             'process_dimensions': dimensions,
             'phase': 'observe',
             'outcome': outcome,
             'text': text,
             'toolchain': [tool_name],
-            'environment_fingerprint': {'host': 'evolving-profile-controller-mcp'},
-            'primary_context': {key: arguments.get(key) for key in ('project_id', 'session_id', 'task_id') if arguments.get(key)},
+            'environment_fingerprint': {'host': 'evolving-profile-controller-mcp', 'cwd': bound.get('cwd'),
+                                        'model_provider': bound.get('model_provider'), 'identity_status': 'observed_metadata' if bound.get('raw_context_locator') else 'unknown'},
+            'primary_context': context,
+            'source_locator': locator,
+            'binding_state': bound.get('state') or 'unknown',
+            'tool_call_id': tool_call_id,
+            'tool_result': {'status': body.get('status') or ('failed' if error else 'returned'),
+                            'returned_count': _returned_count(body, tool_name) if result is not None else None,
+                            'claim_verification': body.get('claim_verification') or 'not_measured'},
             'agent': {'role': arguments.get('agent_role') or 'current-agent', 'host': arguments.get('host') or 'codex'},
-            'model_profile': {'family': arguments.get('model_family') or 'unknown', 'version': arguments.get('model_version') or 'unknown'},
+            'model_profile': {'family': arguments.get('model_family') or bound.get('model') or 'unknown', 'version': arguments.get('model_version') or 'unknown'},
             'preconditions': [key for key in ('check_id', 'session_id', 'turn_id') if arguments.get(key)],
             'failure_signature': [str(error)[:120]] if error else [],
         })
@@ -224,14 +525,15 @@ def capture_tool_trajectory(tool_name: str, arguments: dict, *, outcome: str = '
         # required.  Shadow/transfer gates still prevent unverified injection.
         store.auto_promote_verified_process(limit=100)
     except Exception:
-        # Process-memory capture cannot break an EP5.0 tool response.
+        # Process-memory capture cannot break an EP5.1 tool response.
         return
-GUIDANCE_V1_CONFIG = os.environ.get("EVOLVING_PROFILE_GUIDANCE_CONFIG", str(Path.home() / ".evolving-profile/guidance-v1/guidance-v1.json"))
+GUIDANCE_V1_CONFIG = os.environ.get("EVOLVING_PROFILE_GUIDANCE_CONFIG", "/Users/apple/.evolving-profile/guidance-v1/guidance-v1.json")
 TOPIC_CATALOG_PATH = Path(os.environ.get("EVOLVING_PROFILE_TOPIC_CATALOG", str(Path.home()/'.evolving-profile/catalog/topics.sqlite3')))
 EVIDENCE_DECISION_ROOT = Path(os.environ.get("EVOLVING_PROFILE_EVIDENCE_DECISION_ROOT", str(Path.home()/'.evolving-profile/audit/evidence-decisions')))
 TASK_STATE_ROOT = Path(os.environ.get("EVOLVING_PROFILE_TASK_STATE_ROOT", str(Path.home()/'.evolving-profile/task-state')))
 CONTEXT_INDEX_PATH = Path(os.environ.get("EVOLVING_PROFILE_CONTEXT_INDEX", str(Path.home()/'.evolving-profile/context/context-index.json')))
 PROCESS_MEMORY_PATH = Path(os.environ.get("EVOLVING_PROFILE_PROCESS_MEMORY_PATH", str(Path.home()/'.evolving-profile/process-memory/records.json')))
+PROCESS_MEMORY_WORKSPACE_ROOT = Path(os.environ.get("EVOLVING_PROFILE_PROCESS_WORKSPACE_ROOT", str(Path.home()/'.evolving-profile/process-memory/workspaces')))
 THREAD_SESSION_ROOT = Path(os.environ.get("EVOLVING_PROFILE_THREAD_SESSION_ROOT", str(Path.home()/'.codex/sessions')))
 CHECK_TOOL = {
     'name':'memory_check',
@@ -250,7 +552,7 @@ GUIDANCE_TOOL = {
 }
 GUIDANCE_UNIT_TOOL = {
     'name':'read_preference_unit','description':'按PreferenceUnit稳定ID和可选revision读取完整正文、条件、例外、行动影响、来源引用及版本状态。只读；用于补读deferred项或核对已加载版本。',
-    'inputSchema':{'type':'object','additionalProperties':False,'properties':{'id':{'type':'string','minLength':1},'revision':{'type':'string'}},'required':['id']},
+    'inputSchema':{'type':'object','additionalProperties':False,'properties':{'id':{'type':'string','minLength':1},'revision':{'type':'string'},'check_id':{'type':'string'}},'required':['id']},
     'annotations':{'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False},
 }
 CATALOG_LIST_TOOL={'name':'catalog_list','description':'列出真实主题目录节点的短摘要、新鲜度和来源覆盖；仅用于导航，不作为事实证据。','inputSchema':{'type':'object','additionalProperties':False,'properties':{'limit':{'type':'integer','minimum':1,'maximum':100,'default':30}}},'annotations':{'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False}}
@@ -291,6 +593,8 @@ SCENARIO_SUMMARY_TOOL = {
         'offset': {'type':'integer','minimum':0,'default':0}, 'limit': {'type':'integer','minimum':1,'maximum':20,'default':10}
     },'required':['scenario_type']}, 'annotations': {'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False}
 }
+SCENARIO_SUMMARY_TOOL['inputSchema']['properties']['scenario_id']['description']='完整定位符：Session 用 session:<uuid>，Project 用返回的 project:<key>，turn/episode 必须使用工具返回的完整定位符。Session 类型的无歧义裸 UUID 可规范化。'
+SCENARIO_SUMMARY_TOOL['inputSchema']['properties']['session_id']['description']='仅裸 Session UUID（不带 session:）；与 scenario_id 同时提供时必须指向同一 Session。'
 SCENARIO_GATE_TOOL = {
     'name':'scenario_gate',
     'description':'Agent先根据Recall/Research候选指出证据缺口，再判断是否从compact读取Scenario Summary；不按问题关键词自动断言需要情景，不读取摘要、不证明答案正确。',
@@ -307,15 +611,27 @@ SCENARIO_CONTEXT_SEARCH_TOOL = {
     },'required':['query']},
     'annotations': {'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False}
 }
+for _scenario_tool in (SCENARIO_SUMMARY_TOOL, SCENARIO_CONTEXT_SEARCH_TOOL, SCENARIO_GATE_TOOL):
+    _scenario_tool['inputSchema']['properties']['purpose'] = {'type':'string',
+        'enum':['user_memory','agent_process','navigation'],
+        'description':'本次情景读取用途；未提供则标记未知，不从工具名字猜测所属事实或过程平面。'}
 EXTERNAL_RAG_TOOL = {
     'name': 'rag_search',
     'description': '只搜索Web配置的外部RAG目录，不读取EP Bank、Recall、Research或偏好；返回外部文件路径和片段定位。RAG关闭或未配置时明确返回disabled/root_unavailable。',
     'inputSchema': {'type':'object','additionalProperties':False,'properties': {'query': {'type':'string','minLength':1}, 'limit': {'type':'integer','minimum':1,'maximum':50,'default':8}}, 'required':['query']},
     'annotations': {'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False},
 }
+JEV_RISK_TOOL = {
+    'name': 'review_operation_risk',
+    'description': '可选的JEV风险辅助判断，独立于RAG。仅在Web风险判断开关开启后调用；返回风险提示和是否需要确认，不执行操作、不授予权限、不替代宿主或用户确认。',
+    'inputSchema': {'type': 'object', 'additionalProperties': False, 'properties': {
+        'operation': {'type': 'string', 'maxLength': 1200}, 'irreversible': {'type': 'boolean'}, 'external_send': {'type': 'boolean'}, 'check_id': {'type': 'string'}
+    }, 'required': ['operation']},
+    'annotations': {'readOnlyHint': True, 'destructiveHint': False, 'openWorldHint': False},
+}
 AGENT_TRAJECTORY_TOOL = {
     'name': 'record_agent_trajectory',
-    'description': '记录Agent执行轨迹或工具回执到EP5.0过程记忆候选区。只记录过程证据，不写入Facts/Experiences，不自动注入。',
+    'description': '记录Agent执行轨迹或工具回执到EP5.1过程记忆候选区。只记录过程证据，不写入Facts/Experiences，不自动注入。',
     'inputSchema': {'type':'object','additionalProperties':False,'properties': {
         'task_archetype': {'type':'array','items':{'type':'string'},'minItems':1,'maxItems':8},
         'process_dimensions': {'type':'array','items':{'type':'string'},'maxItems':12},
@@ -353,20 +669,34 @@ AGENT_DRAFT_TOOL = {
     'annotations': {'readOnlyHint':False,'destructiveHint':False,'idempotentHint':False,'openWorldHint':False},
 }
 AGENT_SEARCH_TOOL = {
+    # Compatibility descriptor retained for older in-process callers. The
+    # public MCP descriptor is AGENT_RECALL_TOOL below.
     'name': 'search_agent_process_memory',
-    'description': '按任务族、阶段、模型和工具链搜索EP5.0 Agent过程记忆。默认只返回可用且经过验证的候选，不改变EP5.0召回结果。',
+    'description': '召回优先搜索EP5.1 Agent过程记忆：不设语义总上限，只设单页传输上限；返回total_count/next_offset和direct/weak_background标记。完全无关、冲突、禁用或漂移记录仍拦截。Agent可用workspace_id分批查看并自行筛选，不自动注入。',
     'inputSchema': {'type':'object','additionalProperties':False,'properties': {
         'query': {'type':'string','minLength':1}, 'task_archetype': {'type':'string'}, 'phase': {'type':'string'},
         'model_family': {'type':'string'}, 'model_version': {'type':'string'}, 'capability_fingerprint': {'type':'string'}, 'complexity': {'type':'string','enum':['low','normal','high']},
-        'toolchain': {'type':'array','items':{'type':'string'}}, 'limit': {'type':'integer','minimum':1,'maximum':50,'default':8},
-        'include_unverified': {'type':'boolean','default':False},
+        'toolchain': {'type':'array','items':{'type':'string'}}, 'offset': {'type':'integer','minimum':0,'default':0}, 'limit': {'type':'integer','minimum':1,'maximum':50,'default':8}, 'workspace_id': {'type':'string'},
+        'include_unverified': {'type':'boolean','default':True},
+    },'required':['query']},
+    'annotations': {'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False},
+}
+AGENT_RECALL_TOOL = {**AGENT_SEARCH_TOOL, 'name': 'agent_recall'}
+AGENT_RESEARCH_TOOL = {
+    'name': 'agent_research',
+    'description': '跨任务、跨项目和多分面研究EP5.1 Agent过程记忆。先汇总所有相关页再按offset分页，不设语义总上限；返回total_count/next_offset、匹配分面和direct/weak_background标记。Agent可用workspace_id建立任务级中间工作区；不直接注入。',
+    'inputSchema': {'type':'object','additionalProperties':False,'properties': {
+        'query': {'type':'string','minLength':1}, 'facets': {'type':'array','items':{'type':'string'},'maxItems':8},
+        'task_archetype': {'type':'string'}, 'model_family': {'type':'string'}, 'model_version': {'type':'string'},
+        'capability_fingerprint': {'type':'string'}, 'toolchain': {'type':'array','items':{'type':'string'}},
+        'offset': {'type':'integer','minimum':0,'default':0}, 'limit': {'type':'integer','minimum':1,'maximum':50,'default':8}, 'workspace_id': {'type':'string'}, 'include_unverified': {'type':'boolean','default':True}
     },'required':['query']},
     'annotations': {'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False},
 }
 AGENT_READ_TOOL = {
     'name': 'read_agent_process_memory',
-    'description': '按稳定ID读取一条Agent过程记忆及来源、验证、适用范围和反例。读取结果是行动参考，不是用户事实。',
-    'inputSchema': {'type':'object','additionalProperties':False,'properties': {'process_memory_id': {'type':'string','minLength':1}},'required':['process_memory_id']},
+    'description': '按稳定ID读取一条Agent过程记忆及来源、验证、适用范围和反例。Agent Recall/Research候选应优先使用本工具回读；不要把pm_*过程ID传给用户记忆read_source。读取结果是行动参考，不是用户事实。',
+    'inputSchema': {'type':'object','additionalProperties':False,'properties': {'process_memory_id': {'type':'string','minLength':1}, 'check_id': {'type':'string'}},'required':['process_memory_id']},
     'annotations': {'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False},
 }
 AGENT_CONTEXT_TOOL = {
@@ -376,9 +706,20 @@ AGENT_CONTEXT_TOOL = {
         'query': {'type':'string','minLength':1}, 'task_archetype': {'type':'string'}, 'phase': {'type':'string'},
         'model_family': {'type':'string'}, 'model_version': {'type':'string'}, 'capability_fingerprint': {'type':'string'},
         'toolchain': {'type':'array','items':{'type':'string'}}, 'primary_context': {'type':'object'},
-        'complexity': {'type':'string','enum':['low','normal','high']}, 'limit': {'type':'integer','minimum':1,'maximum':5,'default':3},
+        'complexity': {'type':'string','enum':['low','normal','high']}, 'offset': {'type':'integer','minimum':0,'default':0}, 'limit': {'type':'integer','minimum':1,'maximum':5,'default':3}, 'include_unverified': {'type':'boolean','default':True},
     },'required':['query']},
     'annotations': {'readOnlyHint':True,'destructiveHint':False,'idempotentHint':True,'openWorldHint':False},
+}
+AGENT_WORKSPACE_TOOL = {
+    'name': 'write_agent_process_workspace',
+    'description': '保存任务级Agent过程记忆候选工作区：记录候选ID、已选/已拒绝项、查询分面和下一页游标。只保存必要摘要与定位，不保存私有思维链，也不写入长期用户记忆。',
+    'inputSchema': {'type':'object','additionalProperties':False,'properties': {
+        'workspace_id': {'type':'string'}, 'query': {'type':'string'}, 'facets': {'type':'array','items':{'type':'string'},'maxItems':16},
+        'selected_ids': {'type':'array','items':{'type':'string'},'maxItems':10000}, 'rejected_ids': {'type':'array','items':{'type':'string'},'maxItems':10000},
+        'candidate_refs': {'type':'array','items':{'type':'object'},'maxItems':10000}, 'notes': {'type':'string','maxLength':4000},
+        'total_count': {'type':'integer','minimum':0}, 'next_offset': {'type':['integer','null'],'minimum':0}
+    }},
+    'annotations': {'readOnlyHint':False,'destructiveHint':False,'idempotentHint':False,'openWorldHint':False},
 }
 AGENT_REVALIDATION_TOOL = {
     'name': 'revalidate_agent_process_memory',
@@ -430,6 +771,9 @@ except Exception as guidance_v1_import_error:
     _GUIDANCE_V1_IMPORT_ERROR = type(guidance_v1_import_error).__name__
 else:
     _GUIDANCE_V1_IMPORT_ERROR = None
+if RUNTIME_GUIDANCE_TOOL is not None:
+    RUNTIME_GUIDANCE_TOOL = json.loads(json.dumps(RUNTIME_GUIDANCE_TOOL))
+    RUNTIME_GUIDANCE_TOOL['inputSchema'].setdefault('properties', {})['check_id'] = {'type':'string','description':'Explicit current Prompt binding; never inferred from the last session.'}
 FIND_SOURCES_TOOL = {
     'name':'find_sources',
     'description':'直接在 Bank 原始片段中查找字面词组，不依赖抽取摘要的向量排名。核对用户原话、只找到画像/助手转述或抽取遗漏时使用；先用 recall/research 找主题，再选同义词、关键词尝试原文。可限定文本中的 user/assistant 角色，但角色标签不证明人类身份。未命中不等于不存在。',
@@ -504,7 +848,7 @@ def audit_thread_history(args):
            'bank_status':'not_checked'}
     return {'content':[{'type':'text','text':json.dumps(value,ensure_ascii=False)}],'isError':False}
 RESEARCH_TOOL = {
-    'name':'research',
+    'name':'user_research',
     'description':'复杂历史知识路线。单次recall不足、多主题时间线或关联闭包时建立可分页证据工作区，由当前Agent继续分面、翻页和原文核对。对象未定时保留竞争假设，不把候选名称、预算拆分或阶段预填成已知事实；找到一版不等于排除其他版本。默认不生成长期模型，也不是简单任务或每轮必经步骤。',
     'inputSchema':{'type':'object','additionalProperties':False,'properties':{'query':{'type':'string','description':'原问题及当前对话确定的背景、范围和未解缺口；不虚构背景，不把预期答案写入查询。'}},'required':['query']},
     'annotations':{'readOnlyHint':True,'openWorldHint':False},
@@ -528,7 +872,7 @@ SOURCE_TOOL = {
     "annotations": {"readOnlyHint": True, "openWorldHint": False},
 }
 TOOL = {
-    "name": "recall",
+    "name": "user_recall",
     "description": (
         "历史知识路线。当前任务可能受已有事实、经历、关系、旧决定或经验影响时主动查询Evolving Profile，不等用户明确点名工具。返回受预算限制的候选预览和原文定位，不生成或发布长期模型。"
         "只用当前对话已确定的背景补全查询，不猜测指代；未核实的候选名称、预算拆分或版本阶段不得作为查询前提。可将多时间、多对象问题拆成 facets。"
@@ -557,14 +901,145 @@ TOOL = {
 
 
 for _tool in (TOOL,RESEARCH_TOOL,RESEARCH_PAGE_TOOL,SOURCE_TOOL,FIND_SOURCES_TOOL,
-              CONTEXT_SUMMARY_TOOL,SCENARIO_SUMMARY_TOOL,SCENARIO_GATE_TOOL,SCENARIO_CONTEXT_SEARCH_TOOL):
+              CONTEXT_SUMMARY_TOOL,SCENARIO_SUMMARY_TOOL,SCENARIO_GATE_TOOL,SCENARIO_CONTEXT_SEARCH_TOOL,
+              EXTERNAL_RAG_TOOL,AGENT_TRAJECTORY_TOOL,AGENT_DRAFT_TOOL,AGENT_PROMOTION_TOOL,
+              AGENT_RECALL_TOOL,AGENT_RESEARCH_TOOL,AGENT_READ_TOOL,AGENT_CONTEXT_TOOL,
+              AGENT_WORKSPACE_TOOL,AGENT_REVALIDATION_TOOL,AGENT_EVALUATION_TOOL,
+              AGENT_ROLLOUT_TOOL,AGENT_CAPABILITY_TOOL):
     _tool['inputSchema']['properties']['check_id']={'type':'string','description':'请传当前Hook为本条用户Prompt提供的消息级check_id；不要复用上一轮ID，也不要用turn_id代替。缺失或过期时工具仍执行，但观测回执会标成未归因。'}
+for _tool in (TOOL,RESEARCH_TOOL,RESEARCH_PAGE_TOOL,AGENT_RECALL_TOOL,AGENT_RESEARCH_TOOL,AGENT_CONTEXT_TOOL,EXTERNAL_RAG_TOOL):
+    _tool['inputSchema']['properties']['minimum_relevance']={'type':'string','enum':['strong','medium','weak'],'description':'可选：收紧本轮最低相关度；不能静默放宽配置。候选准入与来源验证分别记录。'}
+RESEARCH_TOOL['inputSchema']['properties']['facets']={'type':'array','items':{'type':'string','minLength':1},'minItems':1,'maxItems':8,'description':'独立子问题；检索始终保留主问题、主体与范围。'}
+AGENT_TRAJECTORY_TOOL['inputSchema']['properties']['outcome']['enum']=sorted(OUTCOMES)
+AGENT_CAPABILITY_TOOL['inputSchema']['properties']['outcome']['enum']=sorted(OUTCOMES | {'success','passed','failure','failed'})
+AGENT_CAPABILITY_TOOL['inputSchema']['properties']['verifier_kind']['enum']=sorted(INDEPENDENT_VERIFIERS)
+for key in ('sample_id','verification_scope'):
+    AGENT_CAPABILITY_TOOL['inputSchema']['properties'][key]={'type':'string'}
+AGENT_CAPABILITY_TOOL['inputSchema']['properties']['verification_evidence']={'type':'array','items':{'type':'object'}}
+
+def _bounded_relevance_audit(audit):
+    if not isinstance(audit, dict): return audit
+    value = dict(audit)
+    decisions = value.get('decisions')
+    if isinstance(decisions, list):
+        value['decisions_total'] = len(decisions)
+        value['decisions_truncated'] = len(decisions) > 20
+        value['decisions'] = decisions[:20]
+        value['diagnostic_boundary'] = 'Bounded decision samples, not a cap on retrieval candidates or pagination.'
+    return value
+
+def _tool_plane(tool, args):
+    if tool == 'rag_search': return 'external_rag'
+    if tool in {'agent_recall', 'agent_research'} or tool.startswith(('read_agent_', 'search_agent_', 'prepare_agent_', 'write_agent_', 'record_agent_', 'promote_agent_', 'revalidate_agent_', 'evaluate_agent_', 'manage_agent_')):
+        return 'agent_process'
+    if tool in {'read_scenario_summary', 'read_context_summary', 'search_scenario_summary', 'search_scenario_contexts', 'scenario_gate'}:
+        return args.get('purpose') if args.get('purpose') in {'agent_process', 'user_memory'} else 'scenario_context'
+    if tool in {'user_preference', 'get_preference', 'get_task_guidance', 'read_preference', 'read_guidance', 'read_preference_unit', 'read_guidance_unit'}:
+        return 'user_preference'
+    return 'user_memory'
+
+def _tool_stage(tool):
+    if tool.startswith('read_'): return 'readback'
+    if tool == 'record_agent_process_draft': return 'extract'
+    if tool.startswith('record_agent_'): return 'capture'
+    if tool.startswith('promote_agent_'): return 'promote'
+    if tool.startswith('evaluate_agent_'): return 'verify'
+    if tool.startswith(('revalidate_agent_', 'manage_agent_')): return 'revalidate'
+    if tool.startswith('write_agent_'): return 'associate'
+    return 'retrieve'
+
+def _route_receipt_path(root, check_id):
+    """Use the existing ingress SHA256 identity for every route outcome."""
+    identity = str(check_id or '').strip()
+    if not identity: raise ValueError('route_receipt_check_id_required')
+    return Path(root)/(hashlib.sha256(identity.encode()).hexdigest()+'.json')
+
+def _route_receipt_for_binding(root, check_id, binding):
+    target = _route_receipt_path(root, check_id)
+    identity = str(check_id or '').strip()
+    try: receipt = json.loads(target.read_text(encoding='utf-8'))
+    except (OSError,ValueError,TypeError):
+        receipt = {'schema':'evolving-profile.memory-check.v1','check_id':identity,'prompt_binding':{}}
+    if not isinstance(receipt,dict) or receipt.get('check_id') not in (None,identity):
+        raise ValueError('route_receipt_binding_mismatch')
+    old_binding = receipt.get('prompt_binding') or {}
+    if not isinstance(old_binding,dict) or any(old_binding.get(key) not in (None,'',binding.get(key))
+            for key in ('session_id','turn_id','hook_invocation_id')):
+        raise ValueError('route_receipt_binding_mismatch')
+    if binding.get('state') != 'prompt_bound' or binding.get('hook_invocation_id') != identity:
+        raise ValueError('route_receipt_binding_mismatch')
+    receipt.update(check_id=identity,prompt_binding={key:binding.get(key) for key in ('session_id','turn_id','hook_invocation_id')})
+    return target,receipt
+
+def _route_receipt_counts(receipt):
+    events = receipt.get('tool_events') or []
+    failures = sum(bool(event.get('failed')) for event in events)
+    receipt.update(route_started=bool(events),tool_called=bool(events),failed_tool_call_count=failures,
+                   returned_count=sum(int(event.get('returned_count') or 0) for event in events))
+    navigation_events = [event for event in events if 'source_navigation_returned_count' in event]
+    if navigation_events:
+        receipt['source_navigation_returned_count'] = sum(int(event.get('source_navigation_returned_count') or 0) for event in navigation_events)
+        receipt['source_navigation_returned_ids'] = list(dict.fromkeys(mid for event in navigation_events for mid in event.get('source_navigation_returned_ids') or []))
+    receipt['delivery_state'] = ('failed' if failures == len(events) else 'partial_failure') if failures else (
+        'returned' if receipt['returned_count'] > 0 else 'source_navigation_returned' if receipt.get('source_navigation_returned_count') else 'tool_called_empty' if events else 'not_started')
+    return receipt
+
+def _begin_tool_call(params, message_id, *, started_at=None):
+    """Freeze occurrence attribution before dispatch, independent of completion."""
+    started_at = started_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    args = dict(params.get('arguments') or {})
+    if args.get('check_id') is not None: args['check_id'] = str(args['check_id']).strip()
+    meta = params.get('_meta') or {}
+    host_call_id = meta.get('tool_call_id') or meta.get('call_id')
+    return {'name':params.get('name'),'arguments':args,
+            'tool_call_id':str(host_call_id) if host_call_id else 'mcp:'+str(uuid.uuid4()),
+            'host_call_id':host_call_id,'mcp_request_id':message_id,'invocation_started_at':started_at,
+            'caller_context':{key:meta[key] for key in ('session_id','turn_id') if isinstance(meta.get(key),str)},
+            'binding_at_start':_prompt_binding_for_check_id(args.get('check_id'),started_at)}
+
+def _record_failed_tool_call(tool, args, error, event_at):
+    check_id = str(args.get('check_id') or '').strip()
+    call = CURRENT_TOOL_CALL or {}
+    binding = call.get('binding_at_start') or _prompt_binding_for_check_id(check_id,event_at)
+    event = {'at':event_at,'tool':tool,'check_id':check_id,'failed':True,
+             'tool_call_id':call.get('tool_call_id'), 'occurrence_id':call.get('tool_call_id'),
+             'host_call_id':call.get('host_call_id'), 'mcp_request_id':call.get('mcp_request_id'),
+             'invocation_started_at':call.get('invocation_started_at'),
+             'plane':_tool_plane(tool,args),'purpose':args.get('purpose') or 'unspecified',
+             'stage':_tool_stage(tool),
+             'status':'failed','returned_count':None,'candidate_count':None,'source_read_count':0,
+             'binding_state':binding.get('state'),'session_id':binding.get('session_id'),
+             'turn_id':binding.get('turn_id'),'hook_invocation_id':binding.get('hook_invocation_id'),
+             'error':mask_text(str(error.get('message') if isinstance(error,dict) else error))[:1200],
+             'delivery':{'host_visibility':'unknown','answer_use':'not_measured'}}
+    audit_root = Path.home()/'.evolving-profile/audit'
+    audit_root.mkdir(parents=True,exist_ok=True)
+    with (audit_root/'mcp-tool-activity.jsonl').open('a',encoding='utf-8') as stream:
+        stream.write(json.dumps(event,ensure_ascii=False)+'\n')
+    if binding.get('state') == 'prompt_bound':
+        root = Path(os.environ.get('EVOLVING_PROFILE_ROUTE_RECEIPT_ROOT',str(audit_root/'memory-route-receipts')))
+        root.mkdir(parents=True,exist_ok=True)
+        target,receipt = _route_receipt_for_binding(root,check_id,binding)
+        events = list(receipt.get('tool_events') or []);events.append(event)
+        receipt.update(tool_events=events,updated_at=event_at)
+        _route_receipt_counts(receipt)
+        temporary = target.with_suffix('.tmp');temporary.write_text(json.dumps(receipt,ensure_ascii=False));temporary.replace(target)
 
 
 def _returned_count(value, tool):
     if not isinstance(value,dict):return 0
     tool=str(tool or '')
-    if tool.endswith(('get_preference','read_preference','read_preference_unit')):
+    if tool.endswith(('read_preference_unit', 'read_guidance_unit')) and isinstance(value.get('unit'), dict):
+        unit = value['unit']
+        return 1 if unit.get('id') or unit.get('unit_id') or unit.get('text') else 0
+    if tool in {'agent_recall', 'agent_research', 'search_agent_process_memory', 'read_agent_process_memory'}:
+        if type(value.get('returned_count')) is int:
+            return max(0, value['returned_count'])
+        if isinstance(value.get('records'), list):
+            return len(value['records'])
+        if isinstance(value.get('record'), dict):
+            return 1
+    if tool.endswith(('user_preference','get_preference','read_preference','read_preference_unit')):
         guidance=value.get('guidance_view') or value
         ids=[]
         for key in ('included','stable_profile','guidance_items','model_sections','entries'):
@@ -575,6 +1050,10 @@ def _returned_count(value, tool):
         if ids:return len(set(ids))
     memories=value.get('memories') or []
     if isinstance(memories,list) and memories:return len(memories)
+    if tool in {'search_scenario_summary', 'search_scenario_contexts', 'read_scenario_summary', 'read_context_summary', 'scenario_gate'}:
+        scenario_items = value.get('items') or value.get('scenarios') or []
+        if isinstance(scenario_items, list):
+            return len(scenario_items)
     if tool.endswith('read_source'):
         source=value.get('source') or {}
         return 1 if (value.get('memory') or {}).get('id') and isinstance(source,dict) and isinstance(source.get('text'),str) and source.get('text') else 0
@@ -584,8 +1063,31 @@ def _returned_count(value, tool):
     return 0
 
 
+def _source_navigation_fields(value):
+    """Observability only: keep returned locators separate from fact bodies."""
+    if not isinstance(value, dict) or not isinstance(value.get('source_navigation'), list):
+        return {}
+    rows, seen = [], set()
+    for row in value['source_navigation']:
+        if not isinstance(row, dict) or not isinstance(row.get('memory_id'), str) or not row['memory_id'] or row['memory_id'] in seen:
+            continue
+        witness = row.get('scope_verification') or {}
+        scope = row.get('scope_status') or (witness.get('status') if isinstance(witness,dict) else None)
+        if row.get('permission_status') in {'denied','blocked'} or scope in {'denied','mismatch'} or row.get('hard_scope_match') is False or row.get('state') in {'invalidated','withdrawn'}:
+            continue
+        seen.add(row['memory_id'])
+        locator = {key:row[key] for key in ('memory_id','document_id','chunk_id','source_revision','subject_relation','claim_verification','authority') if isinstance(row.get(key),str)}
+        action = row.get('next_action') if isinstance(row.get('next_action'),dict) else {}
+        arguments = action.get('arguments') if isinstance(action.get('arguments'),dict) else {}
+        if action.get('tool') == 'read_source' and arguments.get('memory_id') == row['memory_id']:
+            locator['next_action'] = {'tool':'read_source','arguments':{key:arguments[key] for key in ('memory_id','scope') if isinstance(arguments.get(key),str)}}
+        rows.append(locator)
+    return {'source_navigation':rows,'source_navigation_returned_count':len(rows),
+            'source_navigation_returned_ids':[row['memory_id'] for row in rows]}
+
+
 def _scenario_activity_fields(value):
-    if not isinstance(value, dict) or value.get('source') != 'scenario_summary_index':
+    if not isinstance(value, dict) or not isinstance(value.get('source'), str) or value.get('source') not in {'scenario_summary_index', 'scenario_context_index'}:
         return {}
     items = [item for item in value.get('items') or [] if isinstance(item, dict)]
     episodes = []
@@ -627,6 +1129,21 @@ def _scenario_activity_fields(value):
     return fields
 
 
+def _agent_process_scenario_activity_fields(value):
+    followup = value.get('scenario_followup') if isinstance(value, dict) else None
+    if not isinstance(followup, dict):
+        return {}
+    scenarios = [item for item in followup.get('scenarios') or [] if isinstance(item, dict)]
+    unresolved = [item for item in followup.get('unresolved_contexts') or [] if isinstance(item, dict)]
+    return {
+        'scenario_ids': [item.get('scenario_id') for item in scenarios if item.get('scenario_id')][:20],
+        'scenario_navigation_roles': [(item.get('scenario_id'), 'process_context_candidate') for item in scenarios if item.get('scenario_id')][:20],
+        'scope_hypothesis_count': len(scenarios) + len(unresolved),
+        'scope_route_policy': {'state': 'scope_unresolved' if followup.get('required') else 'scope_resolved', 'required_next_action': followup.get('next_tool')},
+        'scenario_decision': followup.get('decision'),
+    }
+
+
 def _prompt_binding_for_check_id(check_id,event_at,home=None):
     check_id=str(check_id or '').strip()
     if not check_id:return {'state':'unbound_missing_check_id'}
@@ -645,12 +1162,19 @@ def _prompt_binding_for_check_id(check_id,event_at,home=None):
             except (ValueError,TypeError):continue
     except OSError:
         return {'state':'unknown_prompt_ingress','check_id':check_id}
-    bound=next((row for row in reversed(rows) if str(row.get('hook_invocation_id') or '')==check_id),None)
+    matches=[row for row in rows if str(row.get('hook_invocation_id') or '')==check_id]
+    if len({(str(row.get('session_id') or ''),str(row.get('turn_id') or '')) for row in matches}) > 1:
+        return {'state':'ambiguous_prompt_binding','check_id':check_id}
+    bound=matches[-1] if matches else None
     if not bound:return {'state':'unknown_check_id','check_id':check_id}
     session_id=str(bound.get('session_id') or '')
     try:event_time=datetime.datetime.fromisoformat(str(event_at).replace('Z','+00:00'))
     except (TypeError,ValueError,OverflowError):return {'state':'unknown_event_time','check_id':check_id}
     if event_time.tzinfo is None:event_time=event_time.replace(tzinfo=datetime.timezone.utc)
+    try:bound_time=datetime.datetime.fromisoformat(str(bound.get('at') or '').replace('Z','+00:00'))
+    except (ValueError,TypeError):return {'state':'unknown_prompt_time','check_id':check_id}
+    if bound_time.tzinfo is None:bound_time=bound_time.replace(tzinfo=datetime.timezone.utc)
+    if bound_time > event_time:return {'state':'unknown_check_id_at_call_time','check_id':check_id}
     latest=None;latest_time=None
     for row in rows:
         if str(row.get('session_id') or '')!=session_id:continue
@@ -660,6 +1184,8 @@ def _prompt_binding_for_check_id(check_id,event_at,home=None):
         if row_time<=event_time and (latest_time is None or row_time>latest_time):latest=row;latest_time=row_time
     value={'state':'prompt_bound','check_id':check_id,'session_id':session_id,'turn_id':bound.get('turn_id'),
            'hook_invocation_id':bound.get('hook_invocation_id')}
+    for key in ('project_id', 'project_key', 'cwd', 'transcript_path', 'model', 'model_provider', 'host', 'host_id'):
+        if bound.get(key): value[key] = bound[key]
     if latest and str(latest.get('hook_invocation_id') or '')!=check_id:
         value.update(state='stale_prompt_binding',latest_turn_id=latest.get('turn_id'),
                      latest_hook_invocation_id=latest.get('hook_invocation_id'))
@@ -709,17 +1235,32 @@ def reply(message_id, result=None, error=None):
     call=dict(CURRENT_TOOL_CALL or {})
     tool=str(call.get('name') or '')
     args=call.get('arguments') or {}
-    check_id=str(args.get('check_id') or '')
+    check_id=str(args.get('check_id') or '').strip()
     event_at=datetime.datetime.now(datetime.timezone.utc).isoformat()
-    binding={'state':'unbound_missing_check_id'}
+    binding=call.get('binding_at_start') or (_prompt_binding_for_check_id(check_id,event_at) if tool else {'state':'unbound_missing_check_id'})
+    if error is not None and isinstance(error,dict) and call.get('tool_call_id'):
+        error={**error,'data':{**(error.get('data') if isinstance(error.get('data'),dict) else {}),
+            'tool_call_id':call['tool_call_id'],'occurrence_id':call['tool_call_id'],
+            'host_call_id':call.get('host_call_id'),'mcp_request_id':call.get('mcp_request_id'),
+            'invocation_started_at':call.get('invocation_started_at'),'observability_binding':binding,
+            'plane':_tool_plane(tool,args),'stage':_tool_stage(tool),'purpose':args.get('purpose') or 'unspecified'}}
+    if error is not None and tool:
+        try: _record_failed_tool_call(tool,args,error,event_at)
+        except (OSError,ValueError,TypeError) as audit_error:
+            sys.stderr.write('failed tool attribution unavailable: '+type(audit_error).__name__+'\n')
     if result and isinstance(result,dict):
         for block in result.get('content',[]):
             if block.get('type')=='text':
                 try:
                     value=json.loads(block['text'])
                     if isinstance(value,dict) and CURRENT_TOOL_CALL:
-                        binding=_prompt_binding_for_check_id(check_id,event_at)
                         value['observability_binding']=binding
+                        if call.get('tool_call_id'):
+                            value.update(tool_call_id=call['tool_call_id'], occurrence_id=call['tool_call_id'],
+                                         host_call_id=call.get('host_call_id'), mcp_request_id=call.get('mcp_request_id'),
+                                         invocation_started_at=call.get('invocation_started_at'),
+                                         plane=_tool_plane(tool,args), purpose=args.get('purpose') or 'unspecified',
+                                         stage=_tool_stage(tool))
                         if tool in {'recall','research'}:
                             value['query_scope_audit']=_query_scope_audit(check_id,str(args.get('query') or ''),binding)
                             value['evidence_contract']={
@@ -731,9 +1272,11 @@ def reply(message_id, result=None, error=None):
                                 'stop_rule':'Stop when the requested slots have direct-source support and remaining conflicts are either resolved or explicitly reported as unresolved. A next page is an option, not an obligation to exhaust all candidates.',
                             }
                         if tool in {'recall','research','read_research','read_source','find_sources',
-                                    'get_preference','read_preference','read_preference_unit',
-                                    'read_scenario_summary','read_context_summary'}:
+                                    'user_preference','get_preference','read_preference','read_preference_unit','read_agent_process_memory',
+                                    'search_scenario_summary','search_scenario_contexts','read_scenario_summary','read_context_summary','scenario_gate'}:
                             value['returned_count']=_returned_count(value,tool)
+                        if tool == 'read_agent_process_memory':
+                            value['original_message_readback_count'] = int(bool((value.get('raw_source') or {}).get('text')))
                         if binding.get('state')=='stale_prompt_binding':
                             value['observability_warning']='check_id belongs to an earlier Prompt; this result was returned but was not attached to its older Prompt receipt.'
                         elif binding.get('state') in {'unbound_missing_check_id','unknown_check_id','unknown_prompt_ingress'}:
@@ -742,6 +1285,24 @@ def reply(message_id, result=None, error=None):
                         value['adapter_config_generation']=os.environ.get('EVOLVING_PROFILE_CONFIG_GENERATION','unspecified')
                     if isinstance(value, dict):
                         value['adapter_build_sha256'] = ADAPTER_BUILD_SHA256
+                        raw_relevance_audit = value.get('relevance_audit') or value.get('relevance_policy')
+                        if isinstance(raw_relevance_audit, dict):
+                            value['relevance_audit'] = _bounded_relevance_audit(raw_relevance_audit)
+                            if isinstance(value.get('relevance_policy'), dict):
+                                value['relevance_policy'] = value['relevance_audit']
+                    if isinstance(value, dict) and tool == 'rag_search':
+                        external_review = (value.get('retrieval') or {}).get('judge')
+                        if isinstance(external_review, dict):
+                            try: audit_external_review(external_review, binding)
+                            except OSError: pass
+                            value['retrieval']['judge'] = jev_caller_view(external_review)
+                    if isinstance(value, dict) and CURRENT_TOOL_CALL and tool in {'user_recall', 'user_research', 'agent_recall', 'agent_research', 'read_research', 'read_source', 'read_agent_process_memory'} and not result.get('isError'):
+                        try:
+                            review_receipt = project_tool_review(tool, args, value, binding)
+                            if review_receipt.get('status') != 'disabled':
+                                value['jev_review'] = review_receipt
+                        except Exception as judge_error:
+                            value['jev_review'] = {'status': 'unavailable', 'fallback': 'rules', 'memory_mutated': False, 'error_type': type(judge_error).__name__, 'failure_stage': 'review_adapter'}
                     safe=mask_value(value)
                     if safe!=value and isinstance(safe,dict):safe['credential_redaction']='recognized patterns masked; not exhaustive; source offsets and hashes refer to original storage'
                     block['text']=json.dumps(safe,ensure_ascii=False)
@@ -754,6 +1315,7 @@ def reply(message_id, result=None, error=None):
     # Keep a bounded activity ledger. Exact Prompt identity is copied from
     # prompt-ingress only after validating that the supplied check_id is still
     # the latest Prompt for that session at tool-call time.
+    snapshot = None
     try:
         if CURRENT_TOOL_CALL and result and isinstance(result,dict) and result.get('content'):
             value=json.loads(result['content'][0].get('text','{}'))
@@ -762,50 +1324,85 @@ def reply(message_id, result=None, error=None):
             for key in ('included','stable_profile','guidance_items','model_sections'):
                 guidance_items.extend(item.get('id') or item.get('section_id') for item in (guidance.get(key) or []) if isinstance(item,dict))
             guidance_items=list(dict.fromkeys(str(item) for item in guidance_items if item))
-            memories=value.get('memories') or []
+            unit = value.get('unit') if isinstance(value.get('unit'),dict) else None
+            if unit:
+                unit_id = unit.get('id') or unit.get('unit_id') or args.get('id')
+                if unit_id and str(unit_id) not in guidance_items: guidance_items.append(str(unit_id))
+            memories=value.get('memories') or value.get('records') or []
             discovered=value.get('discovered_reference_count')
             if discovered is None:discovered=value.get('candidate_count')
             activity_root=Path.home()/'.evolving-profile/audit/mcp-tool-activity.jsonl'
             activity_root.parent.mkdir(parents=True,exist_ok=True)
+            snapshot=None
+            if not result.get('isError'):
+                try:
+                    from lib.returned_content import returned_items, archive_returned_items
+                    snapshot=archive_returned_items(Path.home(),tool,returned_items(value),binding,call)
+                except (OSError, ValueError, TypeError):
+                    snapshot=None
             event={'at':event_at,'tool':tool,'check_id':check_id,
+                   'tool_call_id':call.get('tool_call_id'), 'occurrence_id':call.get('tool_call_id'),
+                   'host_call_id':call.get('host_call_id'), 'mcp_request_id':call.get('mcp_request_id'),
+                   'invocation_started_at':call.get('invocation_started_at'),
+                   'plane':_tool_plane(tool,args), 'stage':_tool_stage(tool),
+                   'purpose':args.get('purpose') or 'unspecified',
+                   'query':mask_text(str(args.get('query') or '')), 'workspace_id':value.get('workspace_id'),
+                   'jev_review':value.get('jev_review'),
+                   'relevance_audit':value.get('relevance_audit'),
                    'session_id':binding.get('session_id'),'turn_id':binding.get('turn_id'),
                    'hook_invocation_id':binding.get('hook_invocation_id'),'binding_state':binding.get('state'),
                    'latest_hook_invocation_id':binding.get('latest_hook_invocation_id'),
                    'research_id':value.get('research_id'),'candidate_count':discovered,
                    'returned_count':_returned_count(value,tool),
                    'source_read_count':1 if tool.endswith('read_source') and _returned_count(value,tool) else 0,
-                   'memory_ids':[item.get('id') for item in memories if isinstance(item,dict) and item.get('id')][:50],
+                   'memory_ids':[item.get('id') or item.get('process_memory_id') for item in memories if isinstance(item,dict) and (item.get('id') or item.get('process_memory_id'))][:100],
                    'memory_id':(value.get('memory') or {}).get('id'),'guidance_ids':guidance_items[:100],
+                   'original_message_readback_count':value.get('original_message_readback_count',0),
+                   'raw_source_status':value.get('raw_source_status'),
+                   'raw_source_coverage':value.get('raw_source_coverage'),
+                   'mapping_items':_process_mapping_items(value),
+                   'returned_content_snapshot':snapshot,
+                   **_source_navigation_fields(value),
                    'guidance_count':len(guidance_items),'deferred_count':len(guidance.get('deferred') or []),'delivery':value.get('delivery') or {},
                    'scenario_ids':[item.get('scenario_id') for item in (value.get('items') or []) if isinstance(item,dict) and item.get('scenario_id')][:20],
                    'scenario_navigation_roles':[(item.get('scenario_id'),item.get('navigation_role')) for item in (value.get('items') or []) if isinstance(item,dict) and item.get('scenario_id')][:20],
                    **_scenario_activity_fields(value),
+                   **_agent_process_scenario_activity_fields(value),
                    'scope_hypothesis_count':len((value.get('hypotheses') or {}).get('hypotheses') or []) if isinstance(value.get('hypotheses'),dict) else 0,
                    'scope_route_policy':value.get('route_policy') or {},
-                   'scenario_decision':value.get('decision') if tool=='scenario_gate' else None}
+                   'scenario_decision':value.get('decision') if tool=='scenario_gate' else (value.get('scenario_followup') or {}).get('decision')}
             if tool in {'recall','research'}:
                 event['query_scope_status']=(value.get('query_scope_audit') or {}).get('status')
             with activity_root.open('a',encoding='utf-8') as stream:
                 stream.write(json.dumps(event,ensure_ascii=False)+'\n')
     except Exception:
         pass
+    if tool and call.get('tool_call_id'):
+        body = {}
+        try:
+            body = json.loads((result or {}).get('content', [{}])[0].get('text', '{}'))
+        except (ValueError, TypeError, IndexError): pass
+        failed = error is not None or bool((result or {}).get('isError'))
+        unavailable = isinstance(body,dict) and (body.get('status') in {'source_missing', 'source_empty', 'not_found', 'disabled', 'unavailable', 'source_unavailable', 'episode_not_found'} or str(body.get('status') or '').startswith('unknown'))
+        capture_tool_trajectory(tool,args,outcome='blocked' if failed else 'ambiguous' if unavailable or not body else 'correct',
+                                error=str(error) if error else None,binding=binding,result=body,tool_call_id=call['tool_call_id'])
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
     try:
         if CURRENT_TOOL_CALL and result and isinstance(result,dict) and result.get('content') and check_id and binding.get('state')=='prompt_bound':
                 value=json.loads(result['content'][0].get('text','{}'))
                 root=Path(os.environ.get('EVOLVING_PROFILE_ROUTE_RECEIPT_ROOT',str(Path.home()/'.evolving-profile/audit/memory-route-receipts')))
-                target=root/(hashlib.sha256(check_id.encode()).hexdigest()+'.json')
-                try: receipt=json.loads(target.read_text(encoding='utf-8'))
-                except (OSError,ValueError,TypeError): receipt={'schema':'evolving-profile.memory-check.v1','check_id':check_id,'prompt_binding':{}}
-                old_binding=receipt.get('prompt_binding') or {}
-                if old_binding and (str(old_binding.get('hook_invocation_id') or '')!=check_id or
-                                    str(old_binding.get('session_id') or '')!=str(binding.get('session_id') or '')):
-                    raise ValueError('route_receipt_binding_mismatch')
-                receipt['prompt_binding']={'session_id':binding.get('session_id'),'turn_id':binding.get('turn_id'),
-                                           'hook_invocation_id':binding.get('hook_invocation_id')}
+                target,receipt=_route_receipt_for_binding(root,check_id,binding)
                 events=list(receipt.get('tool_events') or [])
                 events.append({'tool':tool,'at':event_at,'check_id':check_id,
+                               'tool_call_id':call.get('tool_call_id'), 'occurrence_id':call.get('tool_call_id'),
+                               'host_call_id':call.get('host_call_id'), 'mcp_request_id':call.get('mcp_request_id'),
+                               'invocation_started_at':call.get('invocation_started_at'), 'failed':bool(result.get('isError')),
+                               'plane':_tool_plane(tool,args), 'stage':_tool_stage(tool),
+                               'purpose':args.get('purpose') or 'unspecified',
+                               'query':mask_text(str(args.get('query') or '')), 'workspace_id':value.get('workspace_id'),
+                               'jev_review':value.get('jev_review'),
+                               'relevance_audit':value.get('relevance_audit'),
                                'session_id':binding.get('session_id'),'turn_id':binding.get('turn_id'),
                                'hook_invocation_id':binding.get('hook_invocation_id'),'binding_state':binding.get('state'),
                                'route':value.get('route') or value.get('mode') or tool,
@@ -813,19 +1410,24 @@ def reply(message_id, result=None, error=None):
                                'returned_count':_returned_count(value,tool),'next_offset':value.get('next_offset'),
                                'source_read_count':1 if tool.endswith('read_source') and _returned_count(value,tool) else 0,
                                'memory_id':(value.get('memory') or {}).get('id'),
-                               'memory_ids':[item.get('id') for item in (value.get('memories') or []) if isinstance(item,dict) and item.get('id')][:50],
+                               'guidance_ids':guidance_items[:100],
+                               'original_message_readback_count':value.get('original_message_readback_count',0),
+                               'raw_source_status':value.get('raw_source_status'),
+                               'raw_source_coverage':value.get('raw_source_coverage'),
+                               'mapping_items':_process_mapping_items(value),
+                               'returned_content_snapshot':snapshot,
+                               **_source_navigation_fields(value),
+                               'memory_ids':[item.get('id') or item.get('process_memory_id') for item in (value.get('memories') or value.get('records') or []) if isinstance(item,dict) and (item.get('id') or item.get('process_memory_id'))][:100],
                                'delivery':value.get('delivery') or {},
                                'scenario_ids':[item.get('scenario_id') for item in (value.get('items') or []) if isinstance(item,dict) and item.get('scenario_id')][:20],
                                **_scenario_activity_fields(value),
-                               'scenario_decision':value.get('decision') if tool=='scenario_gate' else None})
-                receipt['tool_events']=events[-20:];receipt['updated_at']=datetime.datetime.now(datetime.timezone.utc).isoformat()
+                               **_agent_process_scenario_activity_fields(value),
+                               'scenario_decision':value.get('decision') if tool=='scenario_gate' else (value.get('scenario_followup') or {}).get('decision')})
+                receipt['tool_events']=events;receipt['updated_at']=datetime.datetime.now(datetime.timezone.utc).isoformat()
                 planned = receipt.get('recommended_route') or receipt.get('history_plan', {}).get('recommended_route')
                 required = bool(receipt.get('route_required')) or planned in {'recall', 'research'} or receipt.get('history_plan', {}).get('minimum_action') in {'recall_probe', 'agent_query'}
                 receipt['route_required'] = required
-                receipt['route_started'] = bool(events)
-                receipt['tool_called'] = bool(events)
-                receipt['returned_count'] = sum(int(event.get('returned_count') or 0) for event in events)
-                receipt['delivery_state'] = 'returned' if receipt['returned_count'] > 0 else ('tool_called_empty' if events else 'not_started')
+                _route_receipt_counts(receipt)
                 receipt['unresolved'] = [] if events else (['EP历史工具尚未调用；本地文件搜索或候选提示不计为历史核验'] if required else [])
                 root.mkdir(parents=True,exist_ok=True);tmp=target.with_suffix('.tmp');tmp.write_text(json.dumps(receipt,ensure_ascii=False),encoding='utf-8');tmp.replace(target)
     except Exception:
@@ -864,14 +1466,108 @@ def memory_check_route(args):
     route_root=Path(os.environ.get('EVOLVING_PROFILE_ROUTE_RECEIPT_ROOT',str(Path.home()/'.evolving-profile/audit/memory-route-receipts')))
     previous={}
     if args.get('check_id'):
-        try: previous=json.loads((route_root/(hashlib.sha256(str(args['check_id']).encode()).hexdigest()+'.json')).read_text(encoding='utf-8'))
+        try: previous=json.loads(_route_receipt_path(route_root,args['check_id']).read_text(encoding='utf-8'))
         except (OSError,ValueError,TypeError): previous={}
     value['prompt_binding']=dict(previous.get('prompt_binding') or {})
     try:
         root=route_root;root.mkdir(parents=True,exist_ok=True)
-        (root/(hashlib.sha256(value['check_id'].encode()).hexdigest()+'.json')).write_text(json.dumps(value,ensure_ascii=False),encoding='utf-8')
+        _route_receipt_path(root,value['check_id']).write_text(json.dumps(value,ensure_ascii=False),encoding='utf-8')
     except OSError:
         pass
+    return value
+
+
+def memory_check_declaration(args):
+    """Declare against a verified Hook occurrence; never infer a caller identity."""
+    check_id = args.get('check_id')
+    if not isinstance(check_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', check_id):
+        raise ValueError('invalid check_id')
+    need, prompt, reason = args.get('need'), args.get('full_prompt'), args.get('reason')
+    if need not in ('required', 'not_needed', 'unavailable'):
+        raise ValueError('invalid need')
+    if not isinstance(prompt, str) or not prompt.strip() or not isinstance(reason, str) or not reason.strip():
+        raise ValueError('full_prompt and reason are required')
+    call = CURRENT_TOOL_CALL or {}
+    caller = call.get('caller_context') or {}
+    event_at = call.get('invocation_started_at') or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    binding = call.get('binding_at_start') or _prompt_binding_for_check_id(check_id, event_at)
+    if binding.get('state') not in {'prompt_bound', 'unknown_check_id', 'unknown_prompt_ingress'}:
+        raise ValueError('memory_check identity is not current: ' + str(binding.get('state')))
+    if binding.get('state') == 'prompt_bound' and not all(binding.get(key) for key in ('session_id','turn_id','hook_invocation_id')):
+        raise ValueError('memory_check Hook identity incomplete')
+    from collections import deque
+    ingress = Path.home()/'.evolving-profile/audit/prompt-ingress.jsonl'
+    try:
+        with ingress.open(encoding='utf-8') as stream:
+            lines = deque(stream, maxlen=4000)
+    except OSError:
+        lines = []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+            if isinstance(row, dict): rows.append(row)
+        except (ValueError, TypeError): pass
+    if binding.get('state') != 'prompt_bound':
+        # A modern unknown may be a real legacy registration, never a new ID.
+        import sqlite3
+        root = Path(os.environ.get('HINDSIGHT_TURN_CHECK_ROOT', str(Path.home()/'.evolving-profile/memory-os/turn-checks')))
+        registry = root/'checks.sqlite3'
+        if not registry.is_file():
+            raise ValueError('check_id was not registered by a Hook; do not invent one')
+        try:
+            with sqlite3.connect(registry.as_uri()+'?mode=ro', uri=True, timeout=.5) as connection:
+                registered = connection.execute('SELECT session,turn,payload FROM checks WHERE id=?', (check_id,)).fetchone()
+                latest = connection.execute('SELECT id FROM checks WHERE session=? ORDER BY rowid DESC LIMIT 1', (registered[0],)).fetchone() if registered else None
+        except sqlite3.Error:
+            raise ValueError('legacy check registry unavailable') from None
+        if not registered:
+            raise ValueError('check_id was not registered by a Hook; do not invent one')
+        if not all(registered[:2]) or not latest or latest[0] != check_id:
+            raise ValueError('memory_check identity is not current: stale_legacy_binding')
+        def occurrence_time(value):
+            try:
+                parsed = datetime.datetime.fromisoformat(str(value).replace('Z','+00:00'))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.timezone.utc)
+            except (ValueError, TypeError): return None
+        legacy_at = occurrence_time(json.loads(registered[2]).get('at'))
+        dispatch_at = occurrence_time(event_at)
+        if legacy_at and legacy_at > dispatch_at:
+            raise ValueError('memory_check identity is not current: future_legacy_binding')
+        same_session = [row for row in rows if row.get('session_id') == registered[0]]
+        current_rows = [row for row in same_session if occurrence_time(row.get('at')) and occurrence_time(row.get('at')) <= dispatch_at]
+        latest_modern = max(current_rows, key=lambda row:occurrence_time(row.get('at')), default=None)
+        if (any(not occurrence_time(row.get('at')) for row in same_session)
+                or latest_modern and latest_modern.get('turn_id') != registered[1]
+                and (not legacy_at or occurrence_time(latest_modern.get('at')) >= legacy_at)):
+            raise ValueError('memory_check identity is not current: legacy_turn_unverified')
+        if any(caller.get(key) and caller[key] != expected for key,expected in zip(('session_id','turn_id'),registered[:2])):
+            raise ValueError('memory_check caller identity does not match Hook binding')
+        from memory_turn_check import declare
+        value = declare(check_id, prompt, need, reason, root=root)
+        value.update(actor='agent_declaration_not_execution', original_prompt_coverage='legacy_hook_registration',
+            caller_identity_state='caller_identity_verified' if all(caller.get(key) for key in ('session_id','turn_id')) else 'caller_identity_unverified')
+        return value
+    if any(caller.get(key) and caller[key] != binding.get(key) for key in ('session_id','turn_id')):
+        raise ValueError('memory_check caller identity does not match Hook binding')
+    source = next((row for row in reversed(rows) if row.get('hook_invocation_id') == check_id
+        and row.get('session_id') == binding.get('session_id') and row.get('turn_id') == binding.get('turn_id')), None)
+    if not source or not isinstance(source.get('prompt_preview'), str) or not source['prompt_preview'].strip():
+        raise ValueError('memory_check trusted Hook prompt unavailable')
+    from memory_turn_check import process_memory_route_hint, POLICY_VERSION
+    value = {'mode':'memory_check_declaration', 'check_id':check_id, 'need':need,
+        'actor':'agent_declaration_not_execution', 'execution_verified':False,
+        'original_prompt':source['prompt_preview'], 'original_prompt_coverage':'hook_ingress_preview',
+        'original_prompt_complete':False,
+        'caller_identity_state':'caller_identity_verified' if all(caller.get(key) for key in ('session_id','turn_id')) else 'caller_identity_unverified',
+        'agent_full_prompt':prompt, 'reason':reason, 'semantic_alignment':'not_verified',
+        'policy_version':POLICY_VERSION, 'process_memory_route':process_memory_route_hint(prompt),
+        'next_action':'Use recall/research with this check_id when required; declaration does not perform retrieval.'}
+    root = Path(os.environ.get('EVOLVING_PROFILE_ROUTE_RECEIPT_ROOT', str(Path.home()/'.evolving-profile/audit/memory-route-receipts')))
+    target, receipt = _route_receipt_for_binding(root, check_id, binding)
+    receipt['declaration'] = mask_value({**value, 'at':event_at})
+    from evidence_workspace import _save
+    _save(target, receipt)
     return value
 
 
@@ -1002,10 +1698,28 @@ def read_context_summary(args):
     wanted_id = str(args.get('scenario_id') or args.get('context_id') or '').strip()
     wanted_session = str(args.get('session_id') or '').strip()
     wanted_project = str(args.get('project_key') or '').strip()
+    if context_type=='session' and wanted_id and ':' not in wanted_id and '/' not in wanted_id:
+        try:wanted_id='session:'+str(uuid.UUID(wanted_id))
+        except ValueError:pass
+    if context_type=='session' and wanted_session and wanted_id.startswith('session:') and '/turn/' not in wanted_id:
+        try:locator_session=str(uuid.UUID(wanted_id[8:]));bare_session=str(uuid.UUID(wanted_session))
+        except ValueError:locator_session=wanted_id[8:];bare_session=wanted_session
+        if locator_session!=bare_session:raise ValueError('conflicting_session_scenario_locator')
+    anchor_turn = None
+    if wanted_id.startswith('session:') and '/turn/' in wanted_id:
+        session_part, anchor_turn = wanted_id[8:].split('/turn/', 1)
+        parsed_session = str(uuid.UUID(session_part))
+        if wanted_session and wanted_session != parsed_session:
+            raise ValueError('conflicting_session_source_turn_locator')
+        wanted_session = parsed_session
+        if not anchor_turn or len(anchor_turn) > 128 or args.get('episode_id') or context_type != 'session':
+            raise ValueError('invalid_source_turn_scenario_locator')
     matches = []
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if anchor_turn:
+            continue  # A whole-Session summary cannot stand in for this turn.
         if wanted_id and str(row.get('context_id') or '') != wanted_id:
             continue
         if wanted_session and str(row.get('session_id') or '') != wanted_session:
@@ -1022,8 +1736,28 @@ def read_context_summary(args):
         parent = matches[0] if len(matches) == 1 else None
         episode = next((item for item in (parent or {}).get('episodes') or []
                         if isinstance(item, dict) and item.get('episode_id') == episode_id), None)
+        single_projection_status = None
+        audit = (parent or {}).get('automated_source_coverage') or {}
+        if (episode is None and parent and not parent.get('episodes') and parent.get('status') == 'model_reviewed'
+                and audit.get('reviewed_episode_ids') == [episode_id]):
+            from lib.memory_recovery_scenario import accepted_session_source
+            from lib.scenario_episodes import partition_source
+            try:
+                live_source = read_session_source(str(parent.get('session_id') or ''),THREAD_SESSION_ROOT,max_chars=500000)
+                if not accepted_session_source(parent,live_source):
+                    single_projection_status = 'stale_source_changed' if live_source.get('status') == 'complete' else 'episode_source_unavailable'
+                else:
+                    partition = partition_source(live_source,[])[0]
+                    if partition['episode_id'] == episode_id:
+                        episode = {**{key:value for key,value in partition.items() if key!='_messages'},
+                            'summary':parent.get('summary') or {},'summary_budget':parent.get('summary_budget') or {},
+                            'title':parent.get('title'),'status':'model_reviewed','review_scope':parent.get('review_scope'),
+                            'projection_basis':'accepted_single_episode_source_coverage'}
+                        parent = {**parent,'episodes':[episode]}
+            except (OSError,ValueError,TypeError):
+                single_projection_status = 'episode_source_unavailable'
         if episode is None:
-            value = {'schema': 'evolving-profile.scenario-summary.v1', 'status': 'episode_not_found',
+            value = {'schema': 'evolving-profile.scenario-summary.v1', 'status': single_projection_status or 'episode_not_found',
                      'scenario_type': 'episode', 'parent_session_id': wanted_session or None,
                      'episode_id': episode_id, 'tier': tier, 'items': [], 'source': 'scenario_summary_index',
                      'total': 0, 'offset': 0, 'next_offset': None}
@@ -1043,6 +1777,7 @@ def read_context_summary(args):
                     'source_message_count': episode.get('source_message_count'),
                     'source_revision': episode.get('source_revision'), 'tier': tier,
                     'status': freshness.get('status'),
+                    'projection_basis':episode.get('projection_basis'),
                     'evidence_role': 'context_navigation_only',
                     'review_scope': episode.get('review_scope') or 'conversation_episode_only_not_external_fact_verification',
                     'raw_source_files': parent.get('raw_source_files') or [],
@@ -1062,7 +1797,17 @@ def read_context_summary(args):
                      'total': 1, 'offset': 0, 'next_offset': None}
         return {'content': [{'type': 'text', 'text': json.dumps(value, ensure_ascii=False)}], 'isError': False}
 
-    if context_type == 'session' and len(matches) == 1 and isinstance(matches[0].get('episodes'), list):
+    pending_summary = next((row for row in matches if str(row.get('status') or '').startswith('raw_available_summary_')), None)
+    if context_type == 'session' and len(matches) == 1 and not pending_summary and matches[0].get('source_stat_revision'):
+        from lib.context_incremental import _revision
+        row = matches[0]
+        try: fresh = _revision([Path(p) for p in row.get('raw_source_files') or []]) == row['source_stat_revision']
+        except (OSError, ValueError, TypeError): fresh = False
+        if not fresh: pending_summary = {**row, 'status':'stale_source_pending'}
+    if pending_summary:
+        wanted_session = pending_summary.get('session_id') or wanted_session
+        matches = []
+    if context_type == 'session' and len(matches) == 1 and matches[0].get('episodes') and isinstance(matches[0].get('episodes'), list):
         row = matches[0]
         episodes = row['episodes']
         page = episodes[offset:offset + limit]
@@ -1094,9 +1839,35 @@ def read_context_summary(args):
     total = len(matches)
     next_offset = offset + limit if offset + limit < total else None
     if not matches:
-        value = {'schema': 'evolving-profile.scenario-summary.v1', 'status': index.get('status') or 'not_found',
+        value = {'schema': 'evolving-profile.scenario-summary.v1', 'status': 'not_found' if index.get('status') in {'ready', 'legacy_ready'} else index.get('status') or 'not_found',
                  'scenario_type': context_type, 'tier': tier, 'items': [], 'source': 'scenario_summary_index',
-                 'total': 0, 'offset': offset, 'next_offset': None}
+                 'index_updated_at': index.get('updated_at'), 'total': 0, 'offset': offset, 'next_offset': None}
+        session = wanted_session or (wanted_id[8:] if wanted_id.startswith('session:') else '')
+        project_association_verified = not wanted_project or (
+            any(r.get('identity_status') == 'verified_project' and r.get('project_key') == wanted_project for r in index.get('projects') or [])
+            and any(r.get('session_id') == session and r.get('project_key') == wanted_project for r in index.get('sessions') or []))
+        if context_type == 'session' and session and not project_association_verified:
+            value.update(status='scope_unresolved', raw_source_status='project_scope_unresolved')
+        elif context_type == 'session' and session and not offset:
+            from lib.raw_session_evidence import read_evidence
+            from lib.context_summary import bounded_summary
+            try:
+                raw = read_evidence(session, THREAD_SESSION_ROOT, turn_id=anchor_turn, max_chars=BUDGETS['session']['full']['max_chars'])
+            except (ValueError, OSError) as error:
+                raw = {'status': 'source_unavailable', 'error_type': type(error).__name__}
+            value['raw_source_status'] = raw.get('status')
+            if (raw.get('source') or {}).get('text'):
+                body, budget = bounded_summary(raw['source']['text'], 'session', tier)
+                value.update(status='available_unreviewed', total=1, items=[{
+                    'scenario_id': wanted_id if anchor_turn else 'session:' + session, 'scenario_type': 'session', 'session_id': session,
+                    'anchor_turn_id': anchor_turn, 'parent_scenario_id': 'session:' + session,
+                    'summary': body, 'summary_budget': budget, 'summary_kind': 'raw_message_excerpt',
+                    'status': 'deterministic_projection_unreviewed', 'evidence_role': 'context_navigation_only',
+                    'identity_status': 'session_id_matched', 'review_scope': 'not_reviewed',
+                    'source_ids': [row['raw_line_sha256'] for row in raw['source']['locators']],
+                    'raw_source_locators': raw['source']['locators'], 'selection_coverage': raw.get('coverage'),
+                    'source_readback': 'original_messages_not_independent_artifact_verification',
+                }])
     else:
         items = []
         page = matches[offset:offset + limit]
@@ -1123,14 +1894,65 @@ def read_context_summary(args):
                  'scenario_type': context_type, 'tier': tier, 'items': items, 'source': 'scenario_summary_index',
                  'index_updated_at': index.get('updated_at'), 'total': total, 'offset': offset,
                  'next_offset': next_offset}
+    if pending_summary:
+        value['summary_processing'] = {'status': pending_summary.get('status'),
+            'source_stat_revision': pending_summary.get('source_stat_revision'), 'error_code': pending_summary.get('error_code'),
+            'foreground_model_call': False, 'progress_path': str(Path(CONTEXT_INDEX_PATH).parent/'context-pipeline-progress.json')}
     return {'content': [{'type': 'text', 'text': json.dumps(value, ensure_ascii=False)}], 'isError': False}
 
 
 def search_scenario_summary(args):
+    disabled = runtime_disabled('scenario_summary', 'retrieve')
+    if disabled: return disabled
     index = read_context_index(CONTEXT_INDEX_PATH)
-    value = search_contexts(index, str(args.get('query') or ''),
+    query = str(args.get('query') or '')
+    value = search_contexts(index, query,
                             context_type=str(args.get('context_type') or 'both'),
                             limit=int(args.get('limit') or 8))
+    # Directory rows are navigation, never a fact identity decision. Remove
+    # metadata-only matches and supplement stale indexes with current process
+    # Session locators without overwriting the background canonical index.
+    filtered = []
+    originals = {row.get('context_id'): row for row in (index.get('sessions') or []) + (index.get('projects') or []) if isinstance(row, dict)}
+    for row in value['items']:
+        original = originals.get(row.get('scenario_id') or row.get('context_id')) or {}
+        summary = original.get('summary') or {}
+        body = (summary.get('compact') or '') if isinstance(summary, dict) else str(summary)
+        match = classify_candidate(query, {'title': row.get('navigation_title') or original.get('title'), 'text': body})
+        if match['level'] not in {'none', 'unknown'}:
+            filtered.append({**row, 'relevance_level': match['level'], 'relevance_score': match['score']})
+    if str(args.get('context_type') or 'both') in {'both', 'session'} and not process_runtime_disabled('retrieve'):
+        records, _ = _process_store()._ranked_search_with_audit(query, include_unverified=True)
+        seen = {row.get('session_id') for row in filtered}
+        for record in records:
+            context = record.get('primary_context') or {}
+            sid = context.get('session_id')
+            if not sid or sid in seen:
+                continue
+            try: uuid.UUID(str(sid))
+            except (ValueError, TypeError): continue
+            seen.add(sid)
+            filtered.append({'context_id': 'session:' + sid, 'scenario_id': 'session:' + sid,
+                'context_type': 'session', 'scenario_type': 'session', 'session_id': sid,
+                'title': str(record.get('text') or '').split('\n', 1)[0][:160],
+                'navigation_title': str(record.get('text') or '').split('\n', 1)[0][:160],
+                'navigation_only': True, 'next_tool': 'read_scenario_summary',
+                'navigation_role': 'background_signal',
+                'status': 'deterministic_projection_unreviewed', 'evidence_role': 'context_navigation_only',
+                'source_ids': [record['process_memory_id']], 'process_memory_id': record['process_memory_id'],
+                'source_integrity': record.get('source_integrity'), 'readback_tool': 'read_scenario_summary',
+                'relevance_level': record.get('relevance_level'), 'relevance_score': record.get('relevance_score'),
+                'coverage': 'process_record_locator_not_reviewed_scenario_summary'})
+    filtered.sort(key=lambda row: -float(row.get('relevance_score') or 0))
+    value['items'] = filtered[:int(args.get('limit') or 8)]
+    value['returned_count'] = len(value['items'])
+    value['coverage'] = {**(value.get('coverage') or {}),
+        'status': 'returned' if value['items'] else 'not_found_in_context_index',
+        'source_scope': 'legacy_directory_and_current_process_session_locators_not_all_history',
+        'ambiguous_top_candidates': len(value['items']) > 1, 'decisive_top_candidate': False}
+    value['route_policy'] = {**(value.get('route_policy') or {}),
+        'state': 'scope_unresolved' if len(value['items']) > 1 else 'scope_candidate_only',
+        'defer_bank_retrieval_until_scope_check': len(value['items']) > 1}
     if bool(args.get('build_hypotheses', True)):
         value['hypotheses'] = build_hypotheses(str(args.get('query') or ''), value['items'])
     value['adapter_version'] = VERSION
@@ -1210,17 +2032,105 @@ def scenario_followup(result):
         'scenarios_total':len(selected),
         'boundary': 'Only verified Project identities are recommended; cwd buckets are navigation hints, not projects. Summary is not fact evidence.'}
 
+
+def agent_process_scenario_followup(records):
+    """Project process-memory context IDs into scenario locators without reading summaries."""
+    index = read_context_index(CONTEXT_INDEX_PATH)
+    sessions = {str(row.get('session_id')): row for row in index.get('sessions') or [] if isinstance(row, dict) and row.get('session_id')}
+    projects = {str(row.get('project_key') or row.get('context_id')): row for row in index.get('projects') or [] if isinstance(row, dict) and row.get('identity_status') == 'verified_project'}
+    selected = {}
+    unresolved = []
+    for record in records or []:
+        context = record.get('primary_context') or {}
+        session_id = str(context.get('session_id') or '').strip()
+        raw_project = context.get('project_key') or context.get('project_id') or context.get('project') or ''
+        pkey = str(raw_project or '').strip()
+        if pkey and pkey not in projects and '/' in pkey:
+            pkey = project_key(pkey)
+        matched = []
+        if session_id and session_id in sessions:
+            matched.append(sessions[session_id])
+        if pkey and pkey in projects:
+            matched.append(projects[pkey])
+        if not matched:
+            if session_id or pkey:
+                locator = 'session:' + session_id + '/turn/' + str(context['turn_id']) if session_id and context.get('turn_id') else None
+                unresolved.append({'session_id': session_id or None, 'project_key': pkey or None, 'process_memory_ids': [record.get('process_memory_id')],
+                                   'source_scenario_id': locator, 'source_readback_tool': 'read_scenario_summary' if locator else None})
+            continue
+        for scope in matched:
+            scenario_id = str(scope.get('context_id') or '')
+            if not scenario_id:
+                continue
+            item = selected.setdefault(scenario_id, {
+                'scenario_id': scenario_id,
+                'scenario_type': scope.get('context_type'),
+                'session_id': scope.get('session_id'),
+                'project_key': scope.get('project_key'),
+                'navigation_title': str(scope.get('title') or '')[:120],
+                'status': scope.get('status') or 'unknown',
+                'title_authority': 'navigation_label_not_verified_fact',
+                'source_revision': scope.get('source_revision'),
+                'source_process_memory_ids': [],
+            })
+            pid = record.get('process_memory_id')
+            if pid and pid not in item['source_process_memory_ids']:
+                item['source_process_memory_ids'].append(pid)
+            if session_id and context.get('turn_id'):
+                locator = 'session:' + session_id + '/turn/' + str(context['turn_id'])
+                if locator not in item.setdefault('source_scenario_ids', []):
+                    item['source_scenario_ids'].append(locator)
+    scenarios = list(selected.values())[:8]
+    ambiguous = len(scenarios) > 1 or bool(unresolved)
+    if not scenarios and not unresolved:
+        decision, reason, next_tool = 'none', 'no_process_context_ids', None
+    elif ambiguous:
+        decision = 'agent_decides'
+        reason = 'process_context_scope_unresolved'
+        next_tool = 'search_scenario_summary' if unresolved else 'read_scenario_summary'
+    else:
+        decision, reason, next_tool = 'none', 'process_context_scope_resolved_no_summary_required', None
+    return {
+        'decision': decision,
+        'required': ambiguous,
+        'reason': reason,
+        'scenarios': scenarios,
+        'unresolved_contexts': unresolved,
+        'next_tool': next_tool,
+        'default_tier': 'compact',
+        'summary_text_included': False,
+        'source': 'agent_process_context_index',
+        'boundary': 'Scenario locators only; no summary body, user fact or process strategy is injected.',
+    }
+
+def _recall_controls(result: dict, policy: dict, arguments: dict) -> dict:
+    """Add public explanations to legacy replies without any retrieval side effect."""
+    audit = result.get('relevance_audit') or {}
+    decisions = {str(row.get('id')): row for row in audit.get('decisions', []) if isinstance(row, dict)}
+    for row in result.get('memories', []):
+        decision = decisions.get(str(row.get('id')), {})
+        for key in ('relationship', 'scope_status', 'temporal_role', 'truth_status', 'evidence_role', 'execution_eligible'):
+            if key in decision:
+                row[key] = decision[key]
+    status = result.get('retrieval_execution_status') or result.get('status')
+    provider_status = 'failed' if status in {'failed', 'error', 'partial', 'partial_source_validation'} or result.get('unavailable') else 'ok'
+    result['adaptive_hint'] = adaptive_recall_hint(policy, arguments, provider_status=provider_status)
+    return result
+
+
 def research(args,page=False):
     disabled = runtime_disabled('facts', 'retrieve')
     if disabled: return disabled
     root=Path(os.environ.get('EVOLVING_PROFILE_RESEARCH_ROOT',str(DEFAULT_ROOT)))
+    policy = resolve_min_relevance(load_runtime_settings(), 'user_memory', args.get('minimum_relevance'))
     if page:
-        result=read_page(BANK,args.get('research_id'),args.get('offset'),official_json,root)
+        result=read_page(BANK,args.get('research_id'),args.get('offset'),official_json,root,relevance_policy=policy)
     else:
-        result=search(BANK,args.get('query'),official_json,root,budget='high',max_tokens=2400,page_size=6)
+        result=search(BANK,args.get('query'),official_json,root,facets=args.get('facets'),budget='high',max_tokens=2400,page_size=6,relevance_policy=policy)
         result['guidance_view']=guidance_value({})
     result['scenario_followup']=scenario_followup(result)
     result['adapter_version']=VERSION
+    _recall_controls(result, policy, args)
     return {'content':[{'type':'text','text':json.dumps(result,ensure_ascii=False)}],'isError':False}
 
 
@@ -1228,6 +2138,7 @@ def evidence_recall(args):
     disabled = runtime_disabled('facts', 'retrieve')
     if disabled: return disabled
     root=Path(os.environ.get('EVOLVING_PROFILE_RESEARCH_ROOT',str(DEFAULT_ROOT)))
+    policy = resolve_min_relevance(load_runtime_settings(), 'user_memory', args.get('minimum_relevance'))
     args=dict(args);facets=args.get('facets')
     if facets is not None:
         facets=[str(value.get('query') or '') if isinstance(value,dict) else str(value) for value in facets]
@@ -1236,15 +2147,16 @@ def evidence_recall(args):
     if args.get('force_deep'):
         if args.get('facets') is not None:
             raise ValueError('deep discovery takes one complete query; use ordinary recall for explicit facets')
-        result=discover(BANK,args.get('query'),official_json,root)
+        result=discover(BANK,args.get('query'),official_json,root,relevance_policy=policy)
     else:
         if args.get('bank_alias','personal')!='personal':raise ValueError('unauthorized bank alias')
         result=search(BANK,args.get('query'),official_json,root,facets=args.get('facets'),
             budget=args.get('budget','high'),max_tokens=args.get('max_tokens',2400),types=(args.get('types') or None),
-            temporal_window=args.get('temporal_window'),prefer_observations=args.get('prefer_observations',False),page_size=args.get('max_results',6))
+            temporal_window=args.get('temporal_window'),prefer_observations=args.get('prefer_observations',False),page_size=args.get('max_results',6),relevance_policy=policy)
     result['guidance_view']=guidance_value({})
     result['scenario_followup']=scenario_followup(result)
     result['adapter_version']=VERSION
+    _recall_controls(result, policy, args)
     return {'content':[{'type':'text','text':json.dumps(result,ensure_ascii=False)}],'isError':False}
 
 
@@ -1380,6 +2292,7 @@ def governed_recall(args):
 
 for line in (sys.stdin if __name__ == "__main__" else ()):
     try:
+        CURRENT_TOOL_CALL = None
         request = json.loads(line)
         method = request.get("method")
         message_id = request.get("id")
@@ -1390,27 +2303,24 @@ for line in (sys.stdin if __name__ == "__main__" else ()):
         elif method == "notifications/initialized":
             continue
         elif method == "tools/list":
-            reply(message_id, {"tools": [TOOL, RESEARCH_TOOL, RESEARCH_PAGE_TOOL, SOURCE_TOOL, FIND_SOURCES_TOOL, THREAD_AUDIT_TOOL, GUIDANCE_TOOL, CHECK_TOOL, GUIDANCE_UNIT_TOOL, MEMORY_INSTRUCTIONS_TOOL,CATALOG_LIST_TOOL,CATALOG_SEARCH_TOOL,CATALOG_READ_TOOL,EVIDENCE_DECISION_TOOL,TASK_STATE_TOOL,SCENARIO_SUMMARY_TOOL,SCENARIO_GATE_TOOL,SCENARIO_CONTEXT_SEARCH_TOOL,EXTERNAL_RAG_TOOL,AGENT_TRAJECTORY_TOOL,AGENT_DRAFT_TOOL,AGENT_PROMOTION_TOOL,AGENT_SEARCH_TOOL,AGENT_READ_TOOL,AGENT_CONTEXT_TOOL,AGENT_REVALIDATION_TOOL,AGENT_EVALUATION_TOOL,AGENT_ROLLOUT_TOOL,AGENT_CAPABILITY_TOOL] + ([PREFERENCE_TOOL, RUNTIME_GUIDANCE_TOOL] if PREFERENCE_TOOL and RUNTIME_GUIDANCE_TOOL else [])})
+            reply(message_id, {"tools": [TOOL, RESEARCH_TOOL, RESEARCH_PAGE_TOOL, SOURCE_TOOL, FIND_SOURCES_TOOL, THREAD_AUDIT_TOOL, GUIDANCE_TOOL, CHECK_TOOL, GUIDANCE_UNIT_TOOL, MEMORY_INSTRUCTIONS_TOOL,CATALOG_LIST_TOOL,CATALOG_SEARCH_TOOL,CATALOG_READ_TOOL,EVIDENCE_DECISION_TOOL,TASK_STATE_TOOL,SCENARIO_SUMMARY_TOOL,SCENARIO_GATE_TOOL,SCENARIO_CONTEXT_SEARCH_TOOL,EXTERNAL_RAG_TOOL,JEV_RISK_TOOL,AGENT_TRAJECTORY_TOOL,AGENT_DRAFT_TOOL,AGENT_PROMOTION_TOOL,AGENT_RECALL_TOOL,AGENT_RESEARCH_TOOL,AGENT_READ_TOOL,AGENT_CONTEXT_TOOL,AGENT_WORKSPACE_TOOL,AGENT_REVALIDATION_TOOL,AGENT_EVALUATION_TOOL,AGENT_ROLLOUT_TOOL,AGENT_CAPABILITY_TOOL] + ([PREFERENCE_TOOL, RUNTIME_GUIDANCE_TOOL] if PREFERENCE_TOOL and RUNTIME_GUIDANCE_TOOL else [])})
         elif method == "tools/call":
             params = request.get("params") or {}
-            CURRENT_TOOL_CALL={'name':params.get('name'),'arguments':params.get('arguments') or {}}
-            capture_tool_trajectory(str(params.get('name') or ''), params.get('arguments') or {})
+            CURRENT_TOOL_CALL=_begin_tool_call(params,message_id)
             if params.get('name') == 'memory_check':
-                from memory_turn_check import declare
                 args=params.get('arguments') or {}
-                if args.get('need') and args.get('reason'):
-                    try:value=declare(args.get('check_id'),args.get('full_prompt'),args.get('need'),args.get('reason'))
-                    except ValueError:value=declare(None,args.get('full_prompt'),args.get('need'),args.get('reason'))
+                if 'need' in args or 'reason' in args:
+                    value=memory_check_declaration(args)
                 else:
                     value=memory_check_route(args)
                 value['adapter_version']=VERSION
                 reply(message_id,{'content':[{'type':'text','text':json.dumps(value,ensure_ascii=False)}],'isError':False})
             elif params.get('name') in ('read_preference', 'read_guidance'):
                 reply(message_id,read_preference(params.get('arguments') or {}))
-            elif params.get('name') in ('get_preference', 'get_task_guidance'):
+            elif params.get('name') in ('user_preference', 'get_preference', 'get_task_guidance'):
                 guidance_args=params.get('arguments') or {}
-                if params.get('name') == 'get_preference' and not str(guidance_args.get('check_id') or '').strip():
-                    raise ValueError('get_preference requires the current Prompt check_id for auditable attribution')
+                if params.get('name') in ('user_preference', 'get_preference') and not str(guidance_args.get('check_id') or '').strip():
+                    raise ValueError('user_preference requires the current Prompt check_id for auditable attribution')
                 reply(message_id,preference(guidance_args))
             elif params.get('name') == 'refresh_runtime_guidance':
                 reply(message_id,runtime_guidance(params.get('arguments') or {}))
@@ -1438,19 +2348,25 @@ for line in (sys.stdin if __name__ == "__main__" else ()):
             elif params.get('name') == 'scenario_gate':
                 reply(message_id, scenario_gate(params.get('arguments') or {}))
             elif params.get('name') == 'rag_search':
-                reply(message_id, {'content':[{'type':'text','text':json.dumps(search_external_rag(str((params.get('arguments') or {}).get('query') or ''), limit=int((params.get('arguments') or {}).get('limit') or 8)),ensure_ascii=False)}],'isError':False})
+                reply(message_id, {'content':[{'type':'text','text':json.dumps(search_external_rag(str((params.get('arguments') or {}).get('query') or ''), limit=int((params.get('arguments') or {}).get('limit') or 8),min_relevance=(params.get('arguments') or {}).get('minimum_relevance')),ensure_ascii=False)}],'isError':False})
+            elif params.get('name') == 'review_operation_risk':
+                reply(message_id, _process_reply(jev_caller_view(jev_review(['operation_risk'], {**(params.get('arguments') or {}), 'tool': 'review_operation_risk'}))))
             elif params.get('name') == 'record_agent_trajectory':
                 reply(message_id, record_agent_trajectory(params.get('arguments') or {}))
             elif params.get('name') == 'record_agent_process_draft':
                 reply(message_id, record_agent_process_draft(params.get('arguments') or {}))
             elif params.get('name') == 'promote_agent_process_memory':
                 reply(message_id, promote_agent_process_memory(params.get('arguments') or {}))
-            elif params.get('name') == 'search_agent_process_memory':
+            elif params.get('name') in ('agent_recall', 'search_agent_process_memory'):
                 reply(message_id, search_agent_process_memory(params.get('arguments') or {}))
+            elif params.get('name') == 'agent_research':
+                reply(message_id, research_agent_process_memory(params.get('arguments') or {}))
             elif params.get('name') == 'read_agent_process_memory':
                 reply(message_id, read_agent_process_memory(params.get('arguments') or {}))
             elif params.get('name') == 'prepare_agent_process_context':
                 reply(message_id, prepare_agent_process_context(params.get('arguments') or {}))
+            elif params.get('name') == 'write_agent_process_workspace':
+                reply(message_id, write_agent_process_workspace(params.get('arguments') or {}))
             elif params.get('name') == 'revalidate_agent_process_memory':
                 reply(message_id, revalidate_agent_process_memory(params.get('arguments') or {}))
             elif params.get('name') == 'evaluate_agent_process_memory':
@@ -1465,24 +2381,19 @@ for line in (sys.stdin if __name__ == "__main__" else ()):
                 reply(message_id,find_sources(params.get('arguments') or {}))
             elif params.get('name') == 'audit_thread_history':
                 reply(message_id, audit_thread_history(params.get('arguments') or {}))
-            elif params.get('name') in ('research','read_research'):
+            elif params.get('name') in ('user_research','research','read_research'):
                 reply(message_id,research(params.get('arguments') or {},page=params['name']=='read_research'))
-            elif params.get("name") == "recall":
+            elif params.get("name") in ("user_recall", "recall"):
                 reply(message_id, evidence_recall(params.get("arguments") or {}))
             else:
                 raise ValueError("unknown tool")
         else:
             reply(message_id, error={"code": -32601, "message": "Method not found"})
     except Exception as exc:
-        try:
-            if isinstance(request, dict) and (request.get('params') or {}).get('name'):
-                capture_tool_trajectory(str((request.get('params') or {}).get('name')), (request.get('params') or {}).get('arguments') or {}, outcome='blocked', error=str(exc))
-        except Exception:
-            pass
         recovery = None
         try:
             failed_name = str((request.get('params') or {}).get('name') or '') if isinstance(request, dict) else ''
-            if failed_name in {'recall', 'research', 'read_research', 'get_preference', 'read_source'}:
+            if failed_name in {'user_recall', 'user_research', 'user_preference', 'agent_recall', 'agent_research', 'recall', 'research', 'read_research', 'get_preference', 'read_source'}:
                 failed_args = (request.get('params') or {}).get('arguments') or {}
                 objective = str(failed_args.get('query') or failed_args.get('task', {}).get('objective') or 'EP工具调用失败后的运行恢复')
                 recovery_result = runtime_guidance({

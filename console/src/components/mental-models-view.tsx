@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton, ActionMenuItem } from "@/components/ui/action-button";
+
 import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
 import { client, type TagGroup, type TagsMatch } from "@/lib/api";
@@ -111,6 +113,7 @@ type ViewMode = "dashboard" | "files";
 
 export function MentalModelsView() {
   const t = useTranslations("mentalModels");
+  const tAction = useTranslations("actionFeedback");
   const { currentBank } = useBank();
   const [mentalModels, setMentalModels] = useState<MentalModel[]>([]);
   const [loading, setLoading] = useState(false);
@@ -150,7 +153,7 @@ export function MentalModelsView() {
   });
 
   const loadData = async () => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setLoading(true);
     try {
@@ -170,7 +173,7 @@ export function MentalModelsView() {
   const [refreshingIds, setRefreshingIds] = useState<Set<string>>(new Set());
 
   const handleRowRefresh = async (m: MentalModel) => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
     const originalAt = m.last_refreshed_at;
     setRefreshingIds((prev) => new Set(prev).add(m.id));
     try {
@@ -186,9 +189,11 @@ export function MentalModelsView() {
           return;
         }
       }
-      toast.error(t("toastRefreshTimeout"));
-    } catch {
+      throw new Error(t("toastRefreshTimeout"));
+    } catch (error) {
       // Error toast handled by API client interceptor
+
+      throw error;
     } finally {
       setRefreshingIds((prev) => {
         const next = new Set(prev);
@@ -199,7 +204,7 @@ export function MentalModelsView() {
   };
 
   const handleDelete = async () => {
-    if (!currentBank || !deleteTarget) return;
+    if (!currentBank || !deleteTarget) return false;
 
     setDeleting(true);
     try {
@@ -209,13 +214,15 @@ export function MentalModelsView() {
       setDeleteTarget(null);
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setDeleting(false);
     }
   };
 
   const handleClear = async () => {
-    if (!currentBank || !clearTarget) return;
+    if (!currentBank || !clearTarget) return false;
 
     setClearing(true);
     try {
@@ -223,9 +230,10 @@ export function MentalModelsView() {
       setMentalModels((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
       if (selectedMentalModel?.id === updated.id) setSelectedMentalModel(updated);
       toast.success("Mental model content cleared");
-      setClearTarget(null);
-    } catch {
+    } catch (error) {
       // Error toast handled by API client interceptor
+
+      throw error;
     } finally {
       setClearing(false);
     }
@@ -526,9 +534,8 @@ export function MentalModelsView() {
         open={showCreateMentalModel}
         onClose={() => setShowCreateMentalModel(false)}
         onCreated={() => {
-          setShowCreateMentalModel(false);
-          // Reload the list immediately to show the new mental model
-          loadData();
+          // Reload the list while retaining the create dialog's completion feedback.
+          void loadData();
         }}
       />
 
@@ -545,14 +552,14 @@ export function MentalModelsView() {
           </AlertDialogHeader>
           <AlertDialogFooter className="flex-row justify-end space-x-2">
             <AlertDialogCancel className="mt-0">{t("deleteDialogCancel")}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDelete}
+            <ActionButton
+              onAction={handleDelete}
               disabled={deleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               {deleting ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
               {t("deleteDialogConfirm")}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -573,10 +580,10 @@ export function MentalModelsView() {
           </AlertDialogHeader>
           <AlertDialogFooter className="flex-row justify-end space-x-2">
             <AlertDialogCancel className="mt-0">{t("cancelButton")}</AlertDialogCancel>
-            <AlertDialogAction onClick={handleClear} disabled={clearing}>
+            <ActionButton onAction={handleClear} disabled={clearing}>
               {clearing ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
               {t("clearDialogConfirm")}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -607,8 +614,6 @@ export function MentalModelsView() {
           onUpdated={(updated) => {
             setMentalModels((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
             setSelectedMentalModel(updated);
-            setShowUpdateDialog(false);
-            setMentalModelToUpdate(null);
           }}
         />
       )}
@@ -628,12 +633,13 @@ function RowActionsMenu({
   m: MentalModel;
   refreshing: boolean;
   onEdit: (m: MentalModel) => void;
-  onRefresh: (m: MentalModel) => void;
+  onRefresh: (m: MentalModel) => Promise<unknown>;
   onClear: (m: MentalModel) => void;
   onDelete: (m: MentalModel) => void;
   triggerClassName?: string;
 }) {
   const t = useTranslations("mentalModels");
+  const tAction = useTranslations("actionFeedback");
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -652,10 +658,10 @@ function RowActionsMenu({
           <Pencil className="h-4 w-4 mr-2" />
           {t("actionEdit")}
         </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => onRefresh(m)} disabled={refreshing}>
+        <ActionMenuItem onAction={() => onRefresh(m)} disabled={refreshing}>
           <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
           {t("actionRefresh")}
-        </DropdownMenuItem>
+        </ActionMenuItem>
         <DropdownMenuItem onClick={() => onClear(m)}>
           <Eraser className="h-4 w-4 mr-2" />
           {t("actionClearContent")}
@@ -683,8 +689,10 @@ function CreateMentalModelDialog({
   onCreated: () => void;
 }) {
   const t = useTranslations("mentalModels");
+  const tAction = useTranslations("actionFeedback");
   const { currentBank } = useBank();
   const [creating, setCreating] = useState(false);
+  const [createdFormKey, setCreatedFormKey] = useState<string | null>(null);
   const [form, setForm] = useState({
     id: "",
     name: "",
@@ -706,7 +714,7 @@ function CreateMentalModelDialog({
   });
 
   const handleCreate = async () => {
-    if (!currentBank || !form.name.trim() || !form.sourceQuery.trim()) return;
+    if (!currentBank || !form.name.trim() || !form.sourceQuery.trim()) return false;
 
     setCreating(true);
     try {
@@ -727,9 +735,9 @@ function CreateMentalModelDialog({
       if (form.tagGroups.trim()) {
         try {
           tagGroups = JSON.parse(form.tagGroups.trim());
-        } catch {
+        } catch (error) {
           toast.error(t("invalidTagGroupsJson"));
-          return;
+          throw new Error(t("invalidTagGroupsJson"));
         }
       }
 
@@ -764,27 +772,12 @@ function CreateMentalModelDialog({
         },
       });
 
-      setForm({
-        id: "",
-        name: "",
-        sourceQuery: "",
-        maxTokens: "2048",
-        tags: "",
-        refreshTrigger: "manual",
-        mode: "full",
-        refreshCron: "",
-        factTypes: [],
-        excludeMentalModels: false,
-        excludeMentalModelIds: "",
-        tagsMatch: "",
-        tagGroups: "",
-        includeChunks: "",
-        recallMaxTokens: "",
-        recallChunksMaxTokens: "",
-      });
+      setCreatedFormKey(JSON.stringify(form));
       onCreated();
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setCreating(false);
     }
@@ -1121,9 +1114,9 @@ function CreateMentalModelDialog({
           <Button variant="outline" onClick={onClose} disabled={creating}>
             {t("cancelButton")}
           </Button>
-          <Button
-            onClick={handleCreate}
-            disabled={creating || !form.name.trim() || !form.sourceQuery.trim()}
+          <ActionButton
+            resetKey={JSON.stringify(form)} successLabel={tAction("submitted")} onAction={handleCreate}
+            disabled={creating || !form.name.trim() || !form.sourceQuery.trim() || createdFormKey === JSON.stringify(form)}
           >
             {creating ? (
               <>
@@ -1133,7 +1126,7 @@ function CreateMentalModelDialog({
             ) : (
               t("createButton")
             )}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1152,6 +1145,7 @@ function UpdateMentalModelDialog({
   onUpdated: (updated: MentalModel) => void;
 }) {
   const t = useTranslations("mentalModels");
+  const tAction = useTranslations("actionFeedback");
   const { currentBank } = useBank();
   const [updating, setUpdating] = useState(false);
   const buildFormState = () => ({
@@ -1200,7 +1194,7 @@ function UpdateMentalModelDialog({
   }, [open, mentalModel]);
 
   const handleUpdate = async () => {
-    if (!currentBank || !form.name.trim() || !form.sourceQuery.trim()) return;
+    if (!currentBank || !form.name.trim() || !form.sourceQuery.trim()) return false;
 
     setUpdating(true);
     try {
@@ -1220,9 +1214,9 @@ function UpdateMentalModelDialog({
       if (form.tagGroups.trim()) {
         try {
           tagGroups = JSON.parse(form.tagGroups.trim());
-        } catch {
+        } catch (error) {
           toast.error(t("invalidTagGroupsJson"));
-          return;
+          throw new Error(t("invalidTagGroupsJson"));
         }
       }
 
@@ -1257,9 +1251,10 @@ function UpdateMentalModelDialog({
       });
 
       onUpdated(updated);
-      onClose();
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setUpdating(false);
     }
@@ -1567,8 +1562,8 @@ function UpdateMentalModelDialog({
           <Button variant="outline" onClick={onClose} disabled={updating}>
             {t("cancelButton")}
           </Button>
-          <Button
-            onClick={handleUpdate}
+          <ActionButton
+            resetKey={JSON.stringify(form)} onAction={handleUpdate}
             disabled={updating || !form.name.trim() || !form.sourceQuery.trim()}
           >
             {updating ? (
@@ -1579,7 +1574,7 @@ function UpdateMentalModelDialog({
             ) : (
               t("updateButton")
             )}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1603,11 +1598,12 @@ function FilesView({
   onOpenDetail: (m: MentalModel) => void;
   refreshingIds: Set<string>;
   onEdit: (m: MentalModel) => void;
-  onRefresh: (m: MentalModel) => void;
+  onRefresh: (m: MentalModel) => Promise<unknown>;
   onClear: (m: MentalModel) => void;
   onDelete: (m: MentalModel) => void;
 }) {
   const t = useTranslations("mentalModels");
+  const tAction = useTranslations("actionFeedback");
   const effectiveId =
     selectedId && mentalModels.some((m) => m.id === selectedId)
       ? selectedId

@@ -8,7 +8,10 @@ import sys
 import types
 from pathlib import Path
 
+from .audit_module_test_context import isolated_audit_loader
 
+
+@isolated_audit_loader
 def _module():
     package_root = Path(__file__).parents[1] / "evolving_profile_api"
     engine_root = package_root / "engine"
@@ -34,6 +37,21 @@ def _module():
     sys.modules[archive_spec.name] = archive_module
     spec.loader.exec_module(module)
     return module, archive_module
+
+
+def test_backfill_loader_preserves_real_package_version_schema_and_parent_links():
+    """Returning a standalone helper must not leave fake public packages cached."""
+    before = {name:module for name,module in sys.modules.items()
+              if name == 'evolving_profile_api' or name.startswith('evolving_profile_api.')}
+    parents = {name:dict(vars(module)) for name,module in before.items() if isinstance(module,types.ModuleType)}
+    version = before['evolving_profile_api'].__version__
+    _module()
+    after = {name:module for name,module in sys.modules.items()
+             if name == 'evolving_profile_api' or name.startswith('evolving_profile_api.')}
+    assert after == before
+    assert after['evolving_profile_api'].__version__ == version
+    for name,attributes in parents.items():
+        assert vars(before[name]) == attributes
 
 
 def test_backfill_writes_verifiable_manifest_without_mutating_legacy_response(tmp_path):

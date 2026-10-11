@@ -64,7 +64,7 @@ def read_native_context_receipts(path, session_id, deadline_seconds=.6):
 
 _CONTROLLER_NAMES = {'evolving_profile_controller', 'hindsight_controller'}
 TOOLS={f'mcp__{controller}__{operation}' for controller in _CONTROLLER_NAMES
-       for operation in ('recall','research','read_research','get_preference')}
+       for operation in ('user_recall','user_research','user_preference','agent_recall','agent_research','recall','research','read_research','get_preference')}
 READ_TOOLS=TOOLS | {f'mcp__{controller}__{operation}' for controller in _CONTROLLER_NAMES
                     for operation in ('read_source','find_sources')}
 
@@ -134,6 +134,35 @@ def response_records(response):
             records.extend({'id':r['anchor_memory_id'], 'text':r.get('excerpt') or r.get('text',''),
                             'type':'source'} for r in value.get('items',[]) if r.get('anchor_memory_id'))
     return records
+
+
+def response_navigation(response):
+    """Project only returned source locators, never their bodies or discovery totals."""
+    if not isinstance(response, dict) or response.get('isError'):
+        return []
+    rows, seen = [], set()
+    for block in response.get('content') or []:
+        if not isinstance(block, dict) or block.get('type') != 'text':
+            continue
+        try: value = json.loads(block.get('text', ''))
+        except (ValueError, TypeError): continue
+        if not isinstance(value, dict): continue
+        for row in value.get('source_navigation') or []:
+            if not isinstance(row, dict) or not isinstance(row.get('memory_id'), str) or not row['memory_id'] or row['memory_id'] in seen:
+                continue
+            witness = row.get('scope_verification') or {}
+            scope = row.get('scope_status') or (witness.get('status') if isinstance(witness,dict) else None)
+            if (row.get('permission_status') in {'denied','blocked'} or scope in {'denied','mismatch'}
+                or row.get('hard_scope_match') is False or row.get('state') in {'invalidated','withdrawn'}):
+                continue
+            seen.add(row['memory_id'])
+            locator = {key:row[key] for key in ('memory_id','document_id','chunk_id','source_revision','subject_relation','claim_verification','authority') if isinstance(row.get(key),str)}
+            action = row.get('next_action') if isinstance(row.get('next_action'),dict) else {}
+            arguments = action.get('arguments') if isinstance(action.get('arguments'),dict) else {}
+            if action.get('tool') == 'read_source' and arguments.get('memory_id') == row['memory_id']:
+                locator['next_action'] = {'tool':'read_source','arguments':{key:arguments[key] for key in ('memory_id','scope') if isinstance(arguments.get(key),str)}}
+            rows.append(locator)
+    return rows
 
 
 def _load_ingress_identity(session, hook_invocation_id, prompt_fingerprint=None, ingress_path=None):
@@ -233,7 +262,16 @@ def read_turn_contributions(traces, checks_path, capture_path, limit=4000, deadl
             if not call or not recognized or (key, call) in seen:
                 continue
             seen.add((key, call))
-            for record in response_records(resolve_tool_response(source, capture_path)):
+            response = resolve_tool_response(source, capture_path)
+            navigation = response_navigation(response)
+            if navigation:
+                entry['mcp'].setdefault('source_navigation', [])
+                for locator in navigation:
+                    if not any(row['memory_id'] == locator['memory_id'] for row in entry['mcp']['source_navigation']):
+                        entry['mcp']['source_navigation'].append(dict(locator,call_id=call,event_id=event.get('event_id'),at=event.get('recorded_at')))
+                entry['mcp']['source_navigation_returned_ids'] = [row['memory_id'] for row in entry['mcp']['source_navigation']]
+                entry['mcp']['source_navigation_returned_count'] = len(entry['mcp']['source_navigation_returned_ids'])
+            for record in response_records(response):
                 if record['id'] not in recognized.get('record_ids', []):
                     continue
                 if any(r['id'] == record['id'] for r in entry['mcp']['records']):

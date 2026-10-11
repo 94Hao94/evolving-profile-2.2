@@ -1,4 +1,5 @@
-@import "tailwindcss";
+@import "tailwindcss" source(none);
+@source "../";
 @import "@xyflow/react/dist/style.css";
 :root {
   --background: oklch(0.9911 0 0);
@@ -319,10 +320,116 @@ input[type="datetime-local"]::-webkit-calendar-picker-indicator {
 
 .execution-canvas-shell { overflow:hidden; border:1px solid var(--border); border-radius:1rem; background:color-mix(in oklab,var(--background) 94%,var(--muted)); box-shadow:0 8px 24px color-mix(in oklab,var(--foreground) 7%,transparent); }
 .execution-canvas-header { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; padding:1rem 1.1rem .75rem; border-bottom:1px solid var(--border); }.execution-canvas-header h2 { margin:.15rem 0; font-size:1.1rem; font-weight:750; }.execution-canvas-header p { margin:0; color:var(--muted-foreground); font-size:.72rem; }.execution-canvas-header > span { border:1px solid #a7c8ef; border-radius:999px; padding:.32rem .55rem; color:#2f6299; font-size:.62rem; white-space:nowrap; }
-.execution-canvas { height:930px; min-width:0; overflow:hidden; background:linear-gradient(180deg,#f8fbff 0%,#f5f9fe 100%); }.dark .execution-canvas { background:linear-gradient(180deg,#111b29 0%,#0f1722 100%); }.execution-canvas .react-flow__controls { z-index:10; border:1px solid var(--border); box-shadow:0 3px 10px rgb(0 0 0 / 8%); }.execution-canvas .react-flow__controls-button { background:var(--card); color:var(--foreground); border-bottom-color:var(--border); }.execution-canvas .react-flow__edge { z-index:0; }.execution-canvas .react-flow__node { z-index:2; }.execution-canvas .react-flow__edge-path { vector-effect:non-scaling-stroke; }
-.execution-lane-background { width:930px; height:142px; border:1px solid #b7d6ef; border-radius:1rem; padding:.8rem 1rem; background:linear-gradient(90deg,#e9f8f5 0%,rgb(255 255 255 / 50%) 35%,rgb(255 255 255 / 34%) 100%); color:#174e68; pointer-events:none; }.execution-lane-background b { display:block; font-size:.82rem; }.execution-lane-background small { display:block; margin-top:.25rem; color:#6a8292; font-size:.62rem; }.execution-lane-agent_process { background:linear-gradient(90deg,#f2edff 0%,rgb(255 255 255 / 50%) 35%,rgb(255 255 255 / 34%) 100%); border-color:#c9baf5; color:#4e3982; }.execution-lane-external_rag { height:214px; background:linear-gradient(90deg,#eaf5ff 0%,rgb(255 255 255 / 50%) 35%,rgb(255 255 255 / 34%) 100%); border-color:#b6d9f4; color:#225f8a; }
+.execution-canvas { height:clamp(600px,calc(100vh - 300px),930px); min-width:0; overflow:hidden; background:linear-gradient(180deg,#f8fbff 0%,#f5f9fe 100%); }.dark .execution-canvas { background:linear-gradient(180deg,#111b29 0%,#0f1722 100%); }.execution-canvas .react-flow__controls { z-index:10; border:1px solid var(--border); box-shadow:0 3px 10px rgb(0 0 0 / 8%); }.execution-canvas .react-flow__controls-button { background:var(--card); color:var(--foreground); border-bottom-color:var(--border); }.execution-canvas .react-flow__edge { z-index:0; }.execution-canvas .react-flow__node { z-index:2; }.execution-canvas .react-flow__edge-path { vector-effect:non-scaling-stroke; }
+.execution-lane-background { width:1080px; height:142px; border:1px solid #b7d6ef; border-radius:1rem; padding:.8rem 1rem; background:linear-gradient(90deg,#e9f8f5 0%,rgb(255 255 255 / 50%) 35%,rgb(255 255 255 / 34%) 100%); color:#174e68; pointer-events:none; }.execution-lane-background b { display:block; font-size:.82rem; }.execution-lane-background small { display:block; margin-top:.25rem; color:#6a8292; font-size:.62rem; }.execution-lane-agent_process { background:linear-gradient(90deg,#f2edff 0%,rgb(255 255 255 / 50%) 35%,rgb(255 255 255 / 34%) 100%); border-color:#c9baf5; color:#4e3982; }.execution-lane-external_rag { height:214px; background:linear-gradient(90deg,#eaf5ff 0%,rgb(255 255 255 / 50%) 35%,rgb(255 255 255 / 34%) 100%); border-color:#b6d9f4; color:#225f8a; }
 .execution-orthogonal-edge { overflow: visible; pointer-events: all; }.execution-orthogonal-edge path { vector-effect: non-scaling-stroke; }.execution-edge-marker-path { pointer-events: none; }.execution-edge-arrow-fallback { pointer-events: none; }
 .execution-node { position:relative; display:flex; min-width:154px; min-height:66px; flex-direction:column; justify-content:center; gap:.18rem; overflow:hidden; border:1px solid #a9c8f7; border-left:4px solid #3986d1; border-radius:.7rem; background:#fff; padding:.62rem .72rem; box-shadow:0 3px 10px rgb(26 74 122 / 12%); color:#143252; }.dark .execution-node { background:#182536; color:#e8f0fb; }.execution-node strong,.execution-node small,.execution-node em { max-width:100%; overflow-wrap:anywhere; word-break:break-word; }.execution-node strong { font-size:.72rem; line-height:1.2; }.execution-node small { color:#60758e; font-size:.59rem; line-height:1.25; }.dark .execution-node small { color:#9db0c6; }.execution-node em { color:#52708e; font-size:.56rem; font-style:normal; }.execution-node-status { position:absolute; top:.38rem; right:.42rem; max-width:45%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border-radius:999px; background:#eef3f8; color:#637386; padding:.16rem .3rem; font-size:.5rem; }.execution-node-teal { border-left-color:#2da994; background:#f1fcf8; }.execution-node-amber { border-left-color:#d99a17; background:#fffaf0; }.execution-node-cyan { border-left-color:#319ad4; background:#f1faff; }.execution-node-emerald { border-left-color:#20a16a; background:#f0fbf4; }.execution-node.is-selected { outline:2px solid #4d91d9; outline-offset:2px; }.execution-node .react-flow__handle { width:7px; height:7px; border:2px solid #fff; background:#5b8fc7; }
 .topology-receipt-items { margin-top:.75rem; border-top:1px solid var(--border); padding-top:.65rem; }.topology-receipt-items h4 { margin:0 0 .45rem; font-size:.7rem; }.topology-receipt-item { margin:.38rem 0; border:1px solid var(--border); border-radius:.45rem; padding:.45rem .55rem; }.topology-receipt-item span { color:var(--primary); font-size:.6rem; font-weight:700; }.topology-receipt-item p { margin:.2rem 0 0; color:var(--muted-foreground); font-size:.68rem; line-height:1.45; }
 @media (max-width: 900px) { .execution-canvas { height:680px; }.execution-canvas-header { flex-direction:column; }.execution-canvas-header > span { align-self:flex-start; } }
 @media (max-width: 600px) { .execution-canvas { height:560px; }.execution-canvas .react-flow__viewport { transform:translate(18px,0) scale(.36) !important; transform-origin:top left; } .execution-canvas .react-flow__controls { transform:scale(1.35); transform-origin:bottom left; } }
+.reference-anchor-debug .reference-svg-node { outline:2px solid #ef4444; outline-offset:-2px; background:rgb(239 68 68 / 12%); }
+.reference-topology-shell { height:calc(100vh - 104px); min-height:560px; border:1px solid var(--border); border-radius:1rem; background:var(--card); overflow:hidden; display:flex; flex-direction:column; }.reference-topology-head { display:flex; justify-content:space-between; gap:1rem; padding:1rem 1.2rem .8rem; border-bottom:1px solid var(--border); }.reference-topology-head h2 { margin:.15rem 0; font-size:1.25rem; }.reference-topology-head p { margin:0; color:var(--muted-foreground); font-size:.75rem; }.reference-topology-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:.5rem; min-width:max-content; }.reference-topology-actions > span { border:1px solid #a7c8ef; border-radius:999px; padding:.35rem .6rem; color:#2f6299; font-size:.65rem; font-weight:700; }.reference-topology-actions button { appearance:none; border:1px solid #1467b8; border-radius:.55rem; background:#176fc1; color:#fff; padding:.48rem .75rem; font-size:.72rem; font-weight:750; line-height:1; cursor:pointer; box-shadow:0 2px 5px rgb(20 103 184 / 18%); }.reference-topology-actions button:hover,.reference-topology-actions button:focus-visible { background:#0d5d9f; outline:3px solid rgb(20 103 184 / 22%); outline-offset:2px; }.reference-topology-stage { position:relative; flex:1; min-height:0; overflow:hidden; background:#f6faff; }.reference-topology-stage > svg { display:block; width:100%; height:100%; }.reference-svg-labels text { fill:#184b78; font:700 15px system-ui,sans-serif; }.reference-svg-hotspots { pointer-events:none; }.reference-svg-node { pointer-events:auto; width:100%; height:100%; display:flex; flex-direction:column; justify-content:center; gap:2px; border:0; background:transparent; padding:5px 7px 5px 39%; color:#143252; text-align:left; cursor:pointer; overflow:hidden; }.reference-svg-node:hover,.reference-svg-node:focus-visible { outline:3px solid #2675c7; outline-offset:2px; background:rgb(255 255 255 / 48%); }.reference-svg-node strong { display:block; max-width:100%; font:700 clamp(11px,1vw,16px)/1.08 system-ui,sans-serif; white-space:normal; overflow-wrap:anywhere; word-break:break-word; }.reference-svg-node em,.reference-svg-node span { display:block; max-width:100%; font:400 clamp(8px,.62vw,10px)/1.08 system-ui,sans-serif; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }.reference-svg-node em { color:#55708c; font-style:normal; }.reference-svg-node span { color:#315f93; }.reference-topology-shell .topology-modal { position:fixed; inset:0; z-index:60; display:grid; place-items:center; background:rgb(9 27 47 / 48%); padding:1rem; }.reference-topology-shell .topology-modal-card { position:relative; width:min(520px,100%); max-height:80vh; overflow:auto; border:1px solid var(--border); border-radius:1rem; background:var(--card); padding:1.25rem; }.reference-topology-shell .topology-modal-close { position:absolute; top:.8rem; right:.8rem; border:0; background:transparent; font-size:1.4rem; cursor:pointer; }.reference-fork-label { fill:#184b78; font:700 15px system-ui,sans-serif; text-anchor:middle; }.reference-lane-title { fill:#174e68; font:700 15px system-ui,sans-serif; }.reference-lane-title.agent { fill:#4e3982; }.reference-lane-title.rag { fill:#225f8a; }
+.reference-anchor-box { position:relative; width:100%; height:100%; }
+.reference-anchor-box.is-editable { border:2px dashed #2d79c7; background:rgb(255 255 255 / 18%); }
+.reference-anchor-box.is-editable .reference-svg-node { cursor:move; padding-left:8px; }
+.reference-anchor-box.is-editable .reference-svg-node { padding-left:39%; }
+.reference-label-overlays { pointer-events:none; }
+.reference-label-box { pointer-events:auto; }
+.reference-label-node { width:100%; height:100%; border:0; background:transparent; color:#184b78; font:700 clamp(10px,.82vw,15px)/1.05 system-ui,sans-serif; text-align:left; white-space:normal; overflow-wrap:anywhere; cursor:pointer; }
+.reference-label-node:hover,.reference-label-node:focus-visible { outline:2px solid #2675c7; outline-offset:1px; background:rgb(255 255 255 / 24%); }
+.reference-label-box.is-editable .reference-label-node { cursor:move; }
+.reference-label-content { position:relative; width:100%; height:100%; display:flex; align-items:center; }
+.reference-label-input { width:100%; height:100%; border:1px dashed #2675c7; border-radius:.25rem; background:rgb(255 255 255 / 68%); color:#184b78; padding:.15rem .25rem; font:700 clamp(10px,.82vw,15px)/1.05 system-ui,sans-serif; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; outline:none; }
+.reference-label-node { text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:0 .25rem; }
+.reference-label-delete { position:absolute; top:-6px; right:-6px; width:16px; height:16px; border:1px solid #fff; border-radius:999px; background:#c23b4a; color:#fff; font-size:11px; line-height:12px; cursor:pointer; }
+.reference-svg-node strong { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; overflow-wrap:normal; word-break:normal; }
+.reference-anchor-resize { width:18px; height:18px; right:-5px; bottom:-5px; cursor:nwse-resize; }
+.reference-anchor-resize { right:0; bottom:0; width:24px; height:24px; z-index:20; }
+.reference-unified-frames { pointer-events:auto; }
+.reference-unified-frame { position:relative; width:100%; height:100%; pointer-events:auto; }
+.reference-unified-frame.is-editable { border:2px dashed #2d79c7; background:rgb(255 255 255 / 10%); }
+.reference-unified-content { position:relative; width:100%; height:100%; display:flex; align-items:center; }
+.reference-unified-node { width:100%; height:100%; border:0; background:transparent; color:#143252; text-align:left; cursor:pointer; padding:5px 7px 5px 39%; overflow:hidden; }
+.reference-unified-node strong { display:block; font:700 clamp(9px,.9vw,14px)/1.02 system-ui,sans-serif; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.reference-unified-node em,.reference-unified-node span { display:block; font:400 clamp(7px,.55vw,9px)/1.02 system-ui,sans-serif; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.reference-unified-input { width:100%; height:100%; border:1px dashed #2675c7; background:rgb(255 255 255 / 80%); padding:2px 4px; color:#143252; font:700 clamp(9px,.9vw,14px)/1.02 system-ui,sans-serif; text-align:left; outline:none; }
+.reference-unified-delete { position:absolute; top:-7px; right:-7px; z-index:8; width:16px; height:16px; border:1px solid #fff; border-radius:999px; background:#c23b4a; color:#fff; font-size:11px; line-height:12px; cursor:pointer; }
+.reference-unified-node.is-compact { padding-top:3px; padding-bottom:3px; }
+.reference-unified-node.is-compact strong { font-size:clamp(8px,.78vw,12px); line-height:1; }
+.reference-unified-node.is-compact em { font-size:clamp(6px,.48vw,8px); line-height:1; }
+.reference-topology-shell .topology-detail-section { margin:1rem 0 .35rem; border-top:1px solid var(--border); padding-top:.65rem; color:#245c91; font-size:.68rem; font-weight:800; letter-spacing:.04em; }
+.reference-topology-shell .topology-modal-card p { line-height:1.5; }
+.reference-anchor-debug .reference-svg-hotspots { pointer-events:auto; }
+.reference-anchor-debug .reference-anchor-box { pointer-events:auto; }
+.reference-save-feedback { color:#087443; font-size:.7rem; font-weight:750; }
+.reference-anchor-resize { position:absolute; right:-2px; bottom:-2px; width:12px; height:12px; border:2px solid #fff; border-radius:2px; background:#2d79c7; cursor:nwse-resize; touch-action:none; }
+.reference-anchor-resize { pointer-events:auto; z-index:5; display:block; }
+.reference-anchor-box.is-editable .reference-anchor-resize:hover { background:#0d5d9f; box-shadow:0 0 0 3px rgb(45 121 199 / 25%); }
+.flow-current-prompt-text { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; overflow-wrap:anywhere; }
+.reference-topology-shell { height:clamp(460px,calc(100vh - 250px),700px); min-height:460px; }
+.flow-current-prompt-card { max-height:58px; overflow:hidden; }
+.flow-current-prompt-text { -webkit-line-clamp:1; white-space:nowrap; text-overflow:ellipsis; }
+.reference-topology-head { padding:.6rem .85rem .5rem; }
+.reference-topology-head h2 { font-size:1.08rem; }
+.reference-topology-head p { font-size:.68rem; }
+.reference-topology-shell { height:680px; min-height:680px; }
+.reference-topology-shell { overflow:visible; }
+.reference-topology-stage { overflow:visible; }
+.reference-topology-stage > svg { width:112%; height:112%; margin-left:-6%; }
+.reference-topology-shell { overflow:hidden; }
+.reference-topology-stage { overflow:hidden; }
+.reference-topology-stage > svg { width:100%; height:100%; margin-left:0; }
+.reference-topology-shell { height:auto; min-height:0; }
+.reference-topology-stage { flex:none; width:100%; height:auto; aspect-ratio:1672 / 941; }
+.reference-topology-stage { aspect-ratio:1672 / 815; }
+.reference-topology-stage { aspect-ratio:1672 / 941; }
+
+/* Unified anchor editor hit targets: the resize affordance must sit above the
+   node content. In edit mode content is visual-only, while the frame wrapper
+   still receives move gestures and the two explicit controls remain live. */
+.reference-unified-frame.is-editable .reference-unified-content,
+.reference-unified-frame.is-editable .reference-unified-node {
+  pointer-events: none !important;
+}
+.reference-unified-frame.is-editable .reference-unified-input,
+.reference-unified-frame.is-editable .reference-unified-delete,
+.reference-unified-frame.is-editable .reference-anchor-resize {
+  pointer-events: auto !important;
+}
+.reference-unified-frame.is-editable .reference-anchor-resize {
+  position: absolute !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  z-index: 100 !important;
+  width: 28px !important;
+  height: 28px !important;
+  display: block !important;
+  border: 2px solid #fff !important;
+  border-radius: 3px !important;
+  background: #2d79c7 !important;
+  cursor: nwse-resize !important;
+  touch-action: none !important;
+}
+.reference-unified-frame.is-editable .reference-unified-delete {
+  z-index: 101 !important;
+}
+.reference-anchor-link { display:inline-flex; width:2rem; height:2rem; align-items:center; justify-content:center; border:1px solid #a7c8ef; border-radius:.55rem; background:var(--card); color:#2f6299; font-size:1rem; font-weight:800; text-decoration:none; }
+.reference-anchor-link:hover,.reference-anchor-link:focus-visible { background:#eaf4ff; outline:3px solid rgb(20 103 184 / 22%); outline-offset:2px; }
+.reference-svg-node { gap:1px; padding-top:4px; padding-bottom:4px; }
+.reference-svg-node strong { font-size:clamp(9px,.9vw,14px); line-height:1.02; }
+.reference-svg-node em,.reference-svg-node span { font-size:clamp(7px,.55vw,9px); line-height:1.02; }
+
+/* Identical content geometry in normal/edit modes; edit outlines never consume
+   the content box. Lane labels have no icon inset. */
+.reference-lane-title-frame .reference-unified-node.reference-label-node { padding:0 4px; line-height:1.2; }
+.reference-unified-frame.is-editable { border:0; outline:2px dashed #2d79c7; outline-offset:-2px; }
+.reference-expanded-root .reference-unified-node { padding:5px 6px 5px 64px; }
+.reference-expanded-root .reference-unified-node strong { font-size:12px; line-height:1.2; }
+.reference-expanded-root .reference-unified-node span { font-size:9px; line-height:1.2; }
+.reference-unified-node strong { font-size:14px; line-height:1.15; }
+.reference-unified-node span { font-size:11px; line-height:1.15; }
+.reference-unified-node.is-compact strong { font-size:13px; line-height:1.15; }
+.reference-unified-node:focus-visible { outline:3px solid #1467b8; outline-offset:-3px; background:rgb(255 255 255 / 72%); }
+.reference-topology-stage:has(> svg[style]) { max-height:calc(100vh - 260px); }
+.reference-topology-shell .topology-modal-card p { overflow-wrap:anywhere; white-space:pre-wrap; }
+.reference-svg-labels text { font-size:13px; }

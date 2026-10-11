@@ -4,7 +4,12 @@
  * map is deliberately local and deterministic: it never calls a model or a
  * remote translation service during render.
  */
+import { RELEASE_UI_COPY } from "./release-ui-copy";
+import { RELEASE_UI_LOCALIZED } from "./release-ui-localized";
+const RELEASE_SOURCE_KEYS=Object.fromEntries(Object.entries(RELEASE_UI_COPY).map(([key,item])=>[item.source,key]));
 const ZH_TO_EN: Record<string, string> = {
+  "原文导航返回数": "Source navigation returned",
+  "已返回原文导航；可回读来源核对主体与断言。": "Source navigation was returned; review the original source to check its subject and claims.",
   "智能体记忆": "Agent memory",
   "事实": "Facts",
   "经历": "Experiences",
@@ -165,8 +170,7 @@ const ZH_TO_EN: Record<string, string> = {
   "更新时间线": "Update timeline",
   "数据与备份": "Data and backup",
   "前台边界": "Foreground boundary",
-  "查看当前实际使用的模型、宿主和本机服务。版本 4.0": "View the models, host, and local services currently in use. Version 5.0",
-  "查看当前实际使用的模型、宿主和本机服务。版本 5.0": "View the models, host, and local services currently in use. Version 5.0",
+  "查看当前实际使用的模型、宿主和本机服务。版本 5.1": "View the models, host, and local services currently in use. Version 5.1",
   "入口": "Entry", "回答": "Answer", "上一页": "Previous", "下一页": "Next",
   "正在读取链路记录…": "Loading flow records…", "选择一条用户 Prompt": "Select a user prompt",
   "记忆使用说明书": "Memory usage guide", "旧记录未保存说明版本": "The old receipt did not save the guidance version",
@@ -174,7 +178,7 @@ const ZH_TO_EN: Record<string, string> = {
   "点击查看本轮 L0，并预览 L1 / L2 下钻状态": "Click to view this turn's L0 and preview L1 / L2 drill-down status",
   "UserPromptSubmit · 说明与偏好入口": "UserPromptSubmit · guidance and preference entry",
   "路径 A": "Path A", "路径 B": "Path B", "偏好路径": "Preference path",
-  "EP 5.0 开发态": "EP 5.0 development", "链路": "Flow",
+  "EP 5.1 开发态": "EP 5.1 development", "链路": "Flow",
   "从 Prompt 到回答的可观测证据图": "Observable evidence path from prompt to answer",
   "左侧选择用户 Prompt，中间查看本轮路径，右侧查看节点真实回执。": "Select a user prompt on the left, inspect its path in the center, and review node receipts on the right.",
   "共": "Total", "条": "items", "尚无可展示的用户 Prompt。": "No user prompts to display.",
@@ -230,6 +234,7 @@ const SEGMENTS: Array<[string, string]> = [
   ["审计", "audit"], ["详情", "details"], ["原文", "source text"], ["上一级", "parent"],
 ];
 
+Object.assign(ZH_TO_EN,Object.fromEntries(Object.values(RELEASE_UI_COPY).map(item=>[item.source,item.en])));
 const EN_TO_ZH: Record<string, string> = Object.fromEntries(
   Object.entries(ZH_TO_EN).map(([zh, en]) => [en, zh])
 );
@@ -241,8 +246,7 @@ Object.assign(EN_TO_ZH, {
   "OpenAI / DeepSeek / Ollama": "OpenAI / DeepSeek / Ollama", "Session：": "Session：",
   "Session Scenario Summary": "Session 情景摘要", "Claude Code": "Claude Code", "Codex CLI": "Codex CLI",
   "LLM Requests": "模型请求", "Audit Logs": "审计日志", On: "开启", Off: "关闭",
-  "查看当前实际使用的模型、宿主和本机服务。版本 4.0": "查看当前实际使用的模型、宿主和本机服务。版本 4.0",
-  "查看当前实际使用的模型、宿主和本机服务。版本 5.0": "查看当前实际使用的模型、宿主和本机服务。版本 5.0",
+  "查看当前实际使用的模型、宿主和本机服务。版本 5.1": "查看当前实际使用的模型、宿主和本机服务。版本 5.1",
 });
 
 function localeFromDocument(): string {
@@ -254,19 +258,39 @@ function localeFromDocument(): string {
 }
 
 export function inlineUiText(source: string, locale = localeFromDocument()): string {
+  const semanticKey=RELEASE_SOURCE_KEYS[source];
+  if (semanticKey && RELEASE_UI_LOCALIZED[locale]?.[semanticKey]) return RELEASE_UI_LOCALIZED[locale][semanticKey];
   const isZh = locale.toLowerCase().startsWith("zh") || locale.toLowerCase().startsWith("yue");
   if (isZh) return EN_TO_ZH[source] ?? source;
   if (!/[\u3400-\u9fff]/u.test(source)) return source;
   if (ZH_TO_EN[source]) return ZH_TO_EN[source];
-  let translated = source;
-  for (const [from, to] of SEGMENTS) translated = translated.split(from).join(to);
-  // Do not leak untranslated Han characters into a non-Chinese locale. The
-  // segment map keeps the meaning of common UI phrases; the final marker is
-  // explicit for rare dynamic fragments that need a later message-key pass.
-  return translated.replace(/[\u3400-\u9fff]+/gu, " details").replace(/\s{2,}/g, " ").trim();
+  // Unknown text is preserved. Segment substitution invents malformed labels
+  // and can corrupt source bodies; call sites must provide semantic copy.
+  return source;
 }
 
 export function isKnownInlineUiText(source: string): boolean {
   return INLINE_STATIC_SOURCES.has(source) || Object.prototype.hasOwnProperty.call(ZH_TO_EN, source) || Object.prototype.hasOwnProperty.call(EN_TO_ZH, source);
+}
+/** Only for storage enums used as interface labels, never memory bodies. */
+export function enumUiText(value: string, locale = localeFromDocument()): string {
+  if (RELEASE_UI_LOCALIZED[locale]?.[value]) return RELEASE_UI_LOCALIZED[locale][value];
+  const labels: Record<string, [string,string]> = {
+    unconfigured:["未配置","Not configured"],
+    configured_but_inactive:["已配置但未启用","Configured, inactive"],disabled_saved:["已保存，未启用","Saved, disabled"],inactive:["未启用","Inactive"],archived_configured:["已归档配置","Archived configuration"],
+    protected:["写入权限禁止；保留原文","Write prohibited; raw source retained"],partial_protected:["部分完成；其余受权限保护","Partial; remaining sources protected"],raw_available_summary_protected:["原文可用；摘要写入受权限保护","Raw available; summary write protected"],
+    unreviewed:["未复核","Unreviewed"],reviewed:["已复核","Reviewed"],unspecified:["用途未指定","Purpose unspecified"],navigation:["情景导航","Scenario navigation"],raw_available_summary_pending:["原文可用；语义摘要待处理","Raw available; semantic summary pending"],raw_available_summary_failed:["原文可用；语义摘要失败","Raw available; semantic summary failed"],stale_source_pending:["来源已更新；等待新摘要","Source changed; new summary pending"],not_discovered:["尚未发现","Not discovered"],partial_pending:["部分完成；仍在排队","Partial; work pending"],partial_failed:["部分完成；存在失败","Partial; failures remain"],complete:["已完成","Complete"],
+    ready:["可用","Ready"],model_reviewed:["已语义复核","Semantically reviewed"],review_pending:["待复核","Review pending"],partial:["部分覆盖","Partial coverage"],available_unreviewed:["原文节选可用，未复核","Raw excerpt available; unreviewed"],raw_message_excerpt:["有界原文节选","Bounded raw excerpt"],queued:["排队中","Queued"],running:["处理中","Running"],succeeded:["已完成","Succeeded"],facts_and_experiences:["事实与经历","Facts and experiences"],facts_experiences_entities:["事实、经历与实体","Facts, experiences and entities"],preferences:["偏好","Preferences"],process_memory:["过程记忆","Process memory"],scenario_summary:["情景摘要","Scenario summary"],
+    trace:["原始轨迹","Raw trajectory"],event:["过程事件","Process event"],process_observation:["过程观察","Process observation"],episode:["失败事件","Failure episode"],pattern:["修复模式","Repair pattern"],skill:["可复用过程策略","Reusable process strategy"],capability_observation:["能力观测","Capability observation"],process_draft:["过程草稿","Process draft"],
+    user_memory:["用户记忆","User memory"],agent_process:["智能体过程记忆","Agent process memory"],scenario:["情景摘要","Scenario summary"],external_rag:["外部 RAG","External RAG"],audit:["审计","Audit"],
+    retrieve:["检索","Retrieve"],readback:["补读原文","Source readback"],deliver:["送达","Deliver"],capture:["捕获","Capture"],extract:["提炼","Extract"],associate:["关联","Associate"],verify:["核验","Verify"],promote:["晋升","Promote"],revalidate:["再验证","Revalidate"],
+    stable:["稳定","Stable"],verified:["已验证","Verified"],observed:["已观察","Observed"],diagnosed:["已诊断","Diagnosed"],repaired:["已修复","Repaired"],replicated:["已复现","Replicated"],generalized:["已泛化","Generalized"],candidate:["候选","Candidate"],unknown:["未知","Unknown"],watch:["需关注","Needs attention"],revalidation_required:["待再验证","Revalidation required"],deprecated:["已弃用","Deprecated"],configured:["已配置","Configured"],
+    not_called:["已确认未调用","Confirmed no call"],returned_zero:["已返回空结果","Returned empty"],returned:["已返回","Returned"],delivered:["已送达","Delivered"],unavailable:["不可用","Unavailable"],failed:["失败","Failed"],not_measured:["未测量","Not measured"],
+    host_retained_result:["宿主原始结果","Host retained result"],canonical_activity:["规范活动回执","Canonical activity"],prompt_bound_receipt:["Prompt 绑定回执","Prompt bound receipt"],route_plan:["路线计划","Route plan"],not_observed:["未观测","Not observed"],bounded_activity:["有界活动","Bounded activity"],
+    software_engineering:["软件工程","Software engineering"],configuration:["配置任务","Configuration"],multi_agent_coordination:["智能体协作","Agent coordination"],browser_automation:["浏览器操作","Browser automation"],document_authoring:["文档编写","Document authoring"],research:["研究","Research"],understand:["理解","Understand"],plan:["规划","Plan"],act:["执行","Act"],observe:["观察","Observe"],recover:["恢复","Recover"],reflect:["反思","Reflect"],
+  };
+  const key=value.replace(/^agent_/,"");
+  const pair=labels[key] || labels[value];
+  return pair ? pair[/^(zh|yue)/i.test(locale) ? 0 : 1] : value;
 }
 import { INLINE_STATIC_SOURCES } from "@/lib/inline-sources.generated";

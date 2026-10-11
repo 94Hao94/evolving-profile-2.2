@@ -16,7 +16,12 @@ import types
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
 
+from .audit_module_test_context import isolated_audit_loader, isolated_audit_modules
+
+
+@isolated_audit_loader
 def _archive_module():
     module_path = Path(__file__).parents[1] / "evolving_profile_api" / "engine" / "audit_trace_archive.py"
     spec = importlib.util.spec_from_file_location("_audit_trace_archive_under_test", module_path)
@@ -27,6 +32,7 @@ def _archive_module():
     return module
 
 
+@isolated_audit_loader
 def _audit_module():
     """Load the logger with its DB boundaries replaced by a real minimal contract."""
     package_root = Path(__file__).parents[1] / "evolving_profile_api"
@@ -59,6 +65,41 @@ def _audit_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_standalone_loaders_leave_real_api_modules_and_parent_attributes_unchanged():
+    """Fake DB dependencies must not replace the next test's runtime imports."""
+    before = {name:module for name,module in sys.modules.items()
+              if name == 'evolving_profile_api' or name.startswith('evolving_profile_api.')}
+    parents = {name:dict(vars(module)) for name,module in before.items() if isinstance(module,types.ModuleType)}
+    private_before = sys.modules.get('_audit_trace_archive_under_test')
+    _archive_module()
+    _audit_module()
+    after = {name:module for name,module in sys.modules.items()
+             if name == 'evolving_profile_api' or name.startswith('evolving_profile_api.')}
+    assert after == before
+    assert sys.modules.get('_audit_trace_archive_under_test') is private_before
+    for name,attributes in parents.items():
+        assert vars(before[name]) == attributes
+
+
+def test_loader_context_restores_runtime_parent_links_even_when_loading_raises():
+    package = sys.modules['evolving_profile_api']
+    engine = sys.modules['evolving_profile_api.engine']
+    package_before = dict(vars(package))
+    engine_before = dict(vars(engine))
+    runtime_name = 'evolving_profile_api.engine.runtime'
+    runtime_before = sys.modules.get(runtime_name)
+    with pytest.raises(RuntimeError, match='loader failed'):
+        with isolated_audit_modules():
+            runtime = types.ModuleType(runtime_name)
+            sys.modules[runtime_name] = runtime
+            engine.runtime = runtime
+            package.engine = runtime
+            raise RuntimeError('loader failed')
+    assert sys.modules.get(runtime_name) is runtime_before
+    assert vars(package) == package_before
+    assert vars(engine) == engine_before
 
 
 def test_archive_round_trip_preserves_the_complete_trace(tmp_path):

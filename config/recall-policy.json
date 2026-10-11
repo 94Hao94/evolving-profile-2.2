@@ -1,0 +1,22 @@
+{
+  "schema": "evolving-profile.recall-policy.v1",
+  "policy_version": "recall-relevance.v1",
+  "levels": ["strong", "medium", "weak"],
+  "default_min_relevance": "weak",
+  "plane_overrides": ["inherit", "strong", "medium", "weak"],
+  "defaults": {
+    "recall_policy": {"default_min_relevance": "weak", "user_memory": "inherit", "agent_memory": "inherit", "advanced": {"allow_transferable_methods": true, "allow_background": true, "historical_mode": "reference_only", "scope_unknown_mode": "keep_navigation", "adaptive_enabled": true}},
+    "rag": {"minimum_relevance": "weak"}
+  },
+  "advanced_enums": {
+    "historical_mode": ["reference_only", "current_only"],
+    "scope_unknown_mode": ["keep_navigation", "require_verified"]
+  },
+  "definitions": {
+    "strong": "Direct content answers the subject, constraint, or requested procedure.",
+    "medium": "Content shares a meaningful subject or transferable procedure, possibly across task domains.",
+    "weak": "Content has an explained partial relation that may help as background.",
+    "none": "No meaningful content relation; metadata and generic boilerplate are insufficient.",
+    "unknown": "Insufficient readable content to establish a relation."
+  }
+}

@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
-GUIDANCE_V1_SRC = os.environ.get("EVOLVING_PROFILE_GUIDANCE_SRC", str(Path.home() / ".evolving-profile/runtime/guidance"))
+GUIDANCE_V1_SRC = os.environ.get("EVOLVING_PROFILE_GUIDANCE_SRC", "/Users/apple/.evolving-profile/runtime/guidance")
 if GUIDANCE_V1_SRC not in sys.path:
     sys.path.insert(0, GUIDANCE_V1_SRC)
 from evidence_workspace import discover, search, read_page, source_witness, record_stdout, DEFAULT_ROOT
@@ -25,7 +25,7 @@ from source_safety import mask_text, mask_value
 CONTROLLER = os.environ.get("EVOLVING_PROFILE_CONTROLLER_URL", "http://127.0.0.1:12079")
 BANK = "personal-memory"
 VERSION = "1.5.0-route-intelligence"
-GUIDANCE_V1_CONFIG = os.environ.get("EVOLVING_PROFILE_GUIDANCE_CONFIG", str(Path.home() / ".evolving-profile/guidance-v1/guidance-v1.json"))
+GUIDANCE_V1_CONFIG = os.environ.get("EVOLVING_PROFILE_GUIDANCE_CONFIG", "/Users/apple/.evolving-profile/guidance-v1/guidance-v1.json")
 CHECK_TOOL = {
     'name':'memory_check',
     'description':'兼容审计工具，不是记忆启动入口，也不应在get_preference之前强制调用。新实质任务先依据启动说明判断：多维度偏好用get_preference，历史事实用recall/research。仅当宿主已经提供真实check_id、需要补记本轮是否查历史，或兼容旧验收时调用；不得编造或复用ID。此工具不读写Bank，不决定是否允许回答。',

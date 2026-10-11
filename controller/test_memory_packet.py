@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import unittest
 
-SCRIPTS = "/tmp/ep-test-user/.hindsight/custom-codex/scripts"
+SCRIPTS = "/Users/apple/.hindsight/custom-codex/scripts"
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 

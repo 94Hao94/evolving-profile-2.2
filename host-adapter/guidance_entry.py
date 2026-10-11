@@ -11,7 +11,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
-import os
 import re
 from pathlib import Path
 import sys
@@ -21,9 +20,8 @@ from task_state import TaskStateStore
 from lib.memory_policy import classify_memory_policy
 from entry_navigation import build_navigation_map
 
-EP_ROOT = Path(os.environ.get("EVOLVING_PROFILE_STATE_ROOT", str(Path.home() / ".evolving-profile")))
-GUIDANCE_SRC = EP_ROOT / "runtime/guidance"
-GUIDANCE_CONFIG = EP_ROOT / "guidance-v1/guidance-v1.json"
+GUIDANCE_SRC = Path("/Users/apple/.evolving-profile/runtime/guidance")
+GUIDANCE_CONFIG = Path("/Users/apple/.evolving-profile/guidance-v1/guidance-v1.json")
 RECEIPT_ROOT = Path.home() / ".evolving-profile/audit/guidance-entry-receipts"
 MAX_TOKENS = 5000
 MAX_CANDIDATES = 6
@@ -314,7 +312,7 @@ def prepare_agent_owned_entry(hook_input: dict, prompt: str, *, memory_policy: s
     if task_state:
         context+=_task_state_context(task_state,session_id,AGENT_ENTRY_MAX_CONTEXT_CHARS-len(context))
     receipt={
-        'schema':'hindsight.guidance-entry-check.v1','kind':'preference_entry_check','tool_name':'get_preference',
+        'schema':'hindsight.guidance-entry-check.v1','kind':'preference_entry_check','tool_name':'user_preference',
         'invocation_mode':'navigation_plus_get_preference_candidate_packet','delivery_stage':'navigation_and_guidance_candidates_prepared',
         'host_visibility':'hook_context_pending','at':datetime.now(timezone.utc).isoformat(),
         'session_id':hook_input.get('session_id'),'turn_id':hook_input.get('turn_id'),'hook_invocation_id':invocation,
@@ -373,7 +371,7 @@ def run_entry_check(hook_input: dict, prompt: str, *, memory_policy: str = "allo
     receipt = {
         "schema": "hindsight.guidance-entry-check.v1",
         "kind": "guidance_entry_check",
-        "tool_name": "get_preference",
+        "tool_name": "user_preference",
         "invocation_mode": "codex_UserPromptSubmit_entry_adapter",
         "delivery_stage": "entry_selected_then_hook_context_prepared",
         "host_visibility": "hook_context_pending",

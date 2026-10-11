@@ -22,7 +22,8 @@ from observation_rebuild import atomic
 def rebuild_rerender_draft(source: dict, draft: dict) -> dict:
     if draft.get("source_revision") != source.get("source_revision"):
         raise ValueError("scenario_source_revision_mismatch")
-    rebuilt = validate_state_draft(source, draft.get("state"), model=str(draft.get("summary_model") or "unknown"))
+    rebuilt = validate_state_draft(source,draft.get('state'),model=str(draft.get('summary_model') or 'unknown'),
+                                   user_claim_protocol=draft.get('state_claim_protocol'))
     for key in ("selection_coverage", "source_chunk_char_limit"):
         if key in draft:
             rebuilt[key] = draft[key]

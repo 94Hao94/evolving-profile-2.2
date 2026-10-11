@@ -1,13 +1,13 @@
+import { epStatePath, EP_STATE_ROOT, EP_API_ENV, EP_HOST_SESSIONS } from "@/lib/ep-state-paths";
 import { NextRequest, NextResponse } from "next/server";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { homedir } from "node:os";
 import { FLOW_LANES, summarizeFlowLane, type FlowReceipt } from "@/lib/flow-receipt";
 
-const EP_ROOT = process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(homedir(), ".evolving-profile");
-const PROCESS_MEMORY_PATH = path.join(EP_ROOT, "process-memory/records.json");
-const HOOK_RECEIPTS_PATH = process.env.EVOLVING_PROFILE_HOOK_RECEIPTS_PATH || path.join(homedir(), ".evolving-profile/audit/hook-output-receipts/production");
-const PROMPT_INGRESS_PATH = process.env.EVOLVING_PROFILE_PROMPT_INGRESS_PATH || path.join(homedir(), ".evolving-profile/audit/prompt-ingress.jsonl");
+const PROCESS_MEMORY_PATH = epStatePath("process-memory/records.json");
+const HOOK_RECEIPTS_PATH = process.env.EVOLVING_PROFILE_HOOK_RECEIPTS_PATH || epStatePath("audit/hook-output-receipts/production");
+const PROMPT_INGRESS_PATH = process.env.EVOLVING_PROFILE_PROMPT_INGRESS_PATH || epStatePath("audit/prompt-ingress.jsonl");
 
 async function localHookBinding(promptId: string) {
   const fingerprint = promptId.split(":", 1)[0];

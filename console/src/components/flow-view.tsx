@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { useLocale } from "next-intl";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ActionButton } from "@/components/ui/action-button";
+import { useLocale, useTranslations } from "next-intl";
 import { projectFlowAudit, type FlowEvidenceItem, type FlowPrompt } from "@/lib/flow-projection";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import { RelevanceAuditDetails } from "./recall-policy-settings";
 import { NavigationTopicBrowser } from "@/components/navigation-topic-browser";
 import { CandidateAuditBrowser } from "@/components/candidate-audit-browser";
 import { useParams } from "next/navigation";
@@ -22,6 +24,8 @@ import {
 
 import { inlineUiText } from "@/lib/inline-i18n";
 import { ExecutionTopologyCanvas } from "@/components/execution-topology-canvas";
+import { SourceNavigationDetails } from "./source-navigation-details";
+import {PromptSourceSummary,type PromptSourceCounts} from "./prompt-source-summary";
 type NodeId = "entry" | "map" | "guidance" | "history" | "answer";
 type ToolStatus = "observed" | "window_observed" | "not_observed";
 type MemoryMapNode = {
@@ -107,7 +111,11 @@ function displayEvidence(item: FlowEvidenceItem) {
 }
 
 function displayToolLabel(tool?: string) {
-  if (tool?.includes("get_preference") || tool?.includes("get_task_guidance")) return "Get Preference";
+  if (tool?.includes("user_preference") || tool?.includes("get_preference") || tool?.includes("get_task_guidance")) return "User Preference";
+  if (tool?.includes("user_recall")) return "User Recall";
+  if (tool?.includes("user_research")) return "User Research";
+  if (tool?.includes("agent_recall")) return "Agent Recall";
+  if (tool?.includes("agent_research")) return "Agent Research";
   if (tool?.includes("read_preference_unit") || tool?.includes("read_guidance_unit")) return "Read Preference Unit";
   if (tool?.includes("read_preference") || tool?.includes("read_guidance")) return "Read Preference";
   if (tool?.includes("search_scenario_summary") || tool?.includes("search_scenario_contexts")) return "Search Scenario Summary";
@@ -183,7 +191,7 @@ export function guidanceNodeValue(audit: ReturnType<typeof projectFlowAudit> | n
 
 export function historyToolStatus(
   route: string | undefined,
-  tool: "recall" | "research" | "read_source" | "read_scenario_summary",
+  tool: "recall" | "research" | "read_source" | "search_scenario_summary" | "read_scenario_summary" | "scenario_gate",
   windowActivity?: FlowPrompt["time_window_activity"],
   toolEvents?: NonNullable<FlowPrompt["memory_route_receipt"]>["tool_events"],
 ): ToolStatus {
@@ -196,9 +204,12 @@ export function historyToolStatus(
 
 export function historyEmptyStateLabel(history: {
   decision?: string;
+  routeReceipt?: FlowPrompt["memory_route_receipt"];
   timeWindowActivity?: FlowPrompt["time_window_activity"];
 }, english = false) {
   const activity = history.timeWindowActivity;
+  const navigation=history.routeReceipt?.tool_events?.reduce((count,event)=>count+(event.source_navigation_returned_count || 0),0) || 0;
+  if (navigation) return inlineUiText("已返回原文导航；可回读来源核对主体与断言。",english ? "en" : undefined);
   const recall = activity?.by_tool?.recall;
   if (recall?.calls) {
     const candidates = activity?.candidate_count ?? recall.candidates ?? 0;
@@ -275,7 +286,9 @@ function ToolRail({
     { id: "recall" as const, label: "recall", caption: inlineUiText("候选召回"), icon: Search },
     { id: "research" as const, label: "research", caption: inlineUiText("复杂关联"), icon: GitBranch },
     { id: "read_source" as const, label: "read_source", caption: inlineUiText("原文回读"), icon: BookOpen },
-    { id: "read_scenario_summary" as const, label: "Scenario Summary", caption: inlineUiText("情景补读"), icon: Network },
+    { id: "search_scenario_summary" as const, label: "search_scenario_summary", caption: inlineUiText("情景定位"), icon: Network },
+    { id: "read_scenario_summary" as const, label: "read_scenario_summary", caption: inlineUiText("情景摘要下钻"), icon: Network },
+    { id: "scenario_gate" as const, label: "scenario_gate", caption: inlineUiText("情景判断"), icon: GitBranch },
   ];
   const statusText: Record<ToolStatus, string> = {
     observed: inlineUiText("调用回执已记录"),
@@ -302,6 +315,7 @@ function ToolRail({
                 <span className="font-medium text-foreground">{displayToolLabel(event.tool)}</span>
                 {event.at && <span>{new Date(event.at).toLocaleString(english ? "en-US" : locale)}</span>}
                 {event.returned_count != null && <span>{inlineUiText("返回")} {event.returned_count} 条</span>}
+                {event.source_navigation_returned_count != null ? <span>{inlineUiText("原文导航返回数")} {event.source_navigation_returned_count}</span> : null}
                 {event.candidate_count != null && <span>{inlineUiText("发现候选")} {event.candidate_count} 条</span>}
                 {event.memory_id && <span className="break-all">memory_id {event.memory_id}</span>}
                 {event.memory_ids?.length ? <span className="break-all">{inlineUiText("读取")} {event.memory_ids.slice(0, 6).join("、")}</span> : null}
@@ -325,6 +339,7 @@ function ToolRail({
                 {event.scope_hypothesis_count != null && <span>{inlineUiText("竞争假设")} {event.scope_hypothesis_count} 个</span>}
                 {event.scope_route_policy?.defer_bank_retrieval_until_scope_check && <span className="font-medium text-amber-700 dark:text-amber-300">{inlineUiText("先核对情景，再检索Bank")}</span>}
                 {event.scenario_decision ? <span>{inlineUiText("建议")} {event.scenario_decision}</span> : null}
+                {event.source_navigation?.length ? <div className="basis-full">{event.source_navigation.map(locator=><SourceNavigationDetails key={locator.memory_id} locator={locator}/>)}</div> : null}
               </div>
             ))}
           </div>
@@ -456,7 +471,7 @@ function ToolRail({
         </div>
       ) : (
         <div className="mt-3 rounded-md border border-dashed border-emerald-200/80 bg-background/50 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground dark:border-emerald-900/60">
-          {historyEmptyStateLabel({ decision: history?.decision, timeWindowActivity: windowActivity }, english)}
+          {historyEmptyStateLabel({ decision: history?.decision, routeReceipt:history?.routeReceipt, timeWindowActivity: windowActivity }, english)}
         </div>
       )}
     </div>
@@ -464,6 +479,7 @@ function ToolRail({
 }
 
 export function FlowView() {
+  const flowText=useTranslations("releaseUi");
   const locale = useLocale();
   const english = !locale.startsWith("zh");
   const copy = FLOW_COPY[locale.startsWith("zh") ? "zh" : "en"];
@@ -483,13 +499,15 @@ export function FlowView() {
   const [cursor, setCursor] = useState(0);
   const [query, setQuery] = useState("");
   const [host, setHost] = useState("all");
+  const [promptSource,setPromptSource]=useState("natural");
+  const [sourceCounts,setSourceCounts]=useState<PromptSourceCounts>({natural:null,audit:null});
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [memoryMap, setMemoryMap] = useState<MemoryMapNode[]>([]);
   const [routeDecision, setRouteDecision] = useState<RouteDecision | null>(null);
-  const [refreshNonce, setRefreshNonce] = useState(0);
-  const [showLegacyFlow, setShowLegacyFlow] = useState(false);
+  // The former legacy chain is intentionally hidden; the receipt-aware topology is the only flow surface.
+  const showLegacyFlow = false;
   // The prompt-list response is only a navigation preview. Do not project its
   // partial counts as actual memory delivery while the prompt-bound detail
   // receipt is still loading; otherwise an older/summary candidate can appear
@@ -505,31 +523,50 @@ export function FlowView() {
     return () => abort.abort();
   }, [mapOpen]);
 
-  useEffect(() => {
-    const controller = new AbortController();
+  const loadPrompts = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError(null);
     const search = query.trim() ? `&q=${encodeURIComponent(query.trim())}` : "";
-    fetch(
-      `/api/evolving-profile/guidance/prompts?limit=20&cursor=${cursor}&host=${encodeURIComponent(host)}${search}`,
-      { cache: "no-store", signal: controller.signal }
-    )
-      .then((response) => {
-        if (!response.ok) throw new Error("prompt_list_unavailable");
-        return response.json();
-      })
-      .then((payload) => {
-        const nextRows = payload.items ?? [];
+    try {
+      const response = await fetch(
+      `/api/evolving-profile/guidance/prompts?limit=20&cursor=${cursor}&host=${encodeURIComponent(host)}&prompt_source=${encodeURIComponent(promptSource)}${search}`,
+      { cache: "no-store", signal }
+      );
+      if (!response.ok) throw new Error("prompt_list_unavailable");
+      const payload = await response.json();
+      const nextRows: FlowPrompt[] = payload.items ?? [];
         setRows(nextRows);
         setSelected((previous) => nextRows.find((row: FlowPrompt) => row.prompt_id === previous?.prompt_id) ?? nextRows[0] ?? null);
         setHasMore(Boolean(payload.has_more));
-      })
-      .catch((cause) => {
-        if (cause.name !== "AbortError") setError(inlineUiText("链路记录暂时不可读取。请刷新后重试。"));
-      })
-      .finally(() => setLoading(false));
+        setSourceCounts({natural:typeof payload.natural_total==="number"?payload.natural_total:null,audit:typeof payload.audit_total==="number"?payload.audit_total:null,
+          verification:payload.source_verification_status==="partial" || payload.source_verification_status==="complete" ? payload.source_verification_status:null,
+          pending:typeof payload.source_verification_pending_total==="number"?payload.source_verification_pending_total:null});
+      return nextRows;
+    } catch (cause) {
+      if (!(cause instanceof Error && cause.name === "AbortError")) setError(inlineUiText("链路记录暂时不可读取。请刷新后重试。"));
+      throw cause;
+    } finally { if (!signal?.aborted) setLoading(false); }
+  }, [cursor, query, host,promptSource]);
+
+  const refresh = async () => {
+    const nextRows = await loadPrompts();
+    const prompt = nextRows.find((row) => row.prompt_id === selected?.prompt_id) ?? nextRows[0];
+    if (!prompt) return;
+    setDetailLoading(true);
+    try {
+      const response = await fetch(`/api/evolving-profile/guidance/prompts/${encodeURIComponent(prompt.prompt_id)}`, { cache: "no-store" });
+      if (!response.ok) throw new Error("prompt_detail_unavailable");
+      const detail = await response.json();
+      if (detail?.prompt_id !== prompt.prompt_id) throw new Error("prompt_detail_mismatch");
+      setSelectedDetail(detail);
+    } finally { setDetailLoading(false); }
+  };
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadPrompts(controller.signal).catch(() => undefined);
     return () => controller.abort();
-  }, [cursor, query, host, refreshNonce]);
+  }, [loadPrompts]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -596,7 +633,7 @@ export function FlowView() {
       })
       .finally(() => { if (!controller.signal.aborted) setDetailLoading(false); });
     return () => controller.abort();
-  }, [selected?.prompt_id, refreshNonce]);
+  }, [selected?.prompt_id]);
 
   const audit = useMemo(() => (currentRow ? projectFlowAudit(currentRow) : null), [currentRow]);
   const entryStateLabel = (value?: string) =>
@@ -619,7 +656,7 @@ export function FlowView() {
         : inlineUiText("指导覆盖待确认");
   const historyValue =
     audit?.history.calls
-      ? (english ? `Observed · ${audit.history.calls} call(s) · ${audit.history.metrics.returned ?? 0} returned` : `已观测 · ${audit.history.calls} 次调用 · 返回 ${audit.history.metrics.returned ?? 0} 条`)
+      ? (english ? `Observed · ${audit.history.calls} call(s) · ${audit.history.metrics.returned ?? "—"} returned` : `已观测 · ${audit.history.calls} 次调用 · 返回 ${audit.history.metrics.returned ?? "—"} 条`) + (audit.history.routeAudit.source_navigation_returned_count != null ? ` · ${flowText("sourceNavigationReturned")} ${audit.history.routeAudit.source_navigation_returned_count}` : "")
     : audit?.systemProbe?.calls
       ? (english ? `System probe observed · ${audit.systemProbe.calls} call(s) · ${audit.systemProbe.candidate_count ?? "unknown"} candidate(s)` : `已观测系统探测 · ${audit.systemProbe.calls} 次 · 候选 ${audit.systemProbe.candidate_count ?? inlineUiText("未知")} 条`)
     : !audit || audit.history.decision === "agent_decides"
@@ -680,25 +717,20 @@ export function FlowView() {
               <div className="flex items-center gap-2">
                 <h1 className="text-2xl font-semibold tracking-tight">{english ? "Flow" : inlineUiText("链路")}</h1>
                 <span className="rounded-full border border-sky-200 bg-sky-50 px-2 py-0.5 text-[10px] font-semibold text-sky-700 dark:border-sky-900/70 dark:bg-sky-950/30 dark:text-sky-300">
-                  {english ? "EP 5.0 development" : inlineUiText("EP 5.0 开发态")}
+                  {english ? "EP 5.1 development" : inlineUiText("EP 5.1 开发态")}
                 </span>
               </div>
               <p className="mt-0.5 text-sm text-muted-foreground">{english ? "Observable evidence path from prompt to answer" : inlineUiText("从 Prompt 到回答的可观测证据图")}</p>
             </div>
           </div>
-          <p className="mt-3 max-w-2xl text-sm text-muted-foreground">
-            {english ? "Select a user prompt on the left, inspect its path in the center, and review observable receipts on the right." : inlineUiText(copy.intro)} {english ? "Each path shows real receipts only; available on demand does not mean called in this turn." : inlineUiText("每一条路径都只展示实际回执；“按需可用”不等于“本轮已调用”。")}
-          </p>
-          {audit && (
-            <p className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground" aria-label={english ? "Current flow receipt status" : inlineUiText("本轮链路回执状态")}>
-              <span>{english ? "Entry" : inlineUiText("入口")}：{audit.hostEvidence.entry === "prepared" ? (english ? "receipt saved" : inlineUiText("回执已保存")) : (english ? "unverified" : inlineUiText("未核实"))}</span>
-              <span>EP MCP：{audit.hostEvidence.mcp === "observed" ? (english ? "tool receipt observed" : inlineUiText("本轮有工具回执")) : (english ? "unverified in this chat" : inlineUiText("当前聊天未核实"))}</span>
-              <span>{english ? "History" : inlineUiText("历史读取")}：{audit.hostEvidence.history === "observed" ? (english ? "called" : inlineUiText("本轮有调用")) : (english ? "no call receipt" : inlineUiText("本轮无调用回执"))}</span>
-              <span>{english ? "Tool result" : inlineUiText("工具结果")}：{audit.hostEvidence.result === "returned" ? (english ? "returned" : inlineUiText("已返回")) : audit.hostEvidence.result === "returned_empty" ? (english ? "returned 0" : inlineUiText("已返回 0 条")) : (english ? "unverified" : inlineUiText("未核实"))}</span>
-            </p>
-          )}
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
+          <label className="flex items-center gap-2 rounded-full border bg-background px-3 py-1.5 text-xs text-muted-foreground">
+            <span>{flowText("promptSourceFilter")}</span>
+            <select aria-label={flowText("promptSourceFilter")} value={promptSource} onChange={event=>{setCursor(0);setPromptSource(event.target.value);}} className="bg-transparent font-medium text-foreground outline-none">
+              {[['natural','promptSourceNatural'],['all','promptSourceAll'],['subagent','promptSourceSubagent'],['automation','promptSourceAutomation'],['memory-maintenance','promptSourceMaintenance'],['unknown','promptSourceUnknown']].map(([value,key])=><option key={value} value={value}>{flowText(key)}</option>)}
+            </select>
+          </label>
           <label className="flex items-center gap-2 rounded-full border bg-background px-3 py-1.5 text-xs text-muted-foreground shadow-sm">
             <span>{english ? "Host" : inlineUiText("宿主")}</span>
             <select
@@ -716,27 +748,29 @@ export function FlowView() {
               <option value="codex-cli">{inlineUiText("Codex CLI")}</option>
             </select>
           </label>
-          <div className="rounded-full border bg-background px-3 py-1.5 text-xs text-muted-foreground shadow-sm">
+          <PromptSourceSummary counts={sourceCounts}>
             {loading ? (english ? "Syncing" : inlineUiText("正在同步")) : `${rows.length} ${english ? "items" : inlineUiText("条")} / ${english ? "page" : inlineUiText("当前页")} ${Math.floor(cursor / 20) + 1}`}
-          </div>
+          </PromptSourceSummary>
         </div>
       </div>
 
-      <div className="grid min-w-0 gap-4 xl:grid-cols-[280px_minmax(0,1fr)]">
+      <div className="grid min-w-0 gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
         <aside className="min-w-0 overflow-hidden rounded-2xl border bg-background shadow-sm">
           <div className="border-b bg-muted/20 px-3 py-3">
             <div className="flex items-center justify-between text-xs font-medium text-muted-foreground">
               <span className="flex items-center gap-2">
                 {english ? copy.prompts : inlineUiText(copy.prompts)}
-                <button
+                <ActionButton
+                  variant="outline"
                   type="button"
-                  aria-label={inlineUiText("刷新用户 Prompt 链路")}
-                  title={inlineUiText("刷新用户 Prompt 链路")}
-                  onClick={() => setRefreshNonce((value) => value + 1)}
+                  size="icon"
+                  aria-label={flowText("refreshPromptFlow")}
+                  title={flowText("refreshPromptFlow")}
+                  onAction={refresh}
                   className="inline-flex h-6 w-6 items-center justify-center rounded-md border bg-background text-foreground hover:bg-muted"
                 >
                   <RefreshCw className="h-3.5 w-3.5" />
-                </button>
+                </ActionButton>
               </span>
               <span>{english ? `Total ${rows.length || "-"} items` : `共 ${rows.length || "-"} 条`}</span>
             </div>
@@ -754,7 +788,7 @@ export function FlowView() {
             {loading && <div className="p-3 text-sm text-muted-foreground">{inlineUiText("正在读取链路记录…")}</div>}
             {error && <div className="p-3 text-sm text-destructive">{error}</div>}
             {!loading && !error && rows.length === 0 && (
-              <div className="p-3 text-sm text-muted-foreground">{english ? copy.empty : inlineUiText(copy.empty)}</div>
+              <div className="p-3 text-sm text-muted-foreground">{flowText(promptSource==="natural" ? "promptSourceEmptyNatural":"promptSourceEmptyFiltered")}</div>
             )}
             {!loading &&
               !error &&
@@ -774,7 +808,9 @@ export function FlowView() {
                   <div className="mt-2 flex gap-2 text-[11px] text-muted-foreground">
                     <span>{entryStateLabel(row.routes?.entry_guidance)}</span>
                     <span>
-                      {historyStateLabel(
+                      {(row.prompt_id === currentRow?.prompt_id ? currentRow : row)?.memory_route_receipt?.tool_events?.length
+                        ? (english ? "Recorded tool calls" : "已记录工具调用")
+                        : historyStateLabel(
                         row.prompt_id === currentRow?.prompt_id
                           ? projectFlowAudit(currentRow).history.value
                           : projectFlowAudit(row).history.value
@@ -802,28 +838,15 @@ export function FlowView() {
           </div>
         </aside>
 
-        <main className="min-w-0 rounded-2xl border bg-gradient-to-b from-slate-50/80 to-background p-4 shadow-sm sm:p-6 dark:from-slate-950/50">
+        <main className="min-w-0 rounded-2xl border bg-gradient-to-b from-slate-50/80 to-background p-2 shadow-sm sm:p-3 dark:from-slate-950/50">
           <div>
-            <div className="mb-5 rounded-xl border bg-background/90 p-4 shadow-sm">
-              <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                <History className="h-3.5 w-3.5" />
-                {inlineUiText("当前观测回合")}
-              </div>
-              <div className="text-sm leading-6">
-                {loading ? inlineUiText("正在读取链路记录…") : (selected?.user_prompt ?? inlineUiText("选择一条用户 Prompt"))}
-              </div>
-            </div>
             <div className="mb-5">
               {detailLoading && selected && !currentRow ? (
                 <div className="flex min-h-[280px] items-center justify-center rounded-xl border border-dashed bg-background/70 p-8 text-center" role="status" aria-live="polite">
                   <div className="space-y-3 text-sm text-muted-foreground"><RefreshCw className="mx-auto h-6 w-6 animate-spin text-primary" /><p>{english ? "Loading this prompt's bound receipts…" : "正在读取本条 Prompt 的绑定回执…"}</p><p className="text-xs">{english ? "This is loading, not an empty result." : "当前仍在读取中，不代表没有记忆或没有调用。"}</p></div>
                 </div>
-              ) : currentRow ? <ExecutionTopologyCanvas promptId={currentRow.prompt_id} english={english} audit={audit} guidanceReceipt={currentRow.guidance_receipt} /> : <div className="flex min-h-[280px] items-center justify-center rounded-xl border border-dashed bg-background/70 p-8 text-center text-sm text-muted-foreground">{english ? "Select a user prompt to view its bound receipts." : "请选择一条用户 Prompt 查看绑定回执。"}</div>}
+              ) : currentRow ? <ExecutionTopologyCanvas promptId={currentRow.prompt_id} promptText={currentRow.user_prompt} english={english} audit={audit} guidanceReceipt={currentRow.guidance_receipt} /> : <div className="flex min-h-[280px] items-center justify-center rounded-xl border border-dashed bg-background/70 p-8 text-center text-sm text-muted-foreground">{english ? "Select a user prompt to view its bound receipts." : "请选择一条用户 Prompt 查看绑定回执。"}</div>}
             </div>
-            <button type="button" onClick={() => setShowLegacyFlow((value) => !value)} className="mb-4 inline-flex items-center gap-2 rounded-lg border bg-background px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted">
-              {showLegacyFlow ? (english ? "Hide detailed receipt chain" : inlineUiText("收起传统详细回执链路")) : (english ? "View detailed receipt chain" : inlineUiText("查看传统详细回执链路"))}
-              <span aria-hidden="true">{showLegacyFlow ? "↑" : "↓"}</span>
-            </button>
             {showLegacyFlow && <div className="legacy-flow-detail rounded-xl border border-dashed border-slate-300 p-3 dark:border-slate-700">
             <div className="mb-5 flex flex-wrap items-center justify-center gap-1.5 text-[11px] text-muted-foreground">
               {stageLabels.map((label, index) => (
@@ -1098,6 +1121,7 @@ export function FlowView() {
                       {inlineUiText("EP 工具已调用，但返回 0 条；这表示已完成一次 EP 检索，不能据此断言历史中不存在相关内容。")}
                     </div>
                   )}
+                  {audit.history.routeAudit.status === "ep_history_source_navigation_returned" ? <div className="mt-3 rounded-lg border bg-background px-3 py-2 text-xs">{flowText("sourceNavigationReceipt")}</div> : null}
                   {audit.history.routeReceipt.tool_events?.length ? (
                     <div className="mt-3 space-y-2">
                       {audit.history.routeReceipt.tool_events.map((event, index) => (
@@ -1110,6 +1134,7 @@ export function FlowView() {
                           </div>
                           <div className="mt-1 text-muted-foreground">
                             {inlineUiText("候选")} {event.candidate_count ?? "—"} {inlineUiText("· 返回")} {event.returned_count ?? "—"}{" "}
+                            {event.source_navigation_returned_count != null ? <span>· {flowText("sourceNavigationReturned")} {event.source_navigation_returned_count} </span> : null}
                             ·{" "}
                             {event.next_offset == null
                               ? inlineUiText("分页结束或未分页")
@@ -1224,6 +1249,7 @@ export function FlowView() {
             <ToolRail history={{ route: audit.history.value, state: audit.history.state, decision: audit.history.decision, metrics: audit.history.metrics, items: audit.history.items, routeReceipt: audit.history.routeReceipt, timeWindowActivity: audit.timeWindowActivity, timeWindowGuidanceActivity: audit.timeWindowGuidanceActivity, preferenceItems: audit.guidance.items, preferenceCount: audit.guidance.count }} />
           ) : null}
           {active === "history" && currentRow?.candidate_groups?.length ? <CandidateAuditBrowser key={currentRow.prompt_id} promptId={currentRow.prompt_id} groups={currentRow.candidate_groups} /> : null}
+          {active === "history" && audit?.history.routeReceipt?.tool_events?.map((event, index) => <RelevanceAuditDetails key={`relevance-${index}`} audit={(event as unknown as { relevance_audit?: Record<string, unknown> }).relevance_audit} />)}
           {active === "answer" ? <p className="text-sm leading-6 text-muted-foreground">{english ? copy.answer : inlineUiText(copy.answer)}</p> : null}
         </DialogContent>
       </Dialog>

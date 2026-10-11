@@ -31,6 +31,35 @@ def claim(text, message_id):
 
 
 class ContextRerenderV3Tests(unittest.TestCase):
+    def test_rerender_preserves_new_user_quote_protocol(self):
+        original=source([('user','不要公开密钥，只有本机使用'),('assistant','已答复')])
+        state={'subject':claim('项目要求','id1'),'goal':claim('处理请求','id1'),'phase':'assistant_reported',
+               'constraints':[claim('不要公开密钥，只有本机使用','id1')],'corrections':[],
+               'assistant_reports':[claim('已答复','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test',user_claim_protocol='user_constraints_corrections_whole_source_clause.v1')
+        rebuilt=RERENDER.rebuild_rerender_draft(original,draft)
+        self.assertEqual(rebuilt['state_claim_protocol'],'user_constraints_corrections_whole_source_clause.v1')
+        self.assertEqual(rebuilt['state']['constraints'][0]['text'],'不要公开密钥，只有本机使用')
+
+    def test_rerender_cannot_drop_protocol_to_accept_negation_loss(self):
+        original=source([('user','不要公开密钥'),('assistant','已答复')])
+        state={'subject':claim('项目要求','id1'),'goal':claim('处理请求','id1'),'phase':'assistant_reported',
+               'constraints':[claim('不要公开密钥','id1')],'corrections':[],
+               'assistant_reports':[claim('已答复','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test',user_claim_protocol='user_constraints_corrections_whole_source_clause.v1')
+        draft['state']['constraints'][0]['text']='公开密钥'
+        with self.assertRaisesRegex(ValueError,'scenario_user_claim_not_verbatim'):
+            RERENDER.rebuild_rerender_draft(original,draft)
+
+    def test_rerender_keeps_legacy_paraphrase_mode_when_no_protocol_exists(self):
+        original=source([('user','不要公开密钥'),('assistant','已答复')])
+        state={'subject':claim('项目要求','id1'),'goal':claim('处理请求','id1'),'phase':'assistant_reported',
+               'constraints':[claim('凭据应保密','id1')],'corrections':[],
+               'assistant_reports':[claim('已答复','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test')
+        rebuilt=RERENDER.rebuild_rerender_draft(original,draft)
+        self.assertNotIn('state_claim_protocol',rebuilt)
+
     def test_rerender_preserves_custom_limit_and_validates_rebuilt_draft(self):
         original = source([("user", "甲" * 20000), ("assistant", "乙" * 20000)])
         state = {"subject": claim("长会话项目", "id1"), "goal": claim("整理项目状态", "id1"),

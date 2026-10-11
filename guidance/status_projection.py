@@ -3,6 +3,26 @@ from __future__ import annotations
 
 import time
 
+from prompt_origin import ORIGIN_KINDS
+
+
+def prompt_population_projection(rows, prompt_source='natural', *, detail_id=None):
+    """Filter and denominators derive from one classified audit population."""
+    requested = str(prompt_source or 'natural').casefold()
+    valid = requested in {'natural', 'all', *ORIGIN_KINDS}
+    source_filter = requested if valid else 'natural'
+    counts = {kind: 0 for kind in ORIGIN_KINDS}
+    for row in rows:
+        kind = row.get('origin_kind') if row.get('origin_kind') in ORIGIN_KINDS else 'unknown'
+        counts[kind] += 1
+    selected = list(rows) if detail_id or source_filter == 'all' else [row for row in rows if row.get('origin_kind', 'unknown') == ('human' if source_filter == 'natural' else source_filter)]
+    return selected, {'source_filter': source_filter, 'source_filter_status': 'valid' if valid else 'invalid_defaulted',
+                      'source_counts': counts, 'natural_total': counts['human'], 'audit_total': len(rows),
+                      'statistics_denominator': len(selected), 'classification_scope': 'bounded_prompt_ingress_window',
+                      'source_verification_status': 'partial' if counts['unknown'] else 'complete',
+                      'source_verification_pending_total': sum(row.get('origin_kind')=='unknown' and (row.get('origin_evidence') or {}).get('reason')=='native_prompt_source_scan_incomplete' for row in rows),
+                      'statistics_denominator_scope': 'verified_natural_user_occurrences_only' if source_filter in {'natural','human'} else 'selected_origin_filter_in_audit_window'}
+
 
 def select_delivery_view(stdout_receipt: dict | None, host_receipt: dict | None) -> dict:
     stdout_ids = (stdout_receipt or {}).get("record_ids") or []

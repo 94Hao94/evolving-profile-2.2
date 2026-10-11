@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect, useRef } from "react";
 import { useTranslations } from "next-intl";
 import ReactMarkdown from "react-markdown";
@@ -158,8 +160,8 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
   const [showClearObservationsDialog, setShowClearObservationsDialog] = useState(false);
   const [isClearingObservations, setIsClearingObservations] = useState(false);
 
-  const loadData = async (isPolling = false) => {
-    if (!currentBank) return;
+  const loadData = async (isPolling = false, throwOnError = false) => {
+    if (!currentBank) return false;
 
     // During polling, only refresh read-only profile data to avoid overwriting form edits.
     // Use ref to get current value (avoids stale closure in setInterval)
@@ -188,14 +190,14 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
       setStats(statsData as BankStats);
       setDirectives(directivesData.items || []);
     } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
+      if (throwOnError) throw error;
     } finally {
       setLoading(false);
     }
   };
 
   const handleDeleteBank = async () => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setIsDeleting(true);
     try {
@@ -206,31 +208,34 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
       router.push("/");
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setIsDeleting(false);
     }
   };
 
   const handleClearObservations = async () => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setIsClearingObservations(true);
     try {
       const result = await client.clearObservations(currentBank);
-      setShowClearObservationsDialog(false);
       await loadData();
       toast.success("Success", {
         description: result.message || "Observations cleared successfully",
       });
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setIsClearingObservations(false);
     }
   };
 
   const handleDeleteDirective = async () => {
-    if (!currentBank || !directiveDeleteTarget) return;
+    if (!currentBank || !directiveDeleteTarget) return false;
 
     setDeletingDirective(true);
     try {
@@ -240,6 +245,8 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
       setDirectiveDeleteTarget(null);
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setDeletingDirective(false);
     }
@@ -467,8 +474,8 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={isDeleting}>{tCommon("cancel")}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDeleteBank}
+            <ActionButton
+              onAction={handleDeleteBank}
               disabled={isDeleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
@@ -483,7 +490,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
                   {tBank("deleteBank")}
                 </>
               )}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -517,8 +524,8 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
             <AlertDialogCancel disabled={isClearingObservations}>
               {tCommon("cancel")}
             </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleClearObservations}
+            <ActionButton
+              onAction={handleClearObservations}
               disabled={isClearingObservations}
               className="bg-amber-500 text-white hover:bg-amber-600"
             >
@@ -533,7 +540,7 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
                   {tBank("clearObservations")}
                 </>
               )}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -545,7 +552,6 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
         onClose={() => setShowCreateDirective(false)}
         onCreated={(d) => {
           setDirectives((prev) => [d, ...prev]);
-          setShowCreateDirective(false);
         }}
       />
 
@@ -566,14 +572,14 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
           </AlertDialogHeader>
           <AlertDialogFooter className="flex-row justify-end space-x-2">
             <AlertDialogCancel className="mt-0">{tCommon("cancel")}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDeleteDirective}
+            <ActionButton
+              onAction={handleDeleteDirective}
               disabled={deletingDirective}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               {deletingDirective ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
               {tCommon("delete")}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -603,7 +609,6 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
           onClose={() => setShowDispositionDialog(false)}
           onSaved={async () => {
             await loadData();
-            setShowDispositionDialog(false);
           }}
         />
       )}
@@ -615,7 +620,6 @@ export function BankProfileView({ hideReflectFields = false }: { hideReflectFiel
           onClose={() => setShowMissionDialog(false)}
           onSaved={async () => {
             await loadData();
-            setShowMissionDialog(false);
           }}
         />
       )}
@@ -632,7 +636,7 @@ function DispositionEditDialog({
 }: {
   disposition: DispositionTraits;
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: () => Promise<void>;
 }) {
   const t = useTranslations("bankProfile");
   const traitLabels = useTraitLabels();
@@ -641,7 +645,7 @@ function DispositionEditDialog({
   const [editDisposition, setEditDisposition] = useState<DispositionTraits>(disposition);
 
   const handleSave = async () => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setSaving(true);
     try {
@@ -650,9 +654,11 @@ function DispositionEditDialog({
         disposition_literalism: editDisposition.literalism,
         disposition_empathy: editDisposition.empathy,
       });
-      onSaved();
+      await onSaved();
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setSaving(false);
     }
@@ -701,7 +707,7 @@ function DispositionEditDialog({
           <Button onClick={onClose} variant="outline" disabled={saving}>
             {t("cancel")}
           </Button>
-          <Button onClick={handleSave} disabled={saving}>
+          <ActionButton resetKey={JSON.stringify(editDisposition)} onAction={handleSave} disabled={saving}>
             {saving ? (
               <>
                 <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
@@ -710,7 +716,7 @@ function DispositionEditDialog({
             ) : (
               t("saveChanges")
             )}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -726,7 +732,7 @@ function MissionEditDialog({
 }: {
   mission: string;
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: () => Promise<void>;
 }) {
   const t = useTranslations("bankProfile");
   const { currentBank } = useBank();
@@ -734,16 +740,18 @@ function MissionEditDialog({
   const [editMission, setEditMission] = useState(mission);
 
   const handleSave = async () => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setSaving(true);
     try {
       await client.updateBankConfig(currentBank, {
         reflect_mission: editMission || null,
       });
-      onSaved();
+      await onSaved();
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setSaving(false);
     }
@@ -771,7 +779,7 @@ function MissionEditDialog({
           <Button onClick={onClose} variant="outline" disabled={saving}>
             {t("cancel")}
           </Button>
-          <Button onClick={handleSave} disabled={saving}>
+          <ActionButton resetKey={editMission} onAction={handleSave} disabled={saving}>
             {saving ? (
               <>
                 <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
@@ -780,7 +788,7 @@ function MissionEditDialog({
             ) : (
               t("saveChanges")
             )}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -807,6 +815,7 @@ function DirectiveFormDialog({
   const t = useTranslations("bankProfile");
   const { currentBank } = useBank();
   const [submitting, setSubmitting] = useState(false);
+  const [createdFormKey, setCreatedFormKey] = useState<string | null>(null);
   const [form, setForm] = useState({ name: "", content: "", tags: "" });
 
   // Reset form when dialog opens or directive changes
@@ -823,7 +832,7 @@ function DirectiveFormDialog({
   }, [open, mode, directive]);
 
   const handleSubmit = async () => {
-    if (!currentBank || !form.name.trim() || !form.content.trim()) return;
+    if (!currentBank || !form.name.trim() || !form.content.trim()) return false;
 
     setSubmitting(true);
     try {
@@ -838,7 +847,7 @@ function DirectiveFormDialog({
           content: form.content.trim(),
           tags: tags.length > 0 ? tags : undefined,
         });
-        setForm({ name: "", content: "", tags: "" });
+        setCreatedFormKey(JSON.stringify(form));
         onCreated?.(result);
       } else if (directive) {
         const result = await client.updateDirective(currentBank, directive.id, {
@@ -847,10 +856,11 @@ function DirectiveFormDialog({
           tags: tags,
         });
         onSaved?.(result);
-        onClose();
       }
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setSubmitting(false);
     }
@@ -911,14 +921,14 @@ function DirectiveFormDialog({
           <Button variant="outline" onClick={handleClose} disabled={submitting}>
             {t("cancel")}
           </Button>
-          <Button
-            onClick={handleSubmit}
-            disabled={submitting || !form.name.trim() || !form.content.trim()}
+          <ActionButton
+            resetKey={JSON.stringify(form)} onAction={handleSubmit}
+            disabled={submitting || !form.name.trim() || !form.content.trim() || (mode === "create" && createdFormKey === JSON.stringify(form))}
             className="bg-rose-500 hover:bg-rose-600"
           >
             {submitting ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
             {mode === "create" ? t("create") : t("save")}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>

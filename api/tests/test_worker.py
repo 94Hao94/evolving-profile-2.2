@@ -83,6 +83,18 @@ async def clean_operations(pool):
     await pool.execute(scoped_delete)
 
 
+@pytest_asyncio.fixture
+async def isolated_claim_schema(pool):
+    """Give exact claim-count assertions their own queue, never shared pending rows."""
+    schema = f"worker_claim_{uuid.uuid4().hex}"
+    await pool.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        await pool.execute(f'CREATE TABLE "{schema}".async_operations (LIKE public.async_operations INCLUDING ALL)')
+        yield schema
+    finally:
+        await pool.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
 def test_metric_operation_label_normalises_retain_variants():
     """Worker completion metrics collapse retain variants onto operation="retain"
     so they share the API path's series; other types pass through unchanged."""
@@ -399,7 +411,7 @@ class TestWorkerPoller:
     """Tests for WorkerPoller task claiming and execution."""
 
     @pytest.mark.asyncio
-    async def test_claim_batch_claims_pending_tasks(self, pool, backend, clean_operations):
+    async def test_claim_batch_claims_pending_tasks(self, pool, backend, isolated_claim_schema):
         """Test that claim_batch claims pending tasks with task_payload."""
         from evolving_profile_api.worker import WorkerPoller
 
@@ -410,8 +422,8 @@ class TestWorkerPoller:
             op_id = uuid.uuid4()
             payload = json.dumps({"type": "test_task", "index": i, "bank_id": bank_id})
             await pool.execute(
-                """
-                INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload)
+                f"""
+                INSERT INTO "{isolated_claim_schema}".async_operations (operation_id, bank_id, operation_type, status, task_payload)
                 VALUES ($1, $2, 'test', 'pending', $3::jsonb)
                 """,
                 op_id,
@@ -429,6 +441,7 @@ class TestWorkerPoller:
             backend=backend,
             worker_id="test-worker-1",
             executor=mock_executor,
+            schema=isolated_claim_schema,
         )
 
         claimed = await poller.claim_batch()
@@ -440,10 +453,11 @@ class TestWorkerPoller:
         for task in my_claims:
             assert task.operation_id is not None
             assert task.task_dict is not None
+            assert task.schema == isolated_claim_schema
 
         # Verify tasks are marked as processing with worker_id
         rows = await pool.fetch(
-            "SELECT status, worker_id FROM async_operations WHERE bank_id = $1",
+            f'SELECT status, worker_id FROM "{isolated_claim_schema}".async_operations WHERE bank_id = $1',
             bank_id,
         )
         for row in rows:

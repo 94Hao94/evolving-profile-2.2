@@ -26,7 +26,7 @@ GUIDANCE_INSTRUCTIONS = f"[{INSTRUCTION_VERSION} sha256={instruction_sha256()}]\
 
 
 PREFERENCE_TOOL = {
-    "name": "get_preference",
+    "name": "user_preference",
     "description": "多维度偏好（Multi-dimensional Preference）路线。遇到实质任务时根据启动说明优先调用；传入用户原始消息、必要前文、任务阶段和约束，读取正式active偏好及其五维归类、融合定位层中的已有心智模型章节。只读；前台模型调用为0，不生成长期模型。返回完整条件、例外、来源、already_loaded_valid、deferred和分页游标。",
     "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
         "context_ref": {"type": "string"},

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient, createConfig, sdk } from "@evolving-profile/client";
-import { getDataplaneHeaders } from "@/lib/evolving-client";
+import { DATAPLANE_URL, getDataplaneHeaders } from "@/lib/evolving-client";
 
 const HEALTH_CHECK_TIMEOUT_MS = 3000;
 
@@ -19,7 +19,8 @@ export async function GET() {
   };
 
   // Check dataplane connectivity with a short timeout
-  const dataplaneUrl = process.env.EVOLVING_PROFILE_DATAPLANE_API_URL || "http://localhost:8888";
+  const dataplaneUrl = DATAPLANE_URL;
+  if (!dataplaneUrl) return NextResponse.json({ ...status, dataplane: { status: "disconnected", url: "", error: "dataplane_endpoint_unavailable" } }, { status: 200 });
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);

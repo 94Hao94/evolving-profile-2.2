@@ -2793,7 +2793,7 @@ def evolution_evidence_alignment(query: str, text: str) -> dict[str, Any]:
     # only when it itself records a completed/active change.
     narrative_prefixes = (
         "助手解释", "助理解释", "助手建议", "助理建议", "助手澄清", "助理澄清",
-        "User询问", "用户询问", "用户要求", "用户希望", "用户提出", "用户指出",
+        "示例用户询问", "用户询问", "用户要求", "用户希望", "用户提出", "用户指出",
         "用户认为", "用户担忧", "用户偏好", "用户决定", "用户设定", "回答用户",
         "对用户当前场景的判断", "当前问题",
     )
@@ -5146,6 +5146,22 @@ def admit_controller_results(query: str, ranked: list[dict[str, Any]], plan: dic
     # solve".  Promote only records that independently name the component and
     # prove both an operational mechanism and an outcome/guardrail.
     if named_mechanism_stage_question(intent):
+        # Current-policy weak background may already be in admitted. Upgrade
+        # its relationship receipt only when the same stage verifier proves
+        # independent mechanism and outcome evidence; never reopen rejections.
+        for index, existing in enumerate(admitted):
+            metadata = dict(existing.get("metadata") or {})
+            admission = dict(metadata.get("_ccy_admission") or {})
+            if admission.get("policy") != RELEVANCE_POLICY or admission.get("relevance_strength") != "weak":
+                continue
+            alignment = mechanism_stage_evidence_alignment(intent, str(existing.get("text") or existing.get("content") or ""))
+            if not alignment["qualified"]:
+                continue
+            admission.update(decision="qualified_mechanism_stage", relevance_strength="direct",
+                             mechanism_stage_alignment=alignment,
+                             reason="同一命名机制已独立说明运行关系及结果/验证；升级关系准入回执，不宣称事实或宿主送达已核验。")
+            metadata["_ccy_admission"] = admission
+            admitted[index] = {**existing, "metadata": metadata}
         known = {result_key(item) for item in admitted}
         promoted: list[dict[str, Any]] = []
         for row in ranked:

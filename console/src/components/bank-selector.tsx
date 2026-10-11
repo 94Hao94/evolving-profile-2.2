@@ -1,5 +1,8 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+import { MemoryRecoveryEntry } from "@/components/memory-recovery-dialog";
+
 import * as React from "react";
 import { Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -94,12 +97,14 @@ function BankSelectorInner() {
   const tNavBank = useTranslations("nav.bank");
   const tCommon = useTranslations("common");
   const tAddDocument = useTranslations("addDocument");
+  const tAction = useTranslations("actionFeedback");
   const { currentBank, setCurrentBank, banks, bankInfos, banksLoading, loadBanks } = useBank();
   const { theme, toggleTheme } = useTheme();
   const { features } = useFeatures();
   const [open, setOpen] = React.useState(false);
   const [createDialogOpen, setCreateDialogOpen] = React.useState(false);
   const [newBankId, setNewBankId] = React.useState("");
+  const [createdBankId, setCreatedBankId] = React.useState<string | null>(null);
   const [isCreating, setIsCreating] = React.useState(false);
   const [createError, setCreateError] = React.useState<string | null>(null);
   const [useTemplate, setUseTemplate] = React.useState(false);
@@ -187,27 +192,26 @@ function BankSelectorInner() {
   );
 
   const handleCreateBank = async () => {
-    if (!newBankId.trim()) return;
+    if (!newBankId.trim() || createdBankId === newBankId.trim()) return false;
 
     setIsCreating(true);
     setCreateError(null);
     setTemplateError(null);
 
     try {
-      // Create the bank first
-      await client.createBank(newBankId.trim());
-
-      // If template JSON is provided, import it
+      // Validate the optional template before creating a bank.
+      let manifest: Record<string, unknown> | undefined;
       if (templateJson.trim()) {
-        let manifest: Record<string, unknown>;
         try {
           manifest = JSON.parse(templateJson.trim());
         } catch {
-          setTemplateError("Invalid JSON. Please check the template syntax.");
-          setIsCreating(false);
-          return;
+          const message = "Invalid JSON. Please check the template syntax.";
+          setTemplateError(message);
+          throw new Error(message);
         }
-
+      }
+      await client.createBank(newBankId.trim());
+      if (manifest) {
         try {
           await client.importBankTemplate(newBankId.trim(), manifest);
         } catch (importError) {
@@ -216,21 +220,19 @@ function BankSelectorInner() {
               ? importError.message
               : tAddDocument("failedToImportTemplate")
           );
-          setIsCreating(false);
-          return;
+          throw importError;
         }
       }
 
       await loadBanks();
-      setCreateDialogOpen(false);
-      setNewBankId("");
-      setTemplateJson("");
+      setCreatedBankId(newBankId.trim());
       setTemplateError(null);
       // Navigate to the new bank
       setCurrentBank(newBankId.trim());
       router.push(bankRoute(newBankId.trim(), "?view=data"));
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : tAddDocument("failedToCreateBank"));
+      throw error;
     } finally {
       setIsCreating(false);
     }
@@ -338,8 +340,13 @@ function BankSelectorInner() {
     );
   };
 
+  const uploadActionKey = JSON.stringify({ names: selectedFiles.map((file) => `${file.name}:${file.size}:${file.lastModified}`), filesMetadata });
+  const retainActionKey = JSON.stringify({ docContent, docContext, docEventDate, docDocumentId, docTags, docObservationScopes, docObservationScopesCustom, docMetadata, docEntities, docAsync, docStrategy });
+  const [lastUploadKey, setLastUploadKey] = React.useState<string | null>(null);
+  const [lastRetainKey, setLastRetainKey] = React.useState<string | null>(null);
+
   const handleUploadFiles = async () => {
-    if (!currentBank || selectedFiles.length === 0) return;
+    if (!currentBank || selectedFiles.length === 0) return false;
 
     setIsCreatingDoc(true);
     setUploadProgress("");
@@ -368,12 +375,7 @@ function BankSelectorInner() {
         files_metadata: perFileMeta,
       });
 
-      // Reset form and close dialog
-      setDocDialogOpen(false);
-      setSelectedFiles([]);
-      setFilesMetadata([]);
-      setDocTags("");
-      setDocAsync(false);
+      setLastUploadKey(uploadActionKey);
       setUploadProgress("");
 
       // Nudge the documents view to surface the new file_convert_retain
@@ -384,8 +386,9 @@ function BankSelectorInner() {
 
       // Navigate to documents view
       router.push(bankRoute(currentBank!, "?view=documents"));
-    } catch {
+    } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setIsCreatingDoc(false);
       setUploadProgress("");
@@ -393,7 +396,7 @@ function BankSelectorInner() {
   };
 
   const handleCreateDocument = async () => {
-    if (!currentBank || !docContent.trim()) return;
+    if (!currentBank || !docContent.trim()) return false;
 
     setIsCreatingDoc(true);
 
@@ -450,25 +453,13 @@ function BankSelectorInner() {
         async: docAsync,
       });
 
-      // Reset form and close dialog
-      setDocDialogOpen(false);
-      setDocContent("");
-      setDocContext("");
-      setDocEventDate("");
-      setDocDocumentId("");
-      setDocTags("");
-      setDocObservationScopes("combined");
-      setDocObservationScopesCustom("");
-      setDocMetadata("");
-      setDocEntities("");
-      setDocAdvancedTab("document");
-      setDocAsync(false);
-      setDocStrategy("");
+      setLastRetainKey(retainActionKey);
 
       // Navigate to documents view to see the new document
       router.push(bankRoute(currentBank!, "?view=documents"));
-    } catch {
+    } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setIsCreatingDoc(false);
     }
@@ -476,7 +467,7 @@ function BankSelectorInner() {
 
   return (
     <div className="bg-card text-card-foreground border-b-4 border-primary-gradient px-2 py-3 sm:px-5">
-      <div className="flex min-w-0 items-center gap-2 text-sm sm:gap-4">
+      <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm sm:gap-4">
         {/* Logo */}
         <Image
           src={withBasePath("/logo.png")}
@@ -633,6 +624,8 @@ function BankSelectorInner() {
           </Button>
         )}
 
+        <MemoryRecoveryEntry bankId={currentBank} location="header" />
+
         {/* Spacer */}
         <div className="hidden flex-1 sm:block" />
 
@@ -655,21 +648,20 @@ function BankSelectorInner() {
         {features?.access_key_auth && (
           <>
             <div className="h-8 w-px bg-border" />
-            <Button
+            <ActionButton
               variant="ghost"
               size="icon"
               className="h-9 w-9"
               title="Logout"
-              onClick={async () => {
-                try {
-                  await fetch(withBasePath("/api/auth/logout"), { method: "POST" });
-                } finally {
-                  window.location.href = withBasePath("/login");
-                }
+              aria-label="Logout"
+              onAction={async () => {
+                const response = await fetch(withBasePath("/api/auth/logout"), { method: "POST" });
+                if (!response.ok) throw new Error(`Logout failed: HTTP ${response.status}`);
+                window.location.href = withBasePath("/login");
               }}
             >
               <LogOut className="h-5 w-5" />
-            </Button>
+            </ActionButton>
           </>
         )}
 
@@ -742,9 +734,9 @@ function BankSelectorInner() {
               >
                 {tCommon("cancel")}
               </Button>
-              <Button onClick={handleCreateBank} disabled={isCreating || !newBankId.trim()}>
+              <ActionButton resetKey={JSON.stringify({ newBankId, templateJson })} onAction={handleCreateBank} disabled={isCreating || !newBankId.trim() || createdBankId === newBankId.trim()}>
                 {isCreating ? tAddDocument("creating") : tCommon("create")}
-              </Button>
+              </ActionButton>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -1335,23 +1327,27 @@ function BankSelectorInner() {
                 {tAddDocument("cancel")}
               </Button>
               {docTab === "text" ? (
-                <Button
-                  onClick={handleCreateDocument}
-                  disabled={isCreatingDoc || !docContent.trim()}
+                <ActionButton
+                  resetKey={retainActionKey}
+                  successLabel={docAsync ? tAction("submitted") : undefined}
+                  onAction={handleCreateDocument}
+                  disabled={isCreatingDoc || !docContent.trim() || lastRetainKey === retainActionKey}
                 >
                   {isCreatingDoc
                     ? tAddDocument("addingDocument")
                     : tAddDocument("addDocumentSubmit")}
-                </Button>
+                </ActionButton>
               ) : (
-                <Button
-                  onClick={handleUploadFiles}
-                  disabled={isCreatingDoc || selectedFiles.length === 0}
+                <ActionButton
+                  resetKey={uploadActionKey}
+                  successLabel={tAction("submitted")}
+                  onAction={handleUploadFiles}
+                  disabled={isCreatingDoc || selectedFiles.length === 0 || lastUploadKey === uploadActionKey}
                 >
                   {isCreatingDoc
                     ? uploadProgress || tAddDocument("uploading")
                     : tAddDocument("uploadFiles", { count: selectedFiles.length })}
-                </Button>
+                </ActionButton>
               )}
             </DialogFooter>
           </DialogContent>

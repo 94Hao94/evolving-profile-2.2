@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect, useCallback } from "react";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
@@ -790,7 +792,8 @@ export function LLMRequestsView() {
       newOperationFilter: string | null = operationFilter,
       newDateRange: string = dateRange,
       newOffset: number = offset,
-      newGrouped: boolean = grouped
+      newGrouped: boolean = grouped,
+      throwOnError = false
     ) => {
       if (!currentBank) return;
 
@@ -810,6 +813,7 @@ export function LLMRequestsView() {
         setTotal(data.total || 0);
       } catch (error) {
         console.error("Error loading LLM requests:", error);
+        if (throwOnError) throw error;
       } finally {
         setLoading(false);
       }
@@ -821,7 +825,7 @@ export function LLMRequestsView() {
     const next = !grouped;
     setGrouped(next);
     setOffset(0);
-    loadRequests(statusFilter, operationFilter, dateRange, 0, next);
+    return loadRequests(statusFilter, operationFilter, dateRange, 0, next, true);
   };
 
   const handleStatusFilterChange = (value: string) => {
@@ -846,7 +850,7 @@ export function LLMRequestsView() {
 
   const handlePageChange = (newOffset: number) => {
     setOffset(newOffset);
-    loadRequests(statusFilter, operationFilter, dateRange, newOffset);
+    return loadRequests(statusFilter, operationFilter, dateRange, newOffset, grouped, true);
   };
 
   const handleRowClick = (entry: LLMRequestEntry) => {
@@ -934,24 +938,24 @@ export function LLMRequestsView() {
           </SelectContent>
         </Select>
 
-        <Button
+        <ActionButton
           variant={grouped ? "default" : "outline"}
           size="sm"
-          onClick={handleGroupToggle}
+          onAction={handleGroupToggle}
           title={t("groupByRunHint")}
         >
           {t("groupByRun")}
-        </Button>
+        </ActionButton>
 
-        <Button
+        <ActionButton
           variant="outline"
           size="sm"
-          onClick={() => loadRequests(statusFilter, operationFilter, dateRange, offset)}
+          onAction={() => loadRequests(statusFilter, operationFilter, dateRange, offset, grouped, true)}
           disabled={loading}
         >
           <RefreshCw className={`w-4 h-4 mr-1 ${loading ? "animate-spin" : ""}`} />
           {t("refresh")}
-        </Button>
+        </ActionButton>
 
         <span className="text-sm text-muted-foreground ml-auto">
           {t("entryCount", { count: total })}
@@ -1025,24 +1029,24 @@ export function LLMRequestsView() {
             {t("paginationPage", { current: currentPage, total: totalPages })}
           </span>
           <div className="flex gap-2">
-            <Button
+            <ActionButton
               variant="outline"
               size="sm"
-              onClick={() => handlePageChange(Math.max(0, offset - limit))}
+              preserveLabel onAction={() => handlePageChange(Math.max(0, offset - limit))}
               disabled={offset === 0}
             >
               <ChevronLeft className="w-4 h-4 mr-1" />
               {t("previous")}
-            </Button>
-            <Button
+            </ActionButton>
+            <ActionButton
               variant="outline"
               size="sm"
-              onClick={() => handlePageChange(offset + limit)}
+              preserveLabel onAction={() => handlePageChange(offset + limit)}
               disabled={offset + limit >= total}
             >
               {t("next")}
               <ChevronRight className="w-4 h-4 ml-1" />
-            </Button>
+            </ActionButton>
           </div>
         </div>
       )}

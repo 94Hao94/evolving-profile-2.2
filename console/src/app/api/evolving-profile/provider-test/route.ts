@@ -1,9 +1,8 @@
+import { epStatePath, EP_STATE_ROOT, EP_API_ENV, EP_HOST_SESSIONS } from "@/lib/ep-state-paths";
 import { NextResponse } from "next/server";
 import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { homedir } from "node:os";
 
-const ENV_PATH = path.join(process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(homedir(), ".evolving-profile"), "profiles/evolving-profile-api.env");
+const ENV_PATH = EP_API_ENV;
 
 function friendlyError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? "");

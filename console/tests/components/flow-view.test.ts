@@ -99,6 +99,11 @@ describe("FlowView route confidence", () => {
     })).toContain("已记录 Recall 回执");
     expect(historyEmptyStateLabel({ decision: "unknown" })).toContain("缺少 recall / research / read_source 回执");
   });
+  it("describes returned navigation without saying the backend omitted candidate bodies",()=>{
+    const label=historyEmptyStateLabel({routeReceipt:{tool_events:[{tool:"user_recall",returned_count:0,source_navigation_returned_count:1}]},timeWindowActivity:{by_tool:{recall:{calls:1,returned:0}}}},true);
+    expect(label).toContain("Source navigation was returned");
+    expect(label).not.toMatch(/no candidate body|missing|unavailable|empty/i);
+  });
 
   it("never labels a system probe route as an Agent MCP call", () => {
     expect(historyToolStatus("system_probe_recall", "recall")).toBe("not_observed");

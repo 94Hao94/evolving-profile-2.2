@@ -180,7 +180,11 @@ from evolving_profile_api.engine.mental_model_refresh import (
     RefreshMentalModelOperationDetails,
 )
 from evolving_profile_api.engine.providers.none_llm import LLMNotAvailableError
-from evolving_profile_api.engine.reflect import ReflectNoAnswerError, ReflectToolCallError
+from evolving_profile_api.engine.reflect import (
+    ReflectNoAnswerError,
+    ReflectRetrievalUnavailableError,
+    ReflectToolCallError,
+)
 from evolving_profile_api.engine.response_models import (
     VALID_RECALL_FACT_TYPES,
     DryRunExtractionResult,
@@ -1192,6 +1196,8 @@ class ReflectResponse(BaseModel):
     text: str = Field(
         description="The reflect response as well-formatted markdown (headers, lists, bold/italic, code blocks, etc.)"
     )
+    status: Literal["ok", "degraded"] = "ok"
+    errors: list[str] = Field(default_factory=list, description="Execution failures retained when reliable evidence was still available.")
     based_on: ReflectBasedOn | None = Field(
         default=None,
         description="Evidence used to generate the response. Only present when include.facts is set.",
@@ -5083,7 +5089,18 @@ def _register_routes(app: FastAPI):
                     llm_calls=llm_calls,
                 )
 
+            execution_errors = [
+                f"LLM tool selection failed ({lc.scope})"
+                for lc in (core_result.llm_trace or []) if lc.scope.endswith("_err")
+            ]
+            execution_errors.extend(
+                f"Retrieval tool {tc.tool if tc.tool in {'recall', 'search_observations', 'search_mental_models', 'expand'} else 'unknown_tool'} failed"
+                for tc in (core_result.tool_trace or [])
+                if isinstance(tc.output, dict) and tc.output.get("error")
+            )
             return ReflectResponse(
+                status="degraded" if execution_errors else "ok",
+                errors=execution_errors,
                 text=core_result.text,
                 based_on=based_on_result,
                 structured_output=core_result.structured_output,
@@ -5097,32 +5114,38 @@ def _register_routes(app: FastAPI):
             raise
         except LLMNotAvailableError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        except ReflectNoAnswerError as e:
+        except ReflectRetrievalUnavailableError as e:
+            logger.warning("Reflect retrieval unavailable in bank %s: %s", bank_id, e)
+            raise HTTPException(
+                status_code=503,
+                detail={"error":"retrieval_unavailable", "category":e.category, "message":str(e), "retryable":e.retryable},
+            )
+        except ReflectNoAnswerError:
             # The loop ran but produced no answer (a done call with an empty answer,
             # a final synthesis that returned nothing). Reflect used to substitute a
             # placeholder sentence and return 200, which read as a real answer to
             # every caller and got stored as one (#2959). There is nothing to
             # return, so this is a failure like any other.
-            logger.warning("Reflect produced no answer in bank %s: %s", bank_id, e)
-            raise HTTPException(status_code=500, detail=str(e))
-        except ReflectToolCallError as e:
+            logger.warning("Reflect produced no valid answer in bank %s", bank_id)
+            raise HTTPException(status_code=500, detail="Reflect did not produce a valid answer.")
+        except ReflectToolCallError:
             # The configured model/transport can't drive reflect's tool-calling loop.
             # The request itself is fine, so this is a server-side (500) failure, not a
             # 4xx -- but log at warning, not error: it's a misconfiguration, not a bug.
-            logger.warning("Reflect tool-calling failure in bank %s: %s", bank_id, e)
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.warning("Reflect tool-calling failure in bank %s", bank_id)
+            raise HTTPException(status_code=500, detail="Reflect requires a working tool-calling model.")
         except TimeoutError as e:
             logger.error("Timeout in /v1/default/banks/%s/reflect: %s", bank_id, e)
             raise HTTPException(
                 status_code=504,
-                detail=str(e) or "Reflect operation timed out. Consider reducing the budget or simplifying the query.",
+                detail="Reflect operation timed out. Consider reducing the budget or simplifying the query.",
             )
         except Exception as e:
             import traceback
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/banks/{bank_id}/reflect: {error_detail}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail="Reflect operation failed.")
 
     @app.get(
         "/v1/default/banks",
@@ -8723,6 +8746,8 @@ def _register_routes(app: FastAPI):
         group: bool = Query(
             False, description="Paginate by operation run (trace) instead of by call; returns whole runs"
         ),
+        include_content: bool = Query(True, description="Include prompt/output bodies. Disable for bounded operational metadata reads."),
+        count_only: bool = Query(False, description="Return exact matching call/run total without loading any request rows."),
         start_date: str | None = Query(None, description="Filter from this ISO datetime (inclusive)"),
         end_date: str | None = Query(None, description="Filter until this ISO datetime (exclusive)"),
         limit: int = Query(50, ge=1, le=500, description="Max items to return"),
@@ -8742,6 +8767,8 @@ def _register_routes(app: FastAPI):
                 document_id=document_id,
                 memory_id=memory_id,
                 group=group,
+                include_content=include_content,
+                count_only=count_only,
                 start_date=datetime.fromisoformat(start_date.replace("Z", "+00:00")) if start_date else None,
                 end_date=datetime.fromisoformat(end_date.replace("Z", "+00:00")) if end_date else None,
                 limit=limit,

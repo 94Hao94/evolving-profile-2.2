@@ -46,7 +46,6 @@ from recall import (
     filter_timeline_evidence,
     specific_personal_attribute_anchor,
     split_mental_model_sections,
-    LEGACY_SHADOW_REPLAY_FIXTURE_ROOT,
 )
 
 
@@ -572,7 +571,7 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         self.assertNotEqual(decision["decision"], "qualified")
 
     def test_shadow_replay_uses_only_explicit_safe_fixture_transcript(self):
-        fixture = str(LEGACY_SHADOW_REPLAY_FIXTURE_ROOT / "followup.jsonl")
+        fixture = "/Users/apple/Documents/Codex/2026-07-11/ag/hindsight-memory-os/tests/fixtures/hindsight-replay/followup.jsonl"
         with patch.dict("os.environ", {"HINDSIGHT_EXECUTION_MODE": "shadow_replay"}, clear=False):
             self.assertFalse(allow_shadow_fixture_transcript(fixture))
         with patch.dict(
@@ -721,14 +720,17 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         self.assertTrue(decision["continuation_policy_alignment"]["qualified"])
 
     def test_continuation_policy_does_not_admit_context_heading_alone(self):
-        """A bare context/Full Prompt heading remains insufficient."""
+        """A same-topic heading is weak background, not continuation proof."""
         query = (
             "在长任务中，用户说‘继续、不要停、把新的补上’时，为什么不能只读取最近三轮？"
             "请说明应如何使用远距离上下文、活动任务证据和 Full Prompt，同时避免把普通续写误判成同一任务。"
         )
         item = {"type": "world", "text": "Full Prompt 与上下文。"}
         decision = admission_decision(query, item, deep=True)
-        self.assertNotEqual(decision["decision"], "qualified")
+        self.assertEqual(decision["decision"], "qualified")
+        self.assertEqual(decision["relevance_strength"], "weak")
+        self.assertFalse(decision["continuation_policy_alignment"]["qualified"])
+        self.assertFalse(decision["authority_verified"])
 
     def test_continuation_policy_coverage_uses_structural_evidence(self):
         """Coverage must recognize task scope/method/outcome markers, not only labels."""
@@ -788,7 +790,7 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
             query, "助手解释官方 Hindsight 的写入机制和检索逻辑。"
         )["qualified"])
         self.assertFalse(controller.evolution_evidence_alignment(
-            query, "User询问 Hindsight 自下载官方以来的主要变迁历程。"
+            query, "示例用户询问 Hindsight 自下载官方以来的主要变迁历程。"
         )["qualified"])
 
     def test_evolution_scope_rejects_unrealized_request_but_keeps_completed_change(self):
@@ -1322,7 +1324,7 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         self.assertTrue(decision["subject_evidence_alignment"]["qualified"])
 
     def test_subject_evidence_lane_does_not_bypass_pure_chain_audit(self):
-        """A migration/config record cannot pass a chain audit on Hindsight alone."""
+        """Related migration background cannot become direct chain evidence."""
         query = (
             "我要做Hindsight真实验收，给出从真实输入、检查Hook/Controller/Bank/Memory Packet，"
             "到状态页复核的最短完整流程，并说明异常时如何回退和复测。"
@@ -1335,7 +1337,11 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
             ),
         }
         decision = admission_decision(query, item, deep=True)
-        self.assertEqual(decision["decision"], "rejected")
+        self.assertEqual(decision["decision"], "qualified")
+        self.assertEqual(decision["relevance_strength"], "weak")
+        self.assertFalse(decision["subject_evidence_alignment"]["qualified"])
+        self.assertFalse(decision["proposition_alignment"]["relation_support"])
+        self.assertFalse(decision["authority_verified"])
 
     def test_memory_taxonomy_admits_four_layer_boundary_model(self):
         query = "跨任务继续处理某个历史项目时，怎样判断该优先调用具体经历、当前状态事实、观察还是心智模型？请说明各类记忆的边界，避免把旧结论当成当前事实。"
@@ -1509,7 +1515,7 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         query = "你现在就查看最近10几条我主动正常的条目，看看有没有问题"
         record = {
             "type": "world",
-            "text": "User要求助手查看其最近10几条主动正常的条目以检查是否存在问题 | When: 2026-09-04 | Involving: User, 助手",
+            "text": "示例用户要求助手查看其最近10几条主动正常的条目以检查是否存在问题 | When: 2026-09-04 | Involving: 示例用户, 助手",
         }
         unrelated = {
             "type": "experience",
@@ -1667,7 +1673,10 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
             ),
         }
         decision = admission_decision(query, migration_noise, deep=True)
-        self.assertEqual(decision["decision"], "rejected")
+        self.assertEqual(decision["decision"], "qualified")
+        self.assertEqual(decision["relevance_strength"], "weak")
+        self.assertFalse(decision["proposition_alignment"]["relation_support"])
+        self.assertFalse(decision["authority_verified"])
 
     def test_stable_guidance_expands_real_chain_acceptance_to_end_to_end_completion(self):
         """A durable acceptance preference need not repeat the model heading.
@@ -1834,9 +1843,15 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         )
         self.assertEqual(
             {row["id"] for row in admitted},
-            {"supersession-conditions", "four-layer-governance"},
+            {"supersession-conditions", "four-layer-governance", "bare-field-noise"},
         )
-        self.assertEqual([row["id"] for row in rejected], ["bare-field-noise"])
+        self.assertEqual(rejected, [])
+        direct = {row["id"] for row in admitted if row["metadata"]["_ccy_admission"]["relevance_strength"] == "direct"}
+        self.assertEqual(direct, {"supersession-conditions", "four-layer-governance"})
+        background = next(row for row in admitted if row["id"] == "bare-field-noise")["metadata"]["_ccy_admission"]
+        self.assertEqual(background["relevance_strength"], "weak")
+        self.assertFalse(background["proposition_alignment"]["relation_support"])
+        self.assertFalse(background["authority_verified"])
         for row in admitted:
             self.assertEqual(
                 (row.get("metadata") or {}).get("_ccy_admission", {}).get("policy"),
@@ -1928,7 +1943,7 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         record = {
             "id": "research-preference",
             "type": "world",
-            "text": "User明确要求AI研究方向不以CNN为主，偏好半冷门方向及论文，并要求提供具体的实现路径。",
+            "text": "示例用户明确要求AI研究方向不以CNN为主，偏好半冷门方向及论文，并要求提供具体的实现路径。",
         }
         decision = admission_decision(query, record, deep=True)
         self.assertEqual(decision["decision"], "qualified")
@@ -2017,16 +2032,16 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         when it names one numbered clip.
         """
         query = (
-            "基于已生成的25段视频文件（位于 /tmp/ep-test-user/Projects/Codex/优优汽车队），"
+            "基于已生成的25段视频文件（位于 /Users/apple/Projects/Codex/优优汽车队），"
             "执行最终剪辑合成任务：按V01–V25顺序拼接，添加片头片尾、背景音乐、字幕并输出MP4。"
         )
         relevant = {
             "type": "experience",
-            "text": "文件 /tmp/ep-test-user/Projects/Codex/优优汽车队/15.mp4 已生成，可作为本次视频合成的第15段素材。",
+            "text": "文件 /Users/apple/Projects/Codex/优优汽车队/15.mp4 已生成，可作为本次视频合成的第15段素材。",
         }
         unrelated_config = {
             "type": "experience",
-            "text": "Codex 配置文件位于 /tmp/ep-test-user/.codex/config.toml，记录 MCP 服务器设置。",
+            "text": "Codex 配置文件位于 /Users/apple/.codex/config.toml，记录 MCP 服务器设置。",
         }
         unrelated_storage = {
             "type": "world",
@@ -2364,7 +2379,12 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
         query = "“Example Router”引入阶段解决了什么问题，验证边界是什么？"
         bare = {"id": "bare", "type": "world", "text": "Example Router 是一个组件名称。"}
         admitted, _ = controller.admit_controller_results(query, [bare], {"primary_shape": "point"})
-        self.assertEqual(admitted, [])
+        self.assertEqual([row["id"] for row in admitted], ["bare"])
+        admission = admitted[0]["metadata"]["_ccy_admission"]
+        self.assertEqual(admission["relevance_strength"], "weak")
+        self.assertNotEqual(admission["decision"], "qualified_mechanism_stage")
+        self.assertFalse(controller.mechanism_stage_evidence_alignment(query, bare["text"])["qualified"])
+        self.assertFalse(admission["authority_verified"])
 
     def test_discourse_openers_starting_with_wo_de_do_not_trigger_attribute_calibration(self):
         """``我的意思/理解`` is not a missing personal attribute.
@@ -2383,7 +2403,7 @@ class EvolutionRecallPlanningTests(unittest.TestCase):
     def test_explicit_personal_attribute_still_uses_narrow_calibration(self):
         self.assertEqual(specific_personal_attribute_anchor("我的名字是什么"), "名字")
         self.assertEqual(specific_personal_attribute_anchor("我的鞋码是多少"), "鞋码")
-        rows = [{"id": "name", "text": "用户正确姓名是User"}]
+        rows = [{"id": "name", "text": "用户正确姓名是示例用户"}]
         kept, anchor, negative = filter_specific_personal_attribute(
             "我的名字是什么", rows, {"primary_shape": "point"}
         )

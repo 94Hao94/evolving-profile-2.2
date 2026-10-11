@@ -1,28 +1,33 @@
+import { epStatePath, EP_STATE_ROOT, EP_API_ENV, EP_HOST_SESSIONS } from "@/lib/ep-state-paths";
 import { NextResponse } from "next/server";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { homedir } from "node:os";
 import { access, stat } from "node:fs/promises";
+import { JEV_BASE_URL, JEV_MODEL, normalizeJevJudge } from "@/lib/jev-provider";
+import { effectiveRecallPolicy, normalizeRecallSettings, RECALL_POLICY_DEFAULTS, RAG_MINIMUM_RELEVANCE_DEFAULT, validateRecallSettingsInput } from "@/lib/recall-policy";
+import { maskRetrievalModels, restoreMaskedRetrievalKeys } from "@/lib/retrieval-model-identity";
 
-const stateRoot = process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(process.env.HOME ?? homedir(), ".evolving-profile");
+const stateRoot = EP_STATE_ROOT;
 const settingsPath = path.join(stateRoot, "config/runtime-settings.json");
-const envPath = path.join(stateRoot, "profiles/evolving-profile-api.env");
+const envPath = process.env.EVOLVING_PROFILE_API_ENV ?? path.join(stateRoot, "profiles/evolving-profile-api.env");
 const actions = { record: true, retrieve: true, inject: true };
 const agentProcessModuleNames = ["agent_process_trajectory", "agent_process_observation", "agent_process_failure_episode", "agent_process_repair_pattern", "agent_process_capability", "agent_process_strategy", "agent_process_revalidation"] as const;
 const moduleNames = ["facts", "experiences", "entities", "preferences", "scenario_summary", "mental_models", "source_readback", "background_reflection", "agent_process_memory", ...agentProcessModuleNames] as const;
 const defaults = {
   schema: "evolving-profile.runtime-settings.v1",
+  recall_policy: { ...RECALL_POLICY_DEFAULTS },
   modules: Object.fromEntries(moduleNames.map((name) => [name, { ...actions }])) as Record<string, typeof actions>,
   routing: { mode: "auto", ep_enabled: true, external_rag_enabled: false, allow_parallel: false, conflict_policy: "show_both" },
   budgets: { ep_total_tokens: 4000, rag_total_tokens: 4000, total_tokens: 6000, preference_tokens: 1200, scenario_tokens: 1200, source_tokens: 2400 },
-  rag: { enabled: false, root_path: "", collection: "default", lexical_enabled: true, vector_enabled: true, fusion: "rrf", lexical_weight: 0.5, vector_weight: 0.5, rerank_enabled: true, rerank_provider: "local", rerank_model: "", top_k: 20, score_threshold: 0.35, max_chunks: 8, auto_index: false },
+  rag: { enabled: false, minimum_relevance: RAG_MINIMUM_RELEVANCE_DEFAULT, root_path: "", collection: "default", lexical_enabled: true, vector_enabled: true, fusion: "rrf", lexical_weight: 0.5, vector_weight: 0.5, rerank_enabled: true, rerank_provider: "local", rerank_model: "", top_k: 20, score_threshold: 0.35, max_chunks: 8, auto_index: false },
     retrieval_models: {
     embedding: { enabled: true, mode: "local", provider: "onnx", model: "intfloat/multilingual-e5-small", local_path: "", dimensions: 384, max_tokens: 512, device: "cpu", profile_id: "embedding-default", status: "configured" },
     reranker: { enabled: true, mode: "local", provider: "local", model: "BAAI/bge-reranker-base", local_path: "", device: "cpu", profile_id: "reranker-default", status: "configured" },
     embedding_profiles: [], reranker_profiles: [],
     fusion: { enabled: true, algorithm: "rrf", profile_id: "fusion-rrf" },
-    judge: { enabled: false, provider: "jev", mode: "api", base_url: "", model: "", api_key: "", timeout_ms: 5000, max_tokens: 600, mode_policy: "off", fallback: "rules", send_scope: "metadata_summary", risk_gate_enabled: false, status: "disabled" },
+    judge: { enabled: false, provider: "jev", mode: "systemone", base_url: JEV_BASE_URL, model: JEV_MODEL, api_key: "", timeout_ms: 5000, max_tokens: 600, mode_policy: "off", fallback: "rules", send_scope: "metadata_summary", risk_gate_enabled: false, status: "disabled" },
   },
   providers: { primary: { name: "", base_url: "", model: "", api_key: "" }, fallbacks: [] as Array<Record<string, unknown>> },
 };
@@ -43,7 +48,17 @@ function merge(base: any, value: any): any {
 
 async function readSettings() {
   const base = await effectiveDefaults();
-  try { return merge(base, JSON.parse(await readFile(settingsPath, "utf8"))); } catch { return base; }
+  let stored;
+  try {
+    stored = JSON.parse(await readFile(settingsPath, "utf8"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return normalizeRecallSettings(base);
+    throw error;
+  }
+  validateRecallSettingsInput(stored);
+  const value = normalizeRecallSettings(merge(base, stored));
+  value.retrieval_models.judge = normalizeJevJudge(value.retrieval_models.judge);
+  return value;
 }
 
 async function modelFiles(root: string, depth = 0): Promise<string[]> {
@@ -85,6 +100,7 @@ async function validateLocalModel(model: any, kind: "embedding" | "reranker") {
 }
 
 async function validate(value: any) {
+  validateRecallSettingsInput(value);
   if (!['auto', 'ep', 'external_rag', 'both_isolated'].includes(value.routing?.mode)) throw new Error("invalid_routing_mode");
   if (typeof value.routing?.ep_enabled !== "boolean" || typeof value.routing?.external_rag_enabled !== "boolean") throw new Error("invalid_routing_switch");
   for (const name of moduleNames) for (const action of Object.keys(actions)) if (typeof value.modules?.[name]?.[action] !== "boolean") throw new Error(`invalid_module_${name}_${action}`);
@@ -116,7 +132,7 @@ function mask(value: any) {
   const copy = JSON.parse(JSON.stringify(value));
   const redact = (provider: any) => { if (provider && provider.api_key) provider.api_key = `••••${String(provider.api_key).slice(-4)}`; };
   redact(copy.providers?.primary); for (const item of copy.providers?.fallbacks ?? []) redact(item);
-  redact(copy.retrieval_models?.judge);
+  copy.retrieval_models = maskRetrievalModels(copy.retrieval_models);
   return copy;
 }
 
@@ -124,13 +140,21 @@ function embeddingSignature(model: any) {
   return [model?.profile_id || "", model?.mode || "", model?.model || "", model?.local_path || "", model?.dimensions || ""].join("|");
 }
 
-export async function GET() { return NextResponse.json(mask(await readSettings())); }
+export async function GET() {
+  try {
+    const value = await readSettings();
+    return NextResponse.json({ ...mask(value), recall_policy_effective: effectiveRecallPolicy(value) });
+  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "runtime_settings_failed" }, { status: 400 }); }
+}
 
 export async function POST(request: Request) {
   try {
     const current = await readSettings();
     const incoming = await request.json();
-    const value = merge(current, incoming);
+    validateRecallSettingsInput(incoming);
+    const value = normalizeRecallSettings(merge(current, incoming));
+    delete value.recall_policy_effective;
+    value.retrieval_models.judge = normalizeJevJudge(value.retrieval_models.judge);
     value.rag.embedding_profile_id = value.rag.embedding_profile_id || value.retrieval_models.embedding.profile_id;
     value.rag.reranker_profile_id = value.rag.reranker_profile_id || value.retrieval_models.reranker.profile_id;
     const previousSignature = embeddingSignature(current.retrieval_models?.embedding);
@@ -146,13 +170,13 @@ export async function POST(request: Request) {
     // Masked values from the UI mean "keep the existing secret".
     if (incoming.providers?.primary?.api_key?.startsWith("••••")) value.providers.primary.api_key = current.providers.primary.api_key;
     for (let i = 0; i < (incoming.providers?.fallbacks ?? []).length; i++) if (incoming.providers.fallbacks[i]?.api_key?.startsWith("••••")) value.providers.fallbacks[i].api_key = current.providers.fallbacks[i]?.api_key ?? "";
-    if (incoming.retrieval_models?.judge?.api_key?.startsWith("••••")) value.retrieval_models.judge.api_key = current.retrieval_models.judge.api_key ?? "";
+    restoreMaskedRetrievalKeys(incoming.retrieval_models, current.retrieval_models, value.retrieval_models);
     await validate(value);
     value.updated_at = new Date().toISOString();
     await mkdir(path.dirname(settingsPath), { recursive: true });
     const temporary = `${settingsPath}.${randomUUID()}.tmp`;
     try { await writeFile(temporary, JSON.stringify(value, null, 2) + "\n", { mode: 0o600, flag: "wx" }); await rename(temporary, settingsPath); }
     finally { await unlink(temporary).catch(() => undefined); }
-    return NextResponse.json({ ...mask(value), applied: true });
+    return NextResponse.json({ ...mask(value), recall_policy_effective: effectiveRecallPolicy(value), applied: true });
   } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "runtime_settings_failed" }, { status: 400 }); }
 }

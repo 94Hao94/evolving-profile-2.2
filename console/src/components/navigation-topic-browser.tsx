@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useEffect, useState } from "react";
 
 import { inlineUiText } from "@/lib/inline-i18n";
@@ -43,7 +45,7 @@ export function NavigationTopicBrowser({ topicId, bankId }: { topicId: string; b
         const body = await chunk.json(); original = body.chunk_text ?? body.text ?? body.content;
       }
       setSource({ id: ref.memory_id, text: memory.text, original, document_id: memory.document_id });
-    } catch (e) { setError(e instanceof Error ? e.message : inlineUiText("读取失败")); }
+    } catch (e) { setError(e instanceof Error ? e.message : inlineUiText("读取失败")); throw e; }
     finally { setReading(false); }
   }
   return <section className="min-w-0 space-y-3 rounded-lg border border-cyan-200 bg-cyan-50/30 p-4 dark:border-cyan-900 dark:bg-cyan-950/20">
@@ -64,8 +66,8 @@ export function NavigationTopicBrowser({ topicId, bankId }: { topicId: string; b
         {topic.entities?.length ? <p className="text-xs text-muted-foreground">{inlineUiText("搜索线索：")}{topic.entities.join("、")}</p> : null}
         <h4 className="text-sm font-medium">{inlineUiText("L2 · 来源入口")}</h4>
         <p className="text-xs text-muted-foreground">{inlineUiText("这些是导航归属和来源定位；事实、主体及时间需读原文确认。")}</p>
-        {(topic.source_locators ?? []).map((ref, index) => <button disabled={reading} key={`sample:${ref.memory_id}`} className="block w-full min-w-0 rounded border bg-background px-3 py-2 text-left text-xs hover:border-cyan-500" onClick={() => readSource(ref)}><span className="line-clamp-2 leading-5">{ref.preview || ref.document_id || ref.memory_id}</span><span className="mt-1 block text-cyan-800 dark:text-cyan-200">{inlineUiText("查看来源")} {index + 1} · {ref.source_status || inlineUiText("原文待回读")}</span></button>)}
-        {topic.evidence_page && <details><summary className="cursor-pointer text-sm">{inlineUiText("全部来源定位 ·")} {topic.evidence_page.total} 条</summary><div className="mt-2 space-y-2">{topic.evidence_page.items.map(ref => <button key={ref.memory_id} disabled={reading} className="block w-full truncate rounded border px-3 py-2 text-left text-xs" onClick={() => readSource(ref)}>{ref.document_id || ref.memory_id}</button>)}</div>
+        {(topic.source_locators ?? []).map((ref, index) => <ActionButton preserveLabel variant="outline" disabled={reading} key={`sample:${ref.memory_id}`} className="block h-auto w-full min-w-0 whitespace-normal rounded border bg-background px-3 py-2 text-left text-xs text-foreground hover:border-cyan-500" onAction={() => readSource(ref)}><span className="line-clamp-2 leading-5">{ref.preview || ref.document_id || ref.memory_id}</span><span className="mt-1 block text-cyan-800 dark:text-cyan-200">{inlineUiText("查看来源")} {index + 1} · {ref.source_status || inlineUiText("原文待回读")}</span></ActionButton>)}
+        {topic.evidence_page && <details><summary className="cursor-pointer text-sm">{inlineUiText("全部来源定位 ·")} {topic.evidence_page.total} 条</summary><div className="mt-2 space-y-2">{topic.evidence_page.items.map(ref => <ActionButton preserveLabel variant="outline" key={ref.memory_id} disabled={reading} className="block h-auto w-full truncate rounded border px-3 py-2 text-left text-xs text-foreground" onAction={() => readSource(ref)}>{ref.document_id || ref.memory_id}</ActionButton>)}</div>
           <div className="mt-3 flex gap-2"><button disabled={offset === 0} className="rounded border px-2 py-1 text-xs disabled:opacity-40" onClick={() => setOffset(Math.max(0, offset - 8))}>{inlineUiText("上一页")}</button><button disabled={topic.evidence_page.next_offset == null} className="rounded border px-2 py-1 text-xs disabled:opacity-40" onClick={() => setOffset(topic.evidence_page?.next_offset ?? offset)}>{inlineUiText("下一页")}</button></div>
         </details>}
       </>}

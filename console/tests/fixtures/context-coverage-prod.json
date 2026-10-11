@@ -1,0 +1,387 @@
+[
+  {
+    "context_id": "session:01a119e7-b036-7ba0-8392-c53b59408047",
+    "session_id": "01a119e7-b036-7ba0-8392-c53b59408047",
+    "source_revision": "448d5d7d4c7a32fecae7756e95519745eabde5c8986676c17ab4fc0687dec829",
+    "status": "model_reviewed",
+    "review_scope": "automated_full_source_coverage_and_episode_model_review_not_external_fact_verification",
+    "source_message_count": 8,
+    "automated_source_coverage": {
+      "accept": true,
+      "whole_source_topics_covered": true,
+      "corrections_preserved": true,
+      "assistant_claims_labeled": true,
+      "partition_exact": true,
+      "source_revision": "448d5d7d4c7a32fecae7756e95519745eabde5c8986676c17ab4fc0687dec829",
+      "reviewed_message_ids": [
+        "4951053b021fca1f",
+        "150ec6a81176c182",
+        "ef0ead0db6e36957",
+        "c64d17f768f3b26f",
+        "5c9f3b39ea5baf07",
+        "4abe76b7434dbefd",
+        "391a955f0e359e02",
+        "dc85bc922d8535fd"
+      ],
+      "reviewed_episode_ids": [
+        "episode:01a119e7-b036-7ba0-8392-c53b59408047:4951053b021fca1f"
+      ],
+      "coverage_protocol": "per_user_source_to_state_and_summary.v2",
+      "no_human_confirmation_claim": true,
+      "fact_verification": false,
+      "model_review_receipt": {
+        "host_validation_version": "source-coverage-primary-context.v3",
+        "input_clipped": false,
+        "source_revision": "448d5d7d4c7a32fecae7756e95519745eabde5c8986676c17ab4fc0687dec829"
+      }
+    },
+    "episodes": [],
+    "source_ids": [
+      "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T13-06-16-01a119e7-b036-7ba0-8392-c53b59408047.jsonl"
+    ]
+  },
+  {
+    "context_id": "session:01a11a80-378f-7f20-8623-5d89b6baf249",
+    "session_id": "01a11a80-378f-7f20-8623-5d89b6baf249",
+    "source_revision": "92a83ea288288131836b0182272241e25ba89fe5092b810762db33a7efd37b30",
+    "status": "model_reviewed",
+    "review_scope": "automated_full_source_coverage_and_episode_model_review_not_external_fact_verification",
+    "source_message_count": 2,
+    "automated_source_coverage": {
+      "accept": true,
+      "whole_source_topics_covered": true,
+      "corrections_preserved": true,
+      "assistant_claims_labeled": true,
+      "partition_exact": true,
+      "source_revision": "92a83ea288288131836b0182272241e25ba89fe5092b810762db33a7efd37b30",
+      "reviewed_message_ids": [
+        "668401499efa3658",
+        "9a0f0551533d8356"
+      ],
+      "reviewed_episode_ids": [
+        "episode:01a11a80-378f-7f20-8623-5d89b6baf249:668401499efa3658"
+      ],
+      "coverage_protocol": "per_user_source_to_state_and_summary.v2",
+      "no_human_confirmation_claim": true,
+      "fact_verification": false,
+      "model_review_receipt": {
+        "host_validation_version": "source-coverage-primary-context.v3",
+        "input_clipped": false,
+        "source_revision": "92a83ea288288131836b0182272241e25ba89fe5092b810762db33a7efd37b30"
+      }
+    },
+    "episodes": [],
+    "source_ids": [
+      "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T15-52-52-01a11a80-378f-7f20-8623-5d89b6baf249.jsonl"
+    ]
+  },
+  {
+    "context_id": "session:01a11944-30ab-7173-9f90-b5639a0238bb",
+    "session_id": "01a11944-30ab-7173-9f90-b5639a0238bb",
+    "source_revision": "6601cf4a89b7021c1401688f4d6c30cf7688e91880e161718e6914e612d40ce9",
+    "status": "episode_directory_ready",
+    "review_scope": "automated_full_source_coverage_and_episode_model_review_not_external_fact_verification",
+    "source_message_count": 30,
+    "automated_source_coverage": {
+      "accept": true,
+      "whole_source_topics_covered": true,
+      "corrections_preserved": true,
+      "assistant_claims_labeled": true,
+      "partition_exact": true,
+      "source_revision": "6601cf4a89b7021c1401688f4d6c30cf7688e91880e161718e6914e612d40ce9",
+      "reviewed_message_ids": [
+        "803d3a6815964718",
+        "6e75624818ee2dbd",
+        "46901c53d52f4a41",
+        "9db97a67c1a5d0ec",
+        "1922267db793a7e4",
+        "4102a37bd40cdbc5",
+        "20425a23ce2f4952",
+        "e990dd8b30deab4f",
+        "ee94864a4b4c4141",
+        "49a3f75ea3cdc88d",
+        "6e277ca216dbe275",
+        "0a65df6a65ce25ff",
+        "8c36bb9ad020de59",
+        "2db58e930287a093",
+        "9340232c3590c616",
+        "05e17a38006b31e1",
+        "a0a99ab0b983fcc6",
+        "0955a5a0a2467285",
+        "6f0efb6696cb42be",
+        "881b790f67bc350d",
+        "d603b7be215cc535",
+        "87e3557c26962dc1",
+        "3b0b40e1f41fcaee",
+        "021023e8fe96acb0",
+        "b3df427cc2b43dd7",
+        "1a3e9090ced32b40",
+        "e565d0585b7e949e",
+        "8238ffba99b6840d",
+        "7eaacfa4a6898630",
+        "9f85296c74566765"
+      ],
+      "reviewed_episode_ids": [
+        "episode:01a11944-30ab-7173-9f90-b5639a0238bb:803d3a6815964718",
+        "episode:01a11944-30ab-7173-9f90-b5639a0238bb:6f0efb6696cb42be"
+      ],
+      "coverage_protocol": "per_user_source_to_state_and_summary.v2",
+      "no_human_confirmation_claim": true,
+      "fact_verification": false,
+      "model_review_receipt": {
+        "host_validation_version": "source-coverage-primary-context.v3",
+        "input_clipped": false,
+        "source_revision": "6601cf4a89b7021c1401688f4d6c30cf7688e91880e161718e6914e612d40ce9"
+      }
+    },
+    "episodes": [
+      {
+        "episode_id": "episode:01a11944-30ab-7173-9f90-b5639a0238bb:803d3a6815964718",
+        "title": "Episode 1",
+        "title_authority": "navigation_label_not_verified_fact",
+        "status": "model_reviewed",
+        "source_message_count": 18,
+        "review_scope": "automated_exact_source_span_not_external_fact_verification",
+        "summary_budget": {
+          "compact": {
+            "context_type": "session",
+            "tier": "compact",
+            "max_chars": 500,
+            "max_tokens": 400,
+            "chars": 206,
+            "estimated_tokens": 103,
+            "truncated": false
+          },
+          "standard": {
+            "context_type": "session",
+            "tier": "standard",
+            "max_chars": 1200,
+            "max_tokens": 900,
+            "chars": 256,
+            "estimated_tokens": 128,
+            "truncated": false
+          },
+          "full": {
+            "context_type": "session",
+            "tier": "full",
+            "max_chars": 4000,
+            "max_tokens": 3000,
+            "chars": 1284,
+            "estimated_tokens": 642,
+            "truncated": false
+          }
+        },
+        "summary": {
+          "compact": "Fixture episode 1 compact",
+          "standard": "Fixture episode 1 standard",
+          "full": "Fixture episode 1 full"
+        },
+        "source_file_ids": [
+          "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl"
+        ],
+        "source_offsets": [
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 212024,
+            "message_id": "803d3a6815964718"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 230333,
+            "message_id": "6e75624818ee2dbd"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 238107,
+            "message_id": "46901c53d52f4a41"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 432152,
+            "message_id": "9db97a67c1a5d0ec"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 443377,
+            "message_id": "1922267db793a7e4"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 481744,
+            "message_id": "4102a37bd40cdbc5"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 494275,
+            "message_id": "20425a23ce2f4952"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 507567,
+            "message_id": "e990dd8b30deab4f"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 516223,
+            "message_id": "ee94864a4b4c4141"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 529641,
+            "message_id": "49a3f75ea3cdc88d"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 667598,
+            "message_id": "6e277ca216dbe275"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 783517,
+            "message_id": "0a65df6a65ce25ff"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 794582,
+            "message_id": "8c36bb9ad020de59"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 831173,
+            "message_id": "2db58e930287a093"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 843957,
+            "message_id": "9340232c3590c616"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 857615,
+            "message_id": "05e17a38006b31e1"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 866369,
+            "message_id": "a0a99ab0b983fcc6"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 1978013,
+            "message_id": "0955a5a0a2467285"
+          }
+        ]
+      },
+      {
+        "episode_id": "episode:01a11944-30ab-7173-9f90-b5639a0238bb:6f0efb6696cb42be",
+        "title": "Episode 2",
+        "title_authority": "navigation_label_not_verified_fact",
+        "status": "model_reviewed",
+        "source_message_count": 12,
+        "review_scope": "automated_exact_source_span_not_external_fact_verification",
+        "summary_budget": {
+          "compact": {
+            "context_type": "session",
+            "tier": "compact",
+            "max_chars": 500,
+            "max_tokens": 400,
+            "chars": 221,
+            "estimated_tokens": 111,
+            "truncated": false
+          },
+          "standard": {
+            "context_type": "session",
+            "tier": "standard",
+            "max_chars": 1200,
+            "max_tokens": 900,
+            "chars": 449,
+            "estimated_tokens": 225,
+            "truncated": false
+          },
+          "full": {
+            "context_type": "session",
+            "tier": "full",
+            "max_chars": 4000,
+            "max_tokens": 3000,
+            "chars": 1368,
+            "estimated_tokens": 684,
+            "truncated": false
+          }
+        },
+        "summary": {
+          "compact": "Fixture episode 2 compact",
+          "standard": "Fixture episode 2 standard",
+          "full": "Fixture episode 2 full"
+        },
+        "source_file_ids": [
+          "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl"
+        ],
+        "source_offsets": [
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2134926,
+            "message_id": "6f0efb6696cb42be"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2349396,
+            "message_id": "881b790f67bc350d"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2357904,
+            "message_id": "d603b7be215cc535"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2376662,
+            "message_id": "87e3557c26962dc1"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2389752,
+            "message_id": "3b0b40e1f41fcaee"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2405006,
+            "message_id": "021023e8fe96acb0"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2417488,
+            "message_id": "b3df427cc2b43dd7"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2471629,
+            "message_id": "1a3e9090ced32b40"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2483568,
+            "message_id": "e565d0585b7e949e"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2498140,
+            "message_id": "8238ffba99b6840d"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 2509459,
+            "message_id": "7eaacfa4a6898630"
+          },
+          {
+            "source_path": "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl",
+            "byte_offset": 3332245,
+            "message_id": "9f85296c74566765"
+          }
+        ]
+      }
+    ],
+    "source_ids": [
+      "/Users/apple/.codex/sessions/2026/10/08/rollout-2026-10-08T10-07-41-01a11944-30ab-7173-9f90-b5639a0238bb.jsonl"
+    ]
+  }
+]

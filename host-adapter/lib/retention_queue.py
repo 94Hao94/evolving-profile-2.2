@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+from bisect import bisect_left
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,13 +98,15 @@ class RetentionQueue:
     def _read(self):
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except FileNotFoundError:
             data = self._empty()
         if not isinstance(data, dict):
-            data = self._empty()
+            raise ValueError('retention_queue_object_required')
         data.setdefault("version", 1)
         data.setdefault("sessions", {})
         data.setdefault("items", [])
+        if not isinstance(data['items'],list) or not isinstance(data['sessions'],dict):
+            raise ValueError('retention_queue_shape_invalid')
         return data
 
     def _write(self, data):
@@ -152,6 +155,8 @@ class RetentionQueue:
         content: str,
         metadata: dict,
         captured_at=None,
+        write_policy=None,
+        messages=None,
     ) -> bool:
         project = str(project or "unknown")
         project_id = self._project_id(bank_id, project)
@@ -166,6 +171,28 @@ class RetentionQueue:
             state["sessions"][session_key] = int(message_count)
             if content:
                 parts = split_content(content, self.threshold_tokens)
+                # Keep the original part as audit while carrying a bounded,
+                # role-preserving message view to the API chunker.
+                from .retention_policy import transcript_messages, message_text
+                original_messages = messages if messages is not None else (transcript_messages(content) if write_policy else [])
+                try:
+                    structured_source=isinstance(json.loads(content),list)
+                except (ValueError,TypeError):
+                    structured_source=False
+                message_spans=[]
+                source_search_start=0
+                for message in original_messages:
+                    text=message_text(message)
+                    encoded=json.dumps(text,ensure_ascii=False)[1:-1] if structured_source else text
+                    start=content.find(encoded,source_search_start)
+                    if start<0 or not text:
+                        continue
+                    source_search_start=start+len(encoded)
+                    offsets=[0]
+                    for char in text:
+                        offsets.append(offsets[-1]+(len(json.dumps(char,ensure_ascii=False)[1:-1]) if structured_source else 1))
+                    message_spans.append((message,text,start,offsets))
+                search_start = 0
                 for part_index, part in enumerate(parts, start=1):
                     item_id = hashlib.sha256(
                         f"{session_key}\0{message_count}\0{part_index}\0{part}".encode("utf-8")
@@ -175,6 +202,28 @@ class RetentionQueue:
                     item_metadata = {str(k): str(v) for k, v in (metadata or {}).items()}
                     if len(parts) > 1:
                         item_metadata["queue_part"] = f"{part_index}/{len(parts)}"
+                    if write_policy and write_policy.get('knowledge_allowed') is False:
+                        item_metadata['retention_plane']='raw_audit'
+                    source_messages=[]
+                    part_start=content.find(part, search_start)
+                    part_end=part_start+len(part)
+                    coverage_start=search_start
+                    search_start=max(search_start,part_end)
+                    for message,text,start,offsets in message_spans:
+                        lower=max(0,coverage_start-start)
+                        upper=min(offsets[-1],part_end-start)
+                        char_start=bisect_left(offsets,lower)
+                        char_end=bisect_left(offsets,upper)
+                        if 0<=lower<upper and char_start<char_end:
+                            source_messages.append({**message,'content':text[char_start:char_end],
+                                                    'source_record':{**(message.get('source_record') or {}),
+                                                                     'original_message_start':char_start,
+                                                                     'original_message_end':char_end,
+                                                                     'original_message_length':len(text),
+                                                                     'original_message_content_sha256':hashlib.sha256(text.encode()).hexdigest(),
+                                                                     'original_message_quoted_ranges':[[m.start(),m.end()] for m in re.finditer(r'“[^”]*”|「[^」]*」|『[^』]*』|"[^"\n]*"|`[^`]*`|(?m:^\s*>.*$)',text)]}})
+                    if original_messages and not source_messages:
+                        item_metadata['retention_plane']='raw_audit'
                     state["items"].append(
                         {
                             "id": item_id,
@@ -186,6 +235,15 @@ class RetentionQueue:
                             "content": part,
                             "estimated_tokens": estimate_tokens(part),
                             "metadata": item_metadata,
+                            **({'source_messages':source_messages} if source_messages else {}),
+                            **({'write_policy': {**write_policy, 'item_content_sha256': hashlib.sha256(part.encode()).hexdigest(),
+                                                 'source_messages_sha256':hashlib.sha256(json.dumps(source_messages,ensure_ascii=False,sort_keys=True).encode()).hexdigest()}}
+                               if write_policy is not None else {}),
+                            **({'retention_origin_hold':write_policy.get('reason','knowledge_write_prohibited')}
+                               if write_policy and write_policy.get('knowledge_allowed') is False else {}),
+                            **({'retention_origin_hold':'source_fragment_without_message_text'}
+                               if original_messages and not source_messages and (not write_policy or write_policy.get('knowledge_allowed') is not False) else {}),
+                            **({'source_text_available':bool(source_messages)} if original_messages else {}),
                             "captured_at": captured.isoformat().replace("+00:00", "Z"),
                         }
                     )
@@ -246,14 +304,13 @@ class RetentionQueue:
                 bank_id = selected[0]["bank_id"]
                 project = selected[0]["project"]
                 session_ids = sorted({item["session_id"] for item in selected})
-                content = "\n\n".join(
-                    f"[pending item {index + 1}/{len(selected)}; session={item['session_id']}]\n{item['content']}"
-                    for index, item in enumerate(selected)
-                )
+                from .retention_policy import batch_content
+                content = batch_content(selected)
                 batches.append(
                     {
                         "batch_id": digest,
                         "item_ids": [item["id"] for item in selected],
+                        "items": selected,
                         "bank_id": bank_id,
                         "project": project,
                         "project_id": project_id,
@@ -275,16 +332,43 @@ class RetentionQueue:
         if config is None:
             from .config import load_config
             config=load_config()
-        from .retention_policy import retention_exclusion
+        from .retention_policy import retention_exclusion, transcript_messages, retention_turns, item_write_exclusion
         with self._locked():
             state=self._read();changed=False
+            # Legacy items can span several turns. Keep their original bytes as
+            # held audit, and derive only eligible turn items with stable lineage.
+            derived = []
+            for item in state['items']:
+                if item.get('operation_id') or item.get('write_policy'):
+                    continue
+                messages = transcript_messages(item.get('content', ''))
+                turns = retention_turns(messages)
+                if len(turns) > 1:
+                    item['write_policy'] = {'version': 1, 'knowledge_allowed': False,
+                                            'reason': 'legacy_raw_audit_parent', 'scope': 'item'}
+                    for index, turn in enumerate(turns):
+                        from .content import prepare_retention_transcript
+                        content, _ = prepare_retention_transcript(turn['messages'], retain_full_window=True)
+                        if not content:
+                            continue
+                        child = {**item, 'id': hashlib.sha256(f"{item['id']}:turn:{index}".encode()).hexdigest(),
+                                 'content': content, 'estimated_tokens': estimate_tokens(content),
+                                 'metadata': {**item.get('metadata', {}), 'audit_parent_item_id': item['id']},
+                                 'write_policy': {**turn['write_policy'], 'item_content_sha256': hashlib.sha256(content.encode()).hexdigest()}}
+                        derived.append(child)
+                    changed = True
+                elif turns:
+                    item['write_policy'] = {**turns[0]['write_policy'],
+                                            'item_content_sha256': hashlib.sha256(item['content'].encode()).hexdigest()}
+                    changed = True
+            state['items'].extend(derived)
             for item in state['items']:
                 if item.get('operation_id'):continue
                 if item.get('session_id') in config.get('diagnosticSessionIds',[]):
                     if (item.get('metadata') or {}).get('prompt_origin')!='test_probe':
                         item.setdefault('metadata',{})['prompt_origin']='test_probe';changed=True
                 reason=('recorded_diagnostic_origin' if (item.get('metadata') or {}).get('prompt_origin')=='test_probe' else
-                        retention_exclusion(item.get('project'),[item.get('session_id')],config))
+                        retention_exclusion(item.get('project'),[item.get('session_id')],config) or item_write_exclusion(item))
                 if item.get('retention_origin_hold','')!=reason:
                     item['retention_origin_hold']=reason;changed=True
             if changed:self._write(state)
@@ -292,14 +376,19 @@ class RetentionQueue:
             # afterwards would also strand genuine user input in that project.
             return self._select_batches(state, force_tail, min_age_seconds)
 
-    def mark_submitted(self, batch_id: str, operation_id: str) -> bool:
+    def mark_submitted(self, batch_id: str, operation_id: str, item_ids=None) -> bool:
         with self._locked():
             state = self._read()
-            candidates = self._select_batches(state, force_tail=True, min_age_seconds=0)
-            batch = next((row for row in candidates if row["batch_id"] == batch_id), None)
-            if batch is None:
+            if item_ids is None:
+                candidates = self._select_batches(state, force_tail=True, min_age_seconds=0)
+                batch = next((row for row in candidates if row["batch_id"] == batch_id), None)
+                if batch is None:
+                    return False
+                item_ids = batch["item_ids"]
+            item_ids = set(item_ids)
+            rows=[row for row in state['items'] if row['id'] in item_ids]
+            if len(rows)!=len(item_ids) or any(row.get('operation_id') not in (None,operation_id) for row in rows):
                 return False
-            item_ids = set(batch["item_ids"])
             submitted_at = _utcnow().isoformat().replace("+00:00", "Z")
             for item in state["items"]:
                 if item["id"] in item_ids:

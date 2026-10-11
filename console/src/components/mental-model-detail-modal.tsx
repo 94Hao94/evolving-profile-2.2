@@ -7,6 +7,7 @@ import { useBank } from "@/lib/bank-context";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -28,7 +29,6 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
-import { toast } from "sonner";
 import { CompactMarkdown } from "./compact-markdown";
 import { CronSchedulePreview } from "./cron-schedule-preview";
 import { NextRefresh } from "./next-refresh";
@@ -628,6 +628,21 @@ interface MentalModelDetailModalProps {
   initialTab?: "content" | "configuration" | "history";
 }
 
+// Keep the refresh action pending until the asynchronous synthesis is visible.
+export async function refreshMentalModelAndWait(
+  bankId: string,
+  model: MentalModel,
+  timeoutMessage: string
+): Promise<MentalModel> {
+  await client.refreshMentalModel(bankId, model.id);
+  for (let attempt = 0; attempt < 120; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const updated = await client.getMentalModel(bankId, model.id);
+    if (updated.last_refreshed_at !== model.last_refreshed_at) return updated;
+  }
+  throw new Error(timeoutMessage);
+}
+
 export function MentalModelDetailModal({
   mentalModelId,
   onClose,
@@ -695,7 +710,7 @@ export function MentalModelDetailModal({
   }, [activeTab, mentalModel, currentBank, history]);
 
   const handleReload = async () => {
-    if (!currentBank || !mentalModel) return;
+    if (!currentBank || !mentalModel) return false;
     setReloading(true);
     try {
       const updated = await client.getMentalModel(currentBank, mentalModel.id);
@@ -703,49 +718,23 @@ export function MentalModelDetailModal({
       setHistory(null);
     } catch (err) {
       console.error("Error reloading mental model:", err);
+      throw err;
     } finally {
       setReloading(false);
     }
   };
 
   const handleRefresh = async () => {
-    if (!currentBank || !mentalModel) return;
+    if (!currentBank || !mentalModel) return false;
     setRefreshing(true);
-    const originalRefreshedAt = mentalModel.last_refreshed_at;
-
     try {
-      await client.refreshMentalModel(currentBank, mentalModel.id);
-
-      const pollInterval = 1000;
-      const maxAttempts = 120;
-      let attempts = 0;
-
-      const poll = async (): Promise<void> => {
-        attempts++;
-        try {
-          const updated = await client.getMentalModel(currentBank, mentalModel.id);
-          if (updated.last_refreshed_at !== originalRefreshedAt) {
-            setMentalModel(updated);
-            setHistory(null);
-            onRefreshed?.(updated);
-            setRefreshing(false);
-            return;
-          }
-          if (attempts >= maxAttempts) {
-            setRefreshing(false);
-            toast.error(t("refreshTimeoutTitle"), {
-              description: t("refreshTimeoutDescription"),
-            });
-            return;
-          }
-          setTimeout(poll, pollInterval);
-        } catch (err) {
-          console.error("Error polling mental model:", err);
-          setRefreshing(false);
-        }
-      };
-      setTimeout(poll, pollInterval);
-    } catch {
+      const updated = await refreshMentalModelAndWait(
+        currentBank, mentalModel, t("refreshTimeoutDescription")
+      );
+      setMentalModel(updated);
+      setHistory(null);
+      onRefreshed?.(updated);
+    } finally {
       setRefreshing(false);
     }
   };
@@ -767,16 +756,18 @@ export function MentalModelDetailModal({
             <DialogTitle className="flex items-center gap-2">
               <span className="truncate">{mentalModel?.name ?? t("mentalModelFallback")}</span>
               {mentalModel && (
-                <Button
+                <ActionButton
+                  resetKey={mentalModel.id}
                   variant="ghost"
-                  size="sm"
+                  size="icon"
+                  aria-label={t("reloadData")}
                   className="h-7 w-7 p-0 shrink-0"
-                  onClick={handleReload}
+                  onAction={handleReload}
                   disabled={reloading}
                   title={t("reloadData")}
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${reloading ? "animate-spin" : ""}`} />
-                </Button>
+                </ActionButton>
               )}
               {mentalModel?.trigger?.refresh_after_consolidation && (
                 <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-500/10 text-green-600 dark:text-green-400 text-xs font-medium">
@@ -818,6 +809,11 @@ export function MentalModelDetailModal({
                     {t("tabHistory")}
                   </TabsTrigger>
                 </TabsList>
+                <div className="flex items-center gap-2">
+                  <ActionButton resetKey={mentalModel.id} variant="outline" size="sm" onAction={handleRefresh} disabled={refreshing}>
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    {t("actionRefreshManually")}
+                  </ActionButton>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
@@ -837,10 +833,6 @@ export function MentalModelDetailModal({
                         {t("actionEdit")}
                       </DropdownMenuItem>
                     )}
-                    <DropdownMenuItem onClick={handleRefresh} disabled={refreshing}>
-                      <RefreshCw className="h-4 w-4 mr-2" />
-                      {t("actionRefreshManually")}
-                    </DropdownMenuItem>
                     {onClear && (
                       <DropdownMenuItem onClick={() => onClear(mentalModel)}>
                         <Eraser className="h-4 w-4 mr-2" />
@@ -861,6 +853,7 @@ export function MentalModelDetailModal({
                     )}
                   </DropdownMenuContent>
                 </DropdownMenu>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto mt-4">

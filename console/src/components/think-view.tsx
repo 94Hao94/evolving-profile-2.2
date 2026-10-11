@@ -1,10 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -44,6 +45,8 @@ type BasedOnTab = "directives" | "mental_models" | "observations" | "world" | "e
 export function ThinkView() {
   const t = useTranslations("thinkView");
   const { currentBank } = useBank();
+  const reflectButtonRef = useRef<HTMLButtonElement>(null);
+  const feedbackButtonRef = useRef<HTMLButtonElement>(null);
   const [query, setQuery] = useState("");
   const [budget, setBudget] = useState<"low" | "mid" | "high">("mid");
   const [maxTokens, setMaxTokens] = useState<number>(4096);
@@ -58,6 +61,7 @@ export function ThinkView() {
   const [excludeMentalModels, setExcludeMentalModels] = useState(false);
   const [excludeMentalModelIds, setExcludeMentalModelIds] = useState("");
   const [feedback, setFeedback] = useState("");
+  const [savedFeedback, setSavedFeedback] = useState<string | null>(null);
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
   const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
@@ -111,7 +115,7 @@ export function ThinkView() {
   };
 
   const submitFeedback = async () => {
-    if (!currentBank || !feedback.trim()) return;
+    if (!currentBank || !feedback.trim()) return false;
 
     setFeedbackSubmitting(true);
     try {
@@ -135,18 +139,17 @@ export function ThinkView() {
         });
       }
 
-      setFeedback("");
-      setFeedbackSubmitted(true);
-      setTimeout(() => setFeedbackSubmitted(false), 3000);
+      setSavedFeedback(feedback);
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setFeedbackSubmitting(false);
     }
   };
 
   const runReflect = async () => {
-    if (!currentBank || !query) return;
+    if (!currentBank || !query) return false;
 
     setLoading(true);
     setViewMode("answer");
@@ -177,6 +180,7 @@ export function ThinkView() {
       setResult(data);
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setLoading(false);
     }
@@ -208,12 +212,12 @@ export function ThinkView() {
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={t("queryPlaceholder")}
                 className="pl-10 h-12 text-lg"
-                onKeyDown={(e) => e.key === "Enter" && runReflect()}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); reflectButtonRef.current?.click(); } }}
               />
             </div>
-            <Button onClick={runReflect} disabled={loading || !query} className="h-12 px-8">
+            <ActionButton ref={reflectButtonRef} resetKey={JSON.stringify({ query, budget, maxTokens, includeFacts, includeToolCalls, tags, tagsMatch, factTypes, excludeMentalModels, excludeMentalModelIds })} onAction={runReflect} disabled={loading || !query} className="h-12 px-8">
               {loading ? t("reflecting") : t("reflect")}
-            </Button>
+            </ActionButton>
           </div>
 
           {/* Filters */}
@@ -440,17 +444,20 @@ export function ThinkView() {
                         className="flex-1 min-h-[60px] resize-none"
                         onKeyDown={(e) => {
                           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                            submitFeedback();
+                            e.preventDefault();
+                            feedbackButtonRef.current?.click();
                           }
                         }}
                       />
-                      <Button
-                        onClick={submitFeedback}
-                        disabled={feedbackSubmitting || !feedback.trim()}
+                      <ActionButton
+                        ref={feedbackButtonRef}
+                        resetKey={feedback}
+                        onAction={submitFeedback}
+                        disabled={feedbackSubmitting || !feedback.trim() || savedFeedback === feedback}
                         className="self-end"
                       >
                         {feedbackSubmitting ? t("savingDirective") : t("saveDirective")}
-                      </Button>
+                      </ActionButton>
                     </div>
                   )}
                 </CardContent>

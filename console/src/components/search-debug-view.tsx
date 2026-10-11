@@ -1,10 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
 import {
@@ -50,6 +51,7 @@ export function SearchDebugView() {
   const t = useTranslations("searchDebug");
   const chinese = useLocale().startsWith("zh");
   const { currentBank } = useBank();
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
 
   // Query state
   const [query, setQuery] = useState("");
@@ -111,7 +113,7 @@ export function SearchDebugView() {
   const runSearch = async () => {
     if (!currentBank) {
       toast.error(t("errorSelectBank"));
-      return;
+      throw new Error(t("errorSelectBank"));
     }
 
     if (!query) {
@@ -121,7 +123,7 @@ export function SearchDebugView() {
     // Must select at least one type
     if (factTypes.length === 0) {
       toast.error(t("errorSelectFactType"));
-      return;
+      throw new Error(t("errorSelectFactType"));
     }
 
     setLoading(true);
@@ -158,6 +160,7 @@ export function SearchDebugView() {
       setViewMode("results");
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setLoading(false);
     }
@@ -199,12 +202,12 @@ export function SearchDebugView() {
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={t("queryPlaceholder")}
                 className="pl-10 h-12 text-lg"
-                onKeyDown={(e) => e.key === "Enter" && runSearch()}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); searchButtonRef.current?.click(); } }}
               />
             </div>
-            <Button onClick={runSearch} disabled={loading || !query} className="h-12 px-8">
+            <ActionButton ref={searchButtonRef} resetKey={JSON.stringify({ query, factTypes, budget, maxTokens, queryDate, includeChunks, includeEntities, tags, tagsMatch })} onAction={runSearch} disabled={loading || !query} className="h-12 px-8">
               {loading ? t("searching") : t("recall")}
-            </Button>
+            </ActionButton>
           </div>
 
           {/* Filters */}

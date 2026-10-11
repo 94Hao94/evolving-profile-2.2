@@ -6,6 +6,10 @@ export type FlowEvidenceItem = {
   title?: string;
 };
 
+import { projectMemoryQualityEvents, summarizeMemoryQualityEvents, type MemoryQualityEvent, type MemoryQualityMode } from "@/lib/memory-quality-event";
+import { mergeToolReceipts } from "./tool-receipt";
+import type { SourceNavigation } from "./tool-receipt";
+
 export type FlowPrompt = {
   candidate_groups?: Array<{id:string;actor:string;count?:number|null}>;
   prompt_id: string;
@@ -19,6 +23,7 @@ export type FlowPrompt = {
   history_decision?: "needed" | "not_needed" | "unknown" | "agent_decides";
   history_decision_evidence?: string;
   memory_route_receipt?: {
+    call_coverage?: "exact_host_turn_complete" | "partial" | "unknown";
     decision?: string;
     recommended_route?: string;
     reason?: string;
@@ -32,9 +37,11 @@ export type FlowPrompt = {
     route_started?: boolean;
     tool_called?: boolean;
     returned_count?: number;
+    source_navigation_returned_count?: number;
+    source_navigation_returned_ids?: string[];
     delivery_state?: string;
     unresolved?: string[];
-    tool_events?: Array<{ tool?: string; at?: string; route?: string; check_id?: string | null; session_id?: string | null; turn_id?: string | null; hook_invocation_id?: string | null; research_id?: string | null; query?: string | null; candidate_count?: number | null; returned_count?: number | null; next_offset?: number | null; memory_id?: string | null; memory_ids?: string[]; scenario_ids?: string[]; scenario_navigation_roles?: Array<[string,string]>; scenario_type?: string | null; scenario_tier?: string | null; scenario_episode_id?: string | null; scenario_episode_title?: string | null; scenario_episode_count?: number | null; scenario_episodes?: Array<{episode_id?:string;title?:string;title_authority?:string;start_message_id?:string;start_user_message_id?:string;end_message_id?:string;source_message_count?:number;source_revision?:string;status?:string}>; scenario_summary_status?: string | null; scenario_summary_text?: string | null; scenario_summary_truncated?: boolean; scope_hypothesis_count?: number | null; scope_route_policy?: {state?:string;required_next_action?:string;defer_bank_retrieval_until_scope_check?:boolean}; scenario_decision?: string | null; delivery?: { host_visibility?: string; answer_use?: string } }>;
+    tool_events?: Array<{ source_navigation_returned_count?: number; source_navigation_returned_ids?: string[]; source_navigation?: SourceNavigation[]; tool?: string; at?: string; route?: string; check_id?: string | null; session_id?: string | null; turn_id?: string | null; hook_invocation_id?: string | null; research_id?: string | null; query?: string | null; candidate_count?: number | null; returned_count?: number | null; next_offset?: number | null; memory_id?: string | null; memory_ids?: string[]; scenario_ids?: string[]; scenario_navigation_roles?: Array<[string,string]>; scenario_type?: string | null; scenario_tier?: string | null; scenario_episode_id?: string | null; scenario_episode_title?: string | null; scenario_episode_count?: number | null; scenario_episodes?: Array<{episode_id?:string;title?:string;title_authority?:string;start_message_id?:string;start_user_message_id?:string;end_message_id?:string;source_message_count?:number;source_revision?:string;status?:string}>; scenario_summary_status?: string | null; scenario_summary_text?: string | null; scenario_summary_truncated?: boolean; scope_hypothesis_count?: number | null; scope_route_policy?: {state?:string;required_next_action?:string;defer_bank_retrieval_until_scope_check?:boolean}; scenario_decision?: string | null; delivery?: { host_visibility?: string; answer_use?: string } }>;
   } | null;
   time_window_activity?: {
     state?: "observed" | "not_observed";
@@ -111,18 +118,23 @@ export type FlowPrompt = {
   } | null;
 };
 
-export function projectFlowAudit(prompt: FlowPrompt) {
+export function projectFlowAudit(prompt: FlowPrompt, qualityMode: MemoryQualityMode = "lightweight") {
   const receipt = prompt.guidance_receipt;
   const history = prompt.historical_audit;
-  const promptToolEvents = prompt.memory_route_receipt?.tool_events ?? [];
+  const promptToolEvents = mergeToolReceipts(prompt.memory_route_receipt?.tool_events ?? []);
   const boundHistory = promptToolEvents.filter(event =>
-    ["recall", "research", "read_research", "read_source", "find_sources", "read_scenario_summary"].includes(event.tool ?? ""));
+    ["recall", "user_recall", "research", "user_research", "read_research", "read_source", "find_sources", "search_scenario_summary", "search_scenario_contexts", "read_scenario_summary", "read_context_summary", "scenario_gate"].includes(event.tool ?? ""));
   const actualEvents = boundHistory.length ? boundHistory :
     prompt.time_window_activity?.boundary === "same_prompt_binding_only" ? prompt.time_window_activity.events ?? [] : [];
   const observedToolEvents = promptToolEvents.length ? promptToolEvents : actualEvents;
   const measuredResults = observedToolEvents.filter(event => typeof event.returned_count === "number");
   const actualRoute = actualEvents.length ? [...new Set(actualEvents.map(event => event.tool))].join("+") : null;
   const actualReturned = actualEvents.reduce((sum, event) => sum + (event.returned_count ?? 0), 0);
+  const actualCountKnown=actualEvents.length>0 && actualEvents.every(event=>typeof event.returned_count==="number" && Number.isFinite(event.returned_count) && event.returned_count>=0);
+  const actualReturnedCount=actualCountKnown ? actualReturned : null;
+  const navigationEvents=actualEvents.filter((event:any)=>typeof event.source_navigation_returned_count==="number");
+  const navigationCount=navigationEvents.length ? navigationEvents.reduce((sum:number,event:any)=>sum+event.source_navigation_returned_count,0) : null;
+  const observedNavigationCount=observedToolEvents.reduce((sum:number,event:any)=>sum+(event.source_navigation_returned_count || 0),0);
   const plannedRoute = prompt.history_plan?.recommended_route ?? prompt.memory_route_receipt?.recommended_route;
   const routeRequired = Boolean(
     prompt.history_plan?.minimum_action === "recall_probe" ||
@@ -133,7 +145,7 @@ export function projectFlowAudit(prompt: FlowPrompt) {
   const routeStatus = routeRequired && !routeStarted
     ? "ep_history_verification_incomplete"
     : routeStarted
-      ? (actualReturned > 0 ? "ep_history_verified_candidate_returned" : "ep_history_tool_called_empty")
+      ? (actualReturnedCount===null ? "ep_history_tool_called_unmeasured" : actualReturnedCount > 0 ? "ep_history_verified_candidate_returned" : navigationCount ? "ep_history_source_navigation_returned" : "ep_history_tool_called_empty")
       : "ep_history_not_required";
   const guidanceItems = [
     ...(receipt?.stable_profile ?? []).map((item) => ({ ...item, type: item.type ?? "stable_profile" })),
@@ -142,13 +154,14 @@ export function projectFlowAudit(prompt: FlowPrompt) {
   ];
   const navigation = prompt.navigation_map;
 
+  const qualityEvents: MemoryQualityEvent[] = projectMemoryQualityEvents(prompt, qualityMode);
   return {
     hostEvidence: {
       entry: prompt.instruction_receipt ? "prepared" : "unknown",
       mcp: observedToolEvents.length ? "observed" : "unknown",
       history: actualEvents.length ? "observed" : "not_observed",
       result: measuredResults.length
-        ? measuredResults.some(event => (event.returned_count ?? 0) > 0) ? "returned" : "returned_empty"
+        ? measuredResults.some(event => (event.returned_count ?? 0) > 0) ? "returned" : observedNavigationCount ? "source_navigation_returned" : "returned_empty"
         : "unknown",
     },
     entry: {
@@ -193,7 +206,7 @@ export function projectFlowAudit(prompt: FlowPrompt) {
     },
     history: {
       value: actualRoute ?? history?.route ?? prompt.routes?.historical_memory ?? "not_observed",
-      state: actualRoute ? (actualReturned ? "observed" : "executed_empty") : history?.state ?? prompt.routes?.historical_memory ?? "unknown",
+      state: actualRoute ? (actualReturnedCount===null ? "executed_no_result" : actualReturnedCount || navigationCount ? "observed" : "executed_empty") : history?.state ?? prompt.routes?.historical_memory ?? "unknown",
       calls: actualEvents.length,
       decision: actualRoute ? "needed" : prompt.history_decision ?? ((history?.state ?? prompt.routes?.historical_memory ?? "unknown") === "unknown" ? "unknown" : "needed"),
       decisionEvidence: prompt.history_decision_evidence ?? "not_observed",
@@ -202,7 +215,7 @@ export function projectFlowAudit(prompt: FlowPrompt) {
       controller: history?.controller_state ?? (history?.route === "recall" || history?.route === "recall_and_research" ? "admission_applied" : "not_used"),
       metrics: {
         candidates: history?.candidate_count ?? null,
-        returned: actualRoute ? actualReturned : history?.returned_to_host_count ?? null,
+        returned: actualRoute ? actualReturnedCount : history?.returned_to_host_count ?? null,
         unread: history?.unread_candidate_count ?? null,
         rejected: history?.rejected_count ?? null,
       },
@@ -214,8 +227,9 @@ export function projectFlowAudit(prompt: FlowPrompt) {
         route_required: routeRequired,
         route_started: routeStarted,
         tool_called: routeStarted,
-        returned_count: actualReturned,
-        delivery_state: routeStarted ? (actualReturned > 0 ? "returned" : "returned_empty") : "not_started",
+        returned_count: actualReturnedCount,
+        ...(navigationCount!==null ? {source_navigation_returned_count:navigationCount,source_navigation_returned_ids:[...new Set(navigationEvents.flatMap((event:any)=>event.source_navigation_returned_ids || []))]} : {}),
+        delivery_state: routeStarted ? (actualReturnedCount===null ? "not_measured" : actualReturnedCount > 0 ? "returned" : navigationCount ? "source_navigation_returned" : "returned_empty") : "not_started",
         unresolved: routeRequired && !routeStarted ? ["EP历史工具尚未调用，不能把本地文件搜索或候选提示算作历史核验"] : [],
         status: routeStatus,
       },
@@ -224,5 +238,10 @@ export function projectFlowAudit(prompt: FlowPrompt) {
     historyPlan: prompt.history_plan ?? null,
     timeWindowActivity: prompt.time_window_activity ?? null,
     timeWindowGuidanceActivity: prompt.time_window_guidance_activity ?? null,
+    quality: {
+      mode: qualityMode,
+      events: qualityEvents,
+      summary: summarizeMemoryQualityEvents(qualityEvents),
+    },
   };
 }

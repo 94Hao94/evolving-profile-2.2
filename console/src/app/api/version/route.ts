@@ -2,10 +2,9 @@ import { NextResponse } from "next/server";
 import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
 import { sdk, lowLevelClient } from "@/lib/evolving-client";
 import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { homedir } from "node:os";
+import { epStatePath } from "@/lib/ep-state-paths";
 
-const RELEASE_MANIFEST_PATH = path.join(process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(homedir(), ".evolving-profile"), "config/release-manifest.json");
+const RELEASE_MANIFEST_PATH = epStatePath("config/release-manifest.json");
 
 export async function GET(request: Request) {
   try {
@@ -28,7 +27,7 @@ export async function GET(request: Request) {
     const features = (data.features ?? {}) as Record<string, boolean>;
     features.access_key_auth = !!process.env.EVOLVING_PROFILE_ACCESS_KEY;
     data.features = features;
-    try { data.evolving_profile = JSON.parse(await readFile(RELEASE_MANIFEST_PATH, "utf8")); } catch { data.evolving_profile = { product_version: "5.0", release_channel: "development", build_id: "ep5-dev" }; }
+    try { data.evolving_profile = JSON.parse(await readFile(RELEASE_MANIFEST_PATH, "utf8")); } catch { data.evolving_profile = { product_version: "5.1", release_channel: "development", build_id: "ep51-dev" }; }
 
     return NextResponse.json(data, { status: 200 });
   } catch (error) {

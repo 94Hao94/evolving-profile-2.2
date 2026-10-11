@@ -46,15 +46,6 @@ def last_completed_summary(previous: dict) -> dict | None:
     reports = sorted(RUNS.glob("*/observation-publication/publication-report.json"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not reports:
         return None
-
-
-def prewarm_semantic_cache(env: dict[str, str]) -> dict:
-    """Best-effort derived-vector refresh; it cannot block preference publication."""
-    try:
-        completed=subprocess.run([sys.executable,str(SOURCE_ROOT/'prewarm_semantic_cache.py')],check=True,env=env,capture_output=True,text=True,timeout=45)
-        return json.loads(completed.stdout)
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
-        return {'status':'degraded','reason':type(exc).__name__}
     try:
         report = json.loads(reports[0].read_text())
         run_dir = reports[0].parents[1]
@@ -65,6 +56,15 @@ def prewarm_semantic_cache(env: dict[str, str]) -> dict:
                 "completed_at": report.get("completed_at")}
     except (OSError, ValueError, TypeError):
         return None
+
+
+def prewarm_semantic_cache(env: dict[str, str]) -> dict:
+    """Best-effort derived-vector refresh; it cannot block preference publication."""
+    try:
+        completed=subprocess.run([sys.executable,str(SOURCE_ROOT/'prewarm_semantic_cache.py')],check=True,env=env,capture_output=True,text=True,timeout=45)
+        return json.loads(completed.stdout)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
+        return {'status':'degraded','reason':type(exc).__name__}
 
 
 def main():

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .context_summary import BUDGETS, estimate_tokens
+from .scenario_state_v3 import USER_CLAIM_PROTOCOL
 
 
 SAFE_VALIDATION_CODES = {
@@ -35,6 +36,7 @@ SAFE_VALIDATION_CODES = {
     "scenario_promotion_layers_not_distinct", "scenario_episode_title_mismatch",
     "scenario_episode_first_message_not_user", "scenario_episode_turn_boundary_unverified",
     "scenario_cross_chunk_review_invalid", "scenario_cross_chunk_claim_evidence_invalid",
+    "scenario_user_claim_not_verbatim",
 }
 
 
@@ -51,6 +53,7 @@ def fingerprint_draft(draft: dict) -> str:
         material["selection_coverage"] = draft["selection_coverage"]
     if "source_chunk_char_limit" in draft:
         material["source_chunk_char_limit"] = draft["source_chunk_char_limit"]
+    if 'state_claim_protocol' in draft:material['state_claim_protocol']=draft['state_claim_protocol']
     return hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -126,7 +129,7 @@ def review_chunk_limit_for_draft(draft: dict, fallback: int = 30000) -> int:
 def validate_session_draft(source: dict, result: dict, *, model: str) -> dict:
     if result.get("schema") == "evolving-profile.scenario-draft.v3":
         from .scenario_state_v3 import validate_state_draft
-        rebuilt = validate_state_draft(source, result.get("state"), model=model)
+        rebuilt = validate_state_draft(source, result.get("state"), model=model,user_claim_protocol=result.get('state_claim_protocol'))
         if result.get("source_revision") != source.get("source_revision"):
             raise ValueError("scenario_source_revision_mismatch")
         if any(result.get(key) != rebuilt[key] for key in ("state", "summaries", "evidence", "unknowns")):
@@ -472,13 +475,13 @@ def request_session_draft(source: dict, *, base_url: str, api_key: str, model: s
 
 def request_session_state_draft(source: dict, *, base_url: str, api_key: str, model: str,
                                 opener=urllib.request.urlopen, timeout: int = 90,
-                                max_input_chars: int = 30000) -> dict:
+                                max_input_chars: int = 30000,user_claim_protocol=USER_CLAIM_PROTOCOL) -> dict:
     """Review every source chunk, then merge bounded source-linked state candidates."""
     from .scenario_state_v3 import validate_state_draft
 
     chunk_char_limit = adaptive_state_chunk_chars(source, max_input_chars)
     chunks = source_chunks(source, max_chars=chunk_char_limit)
-    options = dict(base_url=base_url, api_key=api_key, model=model, opener=opener, timeout=timeout)
+    options = dict(base_url=base_url, api_key=api_key, model=model, opener=opener, timeout=timeout,user_claim_protocol=user_claim_protocol)
     if len(chunks) == 1:
         draft = _request_session_state_single(source, **options)
         draft["source_chunk_char_limit"] = chunk_char_limit
@@ -507,7 +510,7 @@ def request_session_state_draft(source: dict, *, base_url: str, api_key: str, mo
         raise ValueError("scenario_source_chunk_too_large")
     selected = _request_session_state_single({**source, "messages": reduced_messages,
                                               "merge_projection": True}, **options)
-    draft = validate_state_draft(source, selected["state"], model=model)
+    draft = validate_state_draft(source, selected["state"], model=model,user_claim_protocol=user_claim_protocol)
     draft["selection_coverage"] = {
         "source_revision": source["source_revision"], "source_message_count": len(source["messages"]),
         "source_chunk_count": len(chunks), "candidate_state_count": len(local),
@@ -522,11 +525,48 @@ def request_session_state_draft(source: dict, *, base_url: str, api_key: str, mo
     return draft
 
 
+def deterministic_source_state_draft(source: dict, *, model: str = "source-linked-deterministic-fallback",
+                                     user_claim_protocol=USER_CLAIM_PROTOCOL) -> dict:
+    """Build a source-linked bounded draft when a provider state pass is malformed.
+
+    This never claims semantic completeness. It preserves eligible user clauses
+    and assistant reports so the independent coverage review can still inspect
+    the exact source; publication remains gated by the normal review/CAS path.
+    """
+    from .scenario_state_v3 import whole_user_clauses, CORRECTION_HINT, validate_state_draft
+    users=[m for m in source["messages"] if m["role"]=="user"]
+    assistants=[m for m in source["messages"] if m["role"]=="assistant"]
+    if not users: raise ValueError("scenario_source_incomplete")
+    def claim(text,mid): return {"text":str(text), "message_ids":[mid]}
+    constraints=[];corrections=[]
+    for message in users:
+        for clause in whole_user_clauses(message["text"]):
+            if len(clause)>1200: continue
+            target=corrections if CORRECTION_HINT.search(clause) else constraints
+            target.append(claim(clause,message["evidence_id"]))
+    constraints=constraints[:64]; corrections=corrections[:64]
+    subject=claim(" ".join(users[0]["text"].split())[:170],users[0]["evidence_id"])
+    goal=claim(" ".join(users[-1]["text"].split())[:170],users[-1]["evidence_id"])
+    reports=[claim("助手报告（未独立核验）："+ " ".join(m["text"].split())[:150],m["evidence_id"])
+             for m in assistants]
+    last=source["messages"][-1]
+    state={"subject":subject,"goal":goal,
+           "phase":"assistant_reported" if last["role"]=="assistant" else "requested",
+           "constraints":constraints,"corrections":corrections,"assistant_reports":reports,
+           "unresolved":[claim(" ".join(last["text"].split())[:170],last["evidence_id"])]
+             if last["role"]=="user" and not assistants else []}
+    draft=validate_state_draft(source,state,model=model,user_claim_protocol=user_claim_protocol)
+    draft["source_linked_fallback"]={"reason":"provider_state_contract_or_budget_failure",
+        "semantic_completeness_proven":False,"provider_verdict_required":True}
+    return draft
+
+
 def request_episode_bundle(source: dict, *, base_url: str, api_key: str, model: str,
                            opener=urllib.request.urlopen, timeout: int = 90,
-                           max_input_chars: int = 30000) -> dict:
+                           max_input_chars: int = 30000,user_claim_protocol=USER_CLAIM_PROTOCOL) -> dict:
     """Propose a source-complete episode partition and summarize each range."""
     from .scenario_episodes import (EPISODE_BUNDLE_SCHEMA, partition_source,
+                                    deterministic_size_boundaries,
                                     validate_episode_bundle)
 
     if source.get("status") != "complete" or not source.get("messages") or not source.get("source_revision"):
@@ -538,7 +578,16 @@ def request_episode_bundle(source: dict, *, base_url: str, api_key: str, model: 
     if not user_messages:
         raise ValueError("scenario_source_incomplete")
     first_user_id = user_messages[0]["evidence_id"]
-    decisions = []
+    source_positions = {row["evidence_id"]: index for index, row in enumerate(source["messages"])}
+    same_turn_ids = set()
+    for row in user_messages[1:]:
+        position = source_positions[row['evidence_id']]
+        prior_turn = source['messages'][position-1].get('turn_id') if position else None
+        current_turn = row.get('turn_id')
+        if isinstance(prior_turn,str) and prior_turn and isinstance(current_turn,str) and current_turn == prior_turn:
+            same_turn_ids.add(row['evidence_id'])
+    decisions = [{'message_id':row['evidence_id'],'decision':'same_episode','method':'same_turn_join'}
+                 for row in user_messages[1:] if row['evidence_id'] in same_turn_ids]
     options = dict(base_url=base_url, api_key=api_key, model=model, opener=opener, timeout=timeout)
 
     for chunk_index, chunk in enumerate(chunks):
@@ -547,29 +596,23 @@ def request_episode_bundle(source: dict, *, base_url: str, api_key: str, model: 
             continue
         chunk_first_user = chunk_users[0]["evidence_id"]
         local_targets = [row["evidence_id"] for row in chunk_users
-                         if row["evidence_id"] != first_user_id and
+                         if row["evidence_id"] != first_user_id and row['evidence_id'] not in same_turn_ids and
                          (chunk_index == 0 or row["evidence_id"] != chunk_first_user)]
         if local_targets:
             decisions.extend(_request_episode_decisions(
                 chunk, local_targets, request_type="episode_boundary_classification", **options))
 
     cross_chunk_boundaries = []
-    source_positions = {row["evidence_id"]: index for index, row in enumerate(source["messages"])}
     for chunk_index, chunk in enumerate(chunks[1:], start=1):
         chunk_users = [row for row in chunk["messages"] if row.get("role") == "user"]
         if not chunk_users:
             continue
         first_user = chunk_users[0]
-        if first_user["evidence_id"] == first_user_id:
+        if first_user["evidence_id"] == first_user_id or first_user['evidence_id'] in same_turn_ids:
             continue
         position = source_positions[first_user["evidence_id"]]
         previous = source["messages"][max(0, position - 4):position]
         current = source["messages"][position:min(len(source["messages"]), position + 4)]
-        prior_turn = source["messages"][position - 1].get("turn_id") if position else None
-        if prior_turn and first_user.get("turn_id") and prior_turn == first_user.get("turn_id"):
-            decisions.append({"message_id": first_user["evidence_id"], "decision": "same_episode",
-                              "method": "same_turn_join"})
-            continue
         cross_chunk_boundaries.append({
             "message_id": first_user["evidence_id"],
             "previous_messages": [{"message_id": row["evidence_id"], "role": row["role"],
@@ -597,6 +640,15 @@ def request_episode_bundle(source: dict, *, base_url: str, api_key: str, model: 
                 "unresolved_boundary_ids": unresolved, "episodes": [],
                 "evidence_role": "context_navigation_only"}
 
+    # Long Sessions get deterministic transport boundaries even when a model
+    # says every topic belongs to one episode. This limits per-episode claim
+    # pressure without asserting that the task semantically changed.
+    forced_starts = set(deterministic_size_boundaries(source))
+    if forced_starts:
+        for row in decisions:
+            if row["message_id"] in forced_starts:
+                row["decision"] = "new_episode"
+                row["method"] = "deterministic_size_boundary"
     starts = [row["message_id"] for row in decisions if row["decision"] == "new_episode"]
     partitions = partition_source(source, starts)
     if len(partitions) > 64:
@@ -605,7 +657,14 @@ def request_episode_bundle(source: dict, *, base_url: str, api_key: str, model: 
     for partition in partitions:
         episode_source = {**source, "messages": partition["_messages"],
                           "source_revision": partition["source_revision"]}
-        draft = request_session_state_draft(episode_source, max_input_chars=max_input_chars, **options)
+        try:
+            draft = request_session_state_draft(episode_source, max_input_chars=max_input_chars,
+                                                user_claim_protocol=user_claim_protocol, **options)
+        except ValueError as error:
+            # Keep a bounded source-linked candidate for the independent
+            # coverage reviewer instead of dropping a whole long Session.
+            draft = deterministic_source_state_draft(episode_source,
+                user_claim_protocol=user_claim_protocol)
         episodes.append({**{key: value for key, value in partition.items() if key != "_messages"},
                          "title": draft["state"]["subject"]["text"][:120],
                          "title_authority": "navigation_label_not_verified_fact", "draft": draft})
@@ -694,8 +753,8 @@ def _request_episode_decisions(source: dict, target_message_ids: list[str], *, r
 
 
 def _request_session_state_single(source: dict, *, base_url: str, api_key: str, model: str,
-                                  opener=urllib.request.urlopen, timeout: int = 90) -> dict:
-    from .scenario_state_v3 import project_source_messages, correction_review_hints, validate_state_draft
+                                  opener=urllib.request.urlopen, timeout: int = 90,user_claim_protocol=USER_CLAIM_PROTOCOL) -> dict:
+    from .scenario_state_v3 import project_source_messages, correction_review_hints, validate_state_draft,STATE_LIMITS,STATE_FIELD_ROLES,user_clause_catalog,INTENT_FIELD_RULES
 
     messages = project_source_messages(source)
     instructions = (
@@ -705,15 +764,31 @@ def _request_session_state_single(source: dict, *, base_url: str, api_key: str, 
         "constraints、corrections、unresolved 只引用用户消息；assistant_reports 只引用助手消息，"
         "且仅表示助手自述，不证明文件交付或外部事实。"
         "phase 只能是 requested、in_progress、assistant_reported、unknown。最后一条消息是用户新要求或表单答复时，"
+        "assistant_reported 仅表示已有对应的助手答复或结果自述，既不表示正在执行，也不证明外部执行完成。"
+        "对话请求是否已答复与外部结果是否独立核验是两个轴：未核验不能自动变成用户待办。"
+        "unresolved 只保留原文明确仍未答复、未处理或尚有冲突的用户请求；后续助手直接回应已澄清的旧质疑不再作为未答复事项，"
+        "但答复仍只标助手自述，若原文仍明确存在争议或待办须继续保留。"
+        "逐条检查全部user消息：把每次目的、条件、否定、修改及纠正分别落实到subject/goal/constraints/corrections，"
+        "不能只保留最后的泛目标而漏掉具体条件。后续助手限定其自述范围或承认未知时，要保留该限定，"
+        "尤其实际未采用某条线索不等于线索不存在、答复用户不等于该答复已经核实。"
+        "不能仅因用户可能不信服就推断仍未答复或仍未达共识；最后一个具体问题已有后续直接答复时，"
+        "该请求不再因外部结果未知而自动列为unresolved，保留助手答复的范围限定与未核验归因即可。"
+        "constraints/corrections只能用户明示的规范、否定或修改；能力/真实性提问是问题，不能断言其能力成立。"
+        "助手提出的附加功能/实现建议只能assistant_reports，不能混入用户约束。不要只保留最终报告而丢失其他有导航意义的直接答复；可合并相关报告并保留各精确assistant ID。"
+        +("本轮user_claim_protocol要求constraints/corrections精确复制user_clause_catalog的eligible完整原句/显式条目；保留否定、条件、疑问词和标点，不在逗号处拆条件，不补助手功能，不裁剪超过预算的原句。" if user_claim_protocol else "")+
         "不能沿用之前的助手完成状态；新要求没有后续答复时 phase=requested，unresolved 必须引用最后一条用户消息。"
         "结构化表单答复已经解析为问题和回答，provenance_kind 标明其来源；opaque_structured_reply 不得作为主张依据。"
         "correction_review_hints 只提示可能的后续纠正，不是已核实事实；逐条核对原消息，尤其名称、对象和阶段。"
         "若 merge_projection 为 true，输入是前面各分段状态的带来源候选，不是完整原文；须保留竞争变化与未知。"
-        "每个字段简洁，不超过180字；数组每类最多8项。只输出 JSON："
+        f"subject/goal/assistant_reports/unresolved每条text不超过{STATE_LIMITS['text_max_chars_per_claim']}字；constraints/corrections的完整原句每条最多{STATE_LIMITS.get('verbatim_text_max_chars_per_claim',STATE_LIMITS['text_max_chars_per_claim'])}字，但整份full摘要仍受4000字独立预算约束，不能遗漏或截断条件。message_ids必须{STATE_LIMITS['message_ids_min_per_claim']}至{STATE_LIMITS['message_ids_max_per_claim']}个精确来源ID；不要把全部user ID塞subject/goal。"
+        f"具体条件和纠正分别按相应字段保留，每类数组最多{STATE_LIMITS['claims_max_per_array']}项。只输出 JSON："
         '{"source_revision":"...","state":{"subject":{"text":"...","message_ids":["..."]},'
         '"goal":{"text":"...","message_ids":["..."]},"phase":"requested",'
         '"constraints":[],"corrections":[],"assistant_reports":[],"unresolved":[]}}。'
         "输入：" + json.dumps({"source_revision": source["source_revision"], "messages": messages,
+                               "state_limits":STATE_LIMITS,"allowed_roles_by_field":STATE_FIELD_ROLES,
+                               'user_claim_protocol':user_claim_protocol,'user_clause_catalog':user_clause_catalog(source) if user_claim_protocol else [],
+                               'allowed_state_fields_by_disposition_and_kind':INTENT_FIELD_RULES,
                                "merge_projection": bool(source.get("merge_projection")),
                                "allowed_message_ids_by_role": {
                                    "user": [item["evidence_id"] for item in source["messages"] if item["role"] == "user"],
@@ -743,16 +818,25 @@ def _request_session_state_single(source: dict, *, base_url: str, api_key: str, 
         if result.get("source_revision") != source["source_revision"]:
             raise ValueError("scenario_source_revision_mismatch")
         try:
-            return validate_state_draft(source, result.get("state"), model=model)
+            return validate_state_draft(source, result.get("state"), model=model,user_claim_protocol=user_claim_protocol)
         except ValueError as error:
             code = safe_validation_error_code(error)
             if attempt == 2 or code == "unclassified_model_error":
                 raise
-            if code == "scenario_state_role_invalid":
+            from .scenario_state_v3 import StateValidationError
+            if isinstance(error,StateValidationError):
+                feedback=('\n上次结构输出未通过严格校验：'+json.dumps(error.safe_detail(),ensure_ascii=False)+
+                          '。以上actual/maximum按Unicode字符数计算，英文按字符而不是单词计数。'
+                          '请逐个修复所列字段，不要重复原来的超长输出。subject/goal/assistant_reports可压缩表达但保留范围、归因和未知；'
+                          'constraints/corrections必须保持完整eligible原句，不得截断条件、否定或用户要求；'
+                          '如无法在规定结构内完整表达，不得伪造覆盖。仍只返回原定JSON结构。')
+            elif code == "scenario_state_role_invalid":
                 feedback = ("\n上次输出未通过代码校验：" + code + "。assistant_reports 只能引用 assistant 消息 ID："
                             + json.dumps([item["evidence_id"] for item in source["messages"] if item["role"] == "assistant"])
                             + "；subject、goal、constraints、corrections、unresolved 只能引用 user 消息 ID。"
                             "请重新逐项核对角色，不得放宽或虚构来源。仍只输出规定 JSON。")
+            elif code=='scenario_user_claim_not_verbatim':
+                feedback='\n上次约束/纠正不是真实完整user原句：必须逐字复制eligible user_clause_catalog条目，保留否定/条件/疑问词和标点；用户能力提问不能写成已成立能力，助手新增功能不能升级用户要求。不得自行截句或补条件。'
             else:
                 feedback = ("\n上次输出未通过代码校验：" + code + "。请重新按字段检查数组类型、每条主张的 text 与 message_ids、"
                             "角色对应、最后用户消息的未决状态和三级长度预算；不得放宽或虚构来源。仍只输出规定 JSON。")
@@ -1156,7 +1240,7 @@ def _request_session_review_single(source: dict, draft: dict, *, base_url: str, 
         raise ValueError("scenario_review_source_mismatch")
     messages = [{"id": item["evidence_id"], "role": item["role"], "text": _model_text(item["text"])} for item in source["messages"]]
     if draft.get("schema") == "evolving-profile.scenario-draft.v3":
-        from .scenario_state_v3 import correction_review_hints
+        from .scenario_state_v3 import correction_review_hints,STATE_LIMITS,STATE_FIELD_ROLES,state_field_catalog,INTENT_FIELD_RULES
         if chunked:
             local_ids = {item["evidence_id"] for item in source["messages"]}
             local_claims = [item for item in draft["evidence"]
@@ -1168,6 +1252,7 @@ def _request_session_review_single(source: dict, draft: dict, *, base_url: str, 
                 '只输出JSON：{"source_revision":字符串,"accept":布尔,"issues":[{"tier":"evidence",'
                 '"code":英文小写下划线,"detail":不超过200字}]}。'
                 "输入：" + json.dumps({"source_revision": source["source_revision"], "messages": messages,
+                                       "state_limits":STATE_LIMITS,"allowed_roles_by_field":STATE_FIELD_ROLES,
                                        "full_session_last_role": source.get("full_session_last_role"),
                                        "full_session_last_message_id": source.get("full_session_last_message_id"),
                                        "claims_in_chunk": local_claims}, ensure_ascii=False)
@@ -1178,10 +1263,27 @@ def _request_session_review_single(source: dict, draft: dict, *, base_url: str, 
             "再检查后续纠正是否覆盖旧阶段、assistant_reports 是否仍只标助手自述，以及三级摘要是否各自清晰。"
             "最后一条用户请求若没有后续助手消息，必须保留待处理；不能因缺少不存在的执行答复而拒绝。"
             "不能凭导航标题推断项目身份。只对真实误导问题拒绝，最多列3项。"
+            "phase 契约：requested=用户请求尚待答复，in_progress=会话明确仍在讨论或执行，"
+            "assistant_reported=已有对应助手答复或结果自述，unknown=来源不足以判定对话阶段。"
+            "assistant_reported 不是正在执行、不是已独立核验，也不需要改成未定义的 completed/verified。"
+            "对话已答复与外部事实是否核验是两个独立问题；未核验不能自动变成未答复请求。"
+            "来源只含用户消息和助手最终答复，不含工具输出。对已标为助手报告/未独立核验的主张，"
+            "只核对所引助手消息、归因、时序和纠正；不得因本输入未提供工具执行证据而否定一个确实存在的助手自述，"
+            "也不得因助手说已上传或提供链接就升级为真实已完成事实。"
+            "缺少关键纠正、遗漏仍未答复事项、把助手报告写成用户要求或外部事实时必须拒绝。"
+            "逐条核对所有user原意，不仅最后目标：每项具体条件/否定/修改必须在相应state字段和full层有保留；"
+            "泛化目标不能替代注册配置说明、语言版本、文案开头、禁止指名、额度/免费选型等具体要求。"
+            "核对助手答复中的范围限定与承认未知，不能把实际未采用线索写成不存在记录或断言无效。"
+            "state_field_catalog由代码列出每条真实主张、角色、精确来源ID和实际出现层；包括所有旧报告及最新报告。"
+            "若目录显示某主张确在full层，不能失实声称full遗漏该主张；仍须逐条核对该主张是否由对应角色的原句支持。"
+            "用户仅询问能力，不等于明确断言能力成立；助手建议的附加功能不等于用户要求。"
             "correction_review_hints 仅是可能的纠正线索，不是事实判定；核对原文后看状态及摘要是否遗漏有效纠正。"
             '只输出JSON：{"source_revision":字符串,"accept":布尔,"issues":[{"tier":"compact|standard|full|evidence",'
             '"code":英文小写下划线,"detail":不超过200字}]}。'
             "输入：" + json.dumps({"source_revision": source["source_revision"], "messages": messages,
+                                   "state_limits":STATE_LIMITS,"allowed_roles_by_field":STATE_FIELD_ROLES,
+                                   'state_field_catalog':state_field_catalog(source,draft),
+                                   'allowed_state_fields_by_disposition_and_kind':INTENT_FIELD_RULES,
                                    "last_message_role": source["messages"][-1]["role"],
                                    "full_session_last_role": source.get("full_session_last_role", source["messages"][-1]["role"]),
                                    "full_session_last_message_id": source.get("full_session_last_message_id", source["messages"][-1]["evidence_id"]),

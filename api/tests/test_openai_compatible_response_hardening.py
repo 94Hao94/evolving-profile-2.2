@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,7 @@ from evolving_profile_api.engine.providers.openai_compatible_llm import (
     ProviderResponseError,
 )
 from evolving_profile_api.worker.stage import StageHolder, bind_holder, set_stage
+from evolving_profile_api.engine.llm_interface import OutputTooLongError
 
 
 class SimpleJsonResponse(BaseModel):
@@ -38,6 +40,94 @@ def _response(*, content: str | None = '{"ok": true}', choices=None, error=None)
     )
     response.choices = [choice]
     return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ['{"ok": true}', '{"ok":', ""])
+async def test_length_finish_rejects_even_parseable_prefix_without_identical_retry(content):
+    llm = _llm()
+    response = _response(content=content)
+    response.choices[0].finish_reason = "length"
+    create = AsyncMock(return_value=response)
+    llm._client.chat.completions.create = create
+    with pytest.raises(OutputTooLongError):
+        await llm.call(
+            messages=[{"role": "user", "content": "json"}],
+            response_format=SimpleJsonResponse,
+            scope="consolidation",
+            max_completion_tokens=4096,
+            max_retries=3,
+            initial_backoff=0,
+        )
+    assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", [None, "stop"])
+async def test_consolidation_at_token_cap_is_held_before_parsing(finish_reason):
+    llm = _llm()
+    response = _response()
+    response.choices[0].finish_reason = finish_reason
+    response.usage = SimpleNamespace(prompt_tokens=20, completion_tokens=4096, total_tokens=4116)
+    llm._client.chat.completions.create = AsyncMock(return_value=response)
+    with pytest.raises(OutputTooLongError):
+        await llm.call(
+            messages=[{"role": "user", "content": "json"}],
+            response_format=SimpleJsonResponse,
+            scope="consolidation",
+            max_completion_tokens=4096,
+            max_retries=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_consolidation_invalid_json_goes_to_split_without_identical_inner_retry():
+    llm = _llm()
+    create = AsyncMock(return_value=_response(content='{"ok":'))
+    llm._client.chat.completions.create = create
+    with pytest.raises(json.JSONDecodeError):
+        await llm.call(
+            messages=[{"role": "user", "content": "json"}],
+            response_format=SimpleJsonResponse,
+            scope="consolidation",
+            max_retries=3,
+            initial_backoff=0,
+        )
+    assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"ok": true}\n{"ok":',
+        '```json\n{"ok": true}\n{"ok":\n```',
+        '```json\n{"ok": true}',
+    ],
+)
+async def test_consolidation_never_repairs_a_complete_prefix_from_partial_output(content):
+    llm = _llm()
+    llm._client.chat.completions.create = AsyncMock(return_value=_response(content=content))
+    with pytest.raises(json.JSONDecodeError):
+        await llm.call(
+            messages=[{"role": "user", "content": "json"}],
+            response_format=SimpleJsonResponse,
+            scope="consolidation",
+            max_retries=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_consolidation_accepts_a_complete_json_fence():
+    llm = _llm()
+    llm._client.chat.completions.create = AsyncMock(return_value=_response(content='```json\n{"ok": true}\n```'))
+    result = await llm.call(
+        messages=[{"role": "user", "content": "json"}],
+        response_format=SimpleJsonResponse,
+        scope="consolidation",
+        max_retries=0,
+    )
+    assert result.ok is True
 
 
 @pytest.mark.asyncio
@@ -175,7 +265,8 @@ async def test_error_payload_with_no_choices_raises_clear_provider_error_without
 
 
 @pytest.mark.asyncio
-async def test_missing_choices_are_retryable_provider_response_errors():
+@pytest.mark.parametrize("scope", ["memory", "consolidation"])
+async def test_missing_choices_are_retryable_provider_response_errors(scope):
     llm = _llm()
     empty_response = _response(choices=[])
     valid_response = _response()
@@ -183,7 +274,9 @@ async def test_missing_choices_are_retryable_provider_response_errors():
     llm._client.chat.completions.create = create
 
     with (
-        patch("evolving_profile_api.engine.providers.openai_compatible_llm.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        patch(
+            "evolving_profile_api.engine.providers.openai_compatible_llm.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock,
         patch("evolving_profile_api.engine.providers.openai_compatible_llm.get_metrics_collector"),
     ):
         result = await llm.call(
@@ -191,6 +284,7 @@ async def test_missing_choices_are_retryable_provider_response_errors():
             response_format=SimpleJsonResponse,
             max_retries=1,
             initial_backoff=0,
+            scope=scope,
         )
 
     assert result.ok is True

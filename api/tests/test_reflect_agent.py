@@ -16,6 +16,7 @@ import pytest
 from evolving_profile_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
 from evolving_profile_api.engine.reflect.agent import (
     ReflectNoAnswerError,
+    ReflectRetrievalUnavailableError,
     ReflectToolCallError,
     _all_mental_models_are_usable_and_fresh,
     _cache_cleanup_tasks,
@@ -763,25 +764,25 @@ class TestReflectAgentMocked:
 
     @pytest.mark.asyncio
     async def test_max_iterations_reached(self, mock_llm, mock_functions):
-        """Test that agent stops after max iterations even with errors."""
+        """Unknown tools cannot bypass required lookups at the iteration limit."""
         # LLM keeps calling unknown tools
         mock_llm.call_with_tools.return_value = LLMToolCallResult(
             tool_calls=[LLMToolCall(id="1", name="unknown_tool", arguments={})],
             finish_reason="tool_calls",
         )
 
-        result = await run_reflect_agent(
-            llm_config=mock_llm,
-            bank_id="test-bank",
-            query="test query",
-            bank_profile={"name": "Test", "mission": "Testing"},
-            max_iterations=3,
-            **mock_functions,
-        )
-
-        # Should have a result even if no memories found
-        assert result is not None
-        assert result.iterations == 3
+        with pytest.raises(ReflectRetrievalUnavailableError) as raised:
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="test query",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                max_iterations=3,
+                **mock_functions,
+            )
+        assert raised.value.category == "required_retrieval_not_completed"
+        assert mock_llm.call_with_tools.await_count == 2
+        mock_llm.call.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_wall_clock_timeout(self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]) -> None:
@@ -931,24 +932,21 @@ class TestContextOverflowBehavior:
 
     @pytest.mark.asyncio
     async def test_context_overflow_error_skips_retry(self, mock_llm, mock_functions_with_large_output):
-        """A context_length_exceeded error from the LLM should NOT be retried —
-        it should immediately fall back to final synthesis."""
+        """Overflow before retrieval is not retried or turned into a no-data answer."""
         mock_llm.call_with_tools.side_effect = Exception("context_length_exceeded: messages resulted in 150000 tokens.")
 
-        result = await run_reflect_agent(
-            llm_config=mock_llm,
-            bank_id="test-bank",
-            query="What do you know?",
-            bank_profile={"name": "Test", "mission": "Testing"},
-            max_iterations=5,
-            **mock_functions_with_large_output,
-        )
-
-        assert result is not None
+        with pytest.raises(ReflectRetrievalUnavailableError):
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="What do you know?",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                max_iterations=5,
+                **mock_functions_with_large_output,
+            )
         # Should have attempted only 1 iteration (no retry on overflow error)
         assert mock_llm.call_with_tools.call_count == 1
-        # Final synthesis was called
-        mock_llm.call.assert_called_once()
+        mock_llm.call.assert_not_called()
 
 
 class TestNoAnswerFailsHard:

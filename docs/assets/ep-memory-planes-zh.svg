@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
+  <title id="title">EP 记忆平面</title>
+  <desc id="desc">User memory, scenario context, agent process memory and external RAG converge into a governed context packet.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#071331"/><stop offset="1" stop-color="#111d4c"/></linearGradient>
+    <linearGradient id="user" x1="0" x2="1"><stop stop-color="#16c7b7"/><stop offset="1" stop-color="#4cc9f0"/></linearGradient>
+    <linearGradient id="agent" x1="0" x2="1"><stop stop-color="#8b5cf6"/><stop offset="1" stop-color="#ec4899"/></linearGradient>
+    <linearGradient id="rag" x1="0" x2="1"><stop stop-color="#22c55e"/><stop offset="1" stop-color="#facc15"/></linearGradient>
+    <linearGradient id="ctx" x1="0" x2="1"><stop stop-color="#60a5fa"/><stop offset="1" stop-color="#c084fc"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#a7c7ff"/></marker>
+  </defs>
+  <rect width="1400" height="760" rx="28" fill="url(#bg)"/>
+  <g opacity=".18" stroke="#9bbcff"><path d="M40 120H1360M40 250H1360M40 380H1360M40 510H1360M40 640H1360"/><path d="M140 40V720M360 40V720M580 40V720M800 40V720M1020 40V720M1240 40V720"/></g>
+  <text x="70" y="80" fill="#fff" font-family="Inter,Arial,sans-serif" font-size="34" font-weight="700">EP 5.1 · 记忆平面</text>
+  <text x="70" y="116" fill="#a8b7d8" font-family="Inter,Arial,sans-serif" font-size="18">分开管理证据类型，只在受控上下文包处汇合。</text>
+  <g font-family="Inter,Arial,sans-serif">
+    <rect x="70" y="165" width="720" height="145" rx="22" fill="#0e2850" stroke="url(#user)" stroke-width="3"/>
+    <text x="105" y="210" fill="#fff" font-size="25" font-weight="700">A · 用户记忆</text>
+    <text x="105" y="244" fill="#b6d8ff" font-size="17">事实 · 经历 · 实体 · 观察</text>
+    <text x="105" y="274" fill="#b6d8ff" font-size="17">带条件和原因的偏好 · 心智模型</text>
+    <rect x="70" y="340" width="720" height="145" rx="22" fill="#22194f" stroke="url(#agent)" stroke-width="3"/>
+    <text x="105" y="385" fill="#fff" font-size="25" font-weight="700">B · 智能体过程记忆</text>
+    <text x="105" y="419" fill="#decaff" font-size="17">轨迹 · 失败事件 · 修复模式</text>
+    <text x="105" y="449" fill="#decaff" font-size="17">能力观测 · 过程策略 · 迁移与再验证</text>
+    <rect x="70" y="515" width="720" height="145" rx="22" fill="#173b3a" stroke="url(#rag)" stroke-width="3"/>
+    <text x="105" y="560" fill="#fff" font-size="25" font-weight="700">C · 外部 RAG</text>
+    <text x="105" y="594" fill="#c9f7d9" font-size="17">操作者指定的 PDF · DOCX · Markdown · 数据目录</text>
+    <text x="105" y="624" fill="#c9f7d9" font-size="17">词法 + 向量 → RRF → Rerank · 可选判断器</text>
+  </g>
+  <g stroke="#a7c7ff" stroke-width="4" fill="none" marker-end="url(#arrow)"><path d="M800 237 C900 237 900 340 1025 380"/><path d="M800 412 H1025"/><path d="M800 587 C900 587 900 480 1025 420"/></g>
+  <g filter="url(#glow)"><rect x="1025" y="315" width="285" height="170" rx="28" fill="url(#ctx)" opacity=".96"/></g>
+  <rect x="1040" y="330" width="255" height="140" rx="20" fill="#101a44" stroke="#dbeafe" stroke-width="2"/>
+  <text x="1167" y="375" text-anchor="middle" fill="#fff" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="700">上下文包</text>
+  <text x="1167" y="407" text-anchor="middle" fill="#c7d7ff" font-family="Inter,Arial,sans-serif" font-size="16">有界 · 了解来源</text>
+  <text x="1167" y="434" text-anchor="middle" fill="#c7d7ff" font-family="Inter,Arial,sans-serif" font-size="16">回执支撑 · 任务局部</text>
+  <path d="M1310 400H1360" stroke="#fff" stroke-width="4" marker-end="url(#arrow)"/>
+  <text x="1360" y="445" text-anchor="end" fill="#fff" font-family="Inter,Arial,sans-serif" font-size="19" font-weight="600">Agent 执行</text>
+</svg>

@@ -361,3 +361,5 @@ async def test_store_owned_fold_merges_bounds_like_the_sql_path():
     assert record.occurred_end == LATE
     assert record.mentioned_at == LATE
     assert record.created_at == EARLY, "fields the fold does not own are preserved"
+    assert record.metadata["independent_user_evidence"] == "false"
+    assert record.metadata["statement_kind"] == "derived_observation"

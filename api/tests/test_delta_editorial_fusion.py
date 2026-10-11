@@ -96,6 +96,14 @@ and tax prep for people whose income is irregular.
 class TestDeltaEditorialFusion:
     """Real-LLM test verifying delta mode correctly fuses two documents."""
 
+    @pytest.fixture(autouse=True)
+    def english_style_contract(self, monkeypatch):
+        from evolving_profile_api.config import clear_config_cache
+        monkeypatch.setenv("EVOLVING_PROFILE_API_LLM_OUTPUT_LANGUAGE", "English")
+        clear_config_cache()
+        yield
+        clear_config_cache()
+
     async def test_delta_fuses_seo_and_brand_voice(
         self,
         memory_real_llm: MemoryEngine,

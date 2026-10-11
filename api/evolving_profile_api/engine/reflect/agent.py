@@ -8,6 +8,7 @@ Uses hierarchical retrieval:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -88,6 +89,38 @@ class ReflectToolCallError(RuntimeError):
     surfacing raw tool-call JSON as the answer -- we fail loudly so the caller can
     switch to a tool-calling-capable model/transport.
     """
+
+
+class ReflectRetrievalUnavailableError(RuntimeError):
+    """Required retrieval failed before any source lookup could complete."""
+
+    def __init__(self, category: str = "retrieval_unavailable", *, retryable: bool = True):
+        self.category = category
+        self.retryable = retryable
+        super().__init__("Retrieval unavailable: required source lookups did not complete.")
+
+
+def _safe_retrieval_failure(error: Exception) -> tuple[str, bool]:
+    if _is_context_overflow_error(error):
+        return "retrieval_context_overflow", False
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and 400 <= status < 500 and status != 429:
+        return "retrieval_configuration_error", False
+    if isinstance(error, (ValueError, TypeError, PermissionError)):
+        return "retrieval_invalid_request", False
+    return "retrieval_unavailable", True
+
+
+def _public_retrieval_error(output: dict[str, Any]) -> dict[str, Any]:
+    """Keep actual source rows while replacing diagnostic payloads with a safe envelope."""
+    return {
+        "error": output.get("error") if output.get("error") in {
+            "retrieval_unavailable", "retrieval_context_overflow", "retrieval_configuration_error", "retrieval_invalid_request"
+        } else "retrieval_unavailable",
+        "message": "The source lookup could not complete.",
+        "retryable": output.get("retryable") is not False,
+        **{key:output[key] for key in ("memories", "observations", "mental_models", "results") if isinstance(output.get(key), list)},
+    }
 
 
 def _normalize_tool_name(name: str) -> str:
@@ -614,6 +647,8 @@ async def _run_reflect_agent_inner(
     tool_trace_summary: list[dict[str, Any]] = []
     llm_trace: list[dict[str, Any]] = []
     context_history: list[dict[str, Any]] = []  # For final prompt fallback
+    retrieval_errors: list[tuple[str, bool]] = []
+    completed_retrievals = 0
 
     # Token usage tracking - accumulate across all LLM calls.
     # cached_tokens and thoughts_tokens are surfaced for cost attribution
@@ -628,6 +663,17 @@ async def _run_reflect_agent_inner(
     available_memory_ids: set[str] = set()
     available_mental_model_ids: set[str] = set()
     available_observation_ids: set[str] = set()
+
+    def _raise_if_retrieval_unavailable() -> None:
+        history_tools = {"search_mental_models", "search_observations", "recall", "expand"}
+        if (
+            completed_retrievals == 0
+            and not (available_memory_ids or available_mental_model_ids or available_observation_ids)
+            and enabled_tools & history_tools
+            and (has_mental_models or include_observations or include_recall)
+        ):
+            category, retryable = retrieval_errors[-1] if retrieval_errors else ("required_retrieval_not_completed", False)
+            raise ReflectRetrievalUnavailableError(category, retryable=retryable)
 
     def _get_llm_trace() -> list[LLMCall]:
         return [
@@ -714,6 +760,7 @@ async def _run_reflect_agent_inner(
         hundreds of citations the synthesis model never saw (#3122).
         """
         nonlocal total_input_tokens, total_output_tokens, total_cached_tokens, total_thoughts_tokens
+        _raise_if_retrieval_unavailable()
         final_system = build_final_system_prompt(bank_profile.get("mission"), llm_output_language, directives)
         chunks = split_context_history(context_history, max_context_tokens)
         # Every call below uses the transport-level cap, never the caller's
@@ -783,6 +830,49 @@ async def _run_reflect_agent_inner(
             usage=_get_usage(),
             directives_applied=directives_applied,
         )
+
+    done_repair_attempted = False
+
+    async def _finish_done_call(done_call: "LLMToolCall", iterations_completed: int) -> ReflectAgentResult:
+        nonlocal done_repair_attempted, total_input_tokens, total_output_tokens, total_cached_tokens, total_thoughts_tokens
+
+        async def finish(call: "LLMToolCall") -> ReflectAgentResult:
+            return await _process_done_tool(
+                call, available_memory_ids, available_mental_model_ids, available_observation_ids,
+                iterations_completed, total_tools_called, tool_trace, _get_llm_trace(), _get_usage(),
+                _log_completion, reflect_id, directives_applied=directives_applied,
+                llm_config=llm_config, response_schema=response_schema, max_tokens=max_tokens,
+            )
+
+        try:
+            return await finish(done_call)
+        except ReflectNoAnswerError:
+            if done_repair_attempted:
+                raise
+            done_repair_attempted = True
+            messages.append({"role":"assistant", "tool_calls":[_tool_call_to_dict(done_call)]})
+            messages.append({"role":"tool", "tool_call_id":done_call.id, "content":json.dumps({
+                "error":"invalid_done_arguments",
+                "message":"Re-emit done once with valid complete JSON and a non-empty answer or required structured document. Use the source evidence already retrieved.",
+            })})
+            started = time.time()
+            try:
+                repaired = await llm_config.call_with_tools(
+                    messages=messages, tools=tools, scope="reflect_done_repair", tool_choice=LLMToolChoice.named("done"),
+                )
+            except Exception as error:
+                fingerprint = hashlib.sha256(str(error).encode()).hexdigest()[:16]
+                logger.warning("Reflect done repair failed: type=%s hash=%s", type(error).__name__, fingerprint)
+                raise ReflectNoAnswerError("Reflect's done repair returned no answer.") from error
+            total_input_tokens += repaired.input_tokens
+            total_output_tokens += repaired.output_tokens
+            total_cached_tokens += getattr(repaired, "cached_tokens", 0) or 0
+            total_thoughts_tokens += getattr(repaired, "thoughts_tokens", 0) or 0
+            llm_trace.append({"scope":"done_repair", "duration_ms":int((time.time()-started)*1000)})
+            repaired_done = next((call for call in repaired.tool_calls if _is_done_tool(call.name)), None)
+            if repaired_done is None:
+                raise ReflectNoAnswerError("Reflect's done repair returned no answer.")
+            return await finish(repaired_done)
 
     consecutive_errors = 0
     # When a forced ``search_mental_models`` returns fresh, usable models on a
@@ -890,7 +980,9 @@ async def _run_reflect_agent_inner(
         except Exception as e:
             err_duration = int((time.time() - llm_start) * 1000)
             consecutive_errors += 1
-            logger.warning(f"[REFLECT {reflect_id}] LLM error on iteration {iteration + 1}: {e} ({err_duration}ms)")
+            retrieval_errors.append(_safe_retrieval_failure(e))
+            fingerprint = hashlib.sha256(str(e).encode()).hexdigest()[:16]
+            logger.warning(f"[REFLECT {reflect_id}] LLM error on iteration {iteration + 1}: type={type(e).__name__} hash={fingerprint} ({err_duration}ms)")
             llm_trace.append({"scope": f"agent_{iteration + 1}_err", "duration_ms": err_duration})
             has_gathered_evidence = (
                 bool(available_memory_ids) or bool(available_mental_model_ids) or bool(available_observation_ids)
@@ -920,13 +1012,9 @@ async def _run_reflect_agent_inner(
             # done()-payload with sibling id fields leaking into user-visible text.
             # Fail loudly instead so the caller picks a tool-calling-capable model.
             if not saw_tool_call:
-                snippet = (result.content or "").strip()
-                if len(snippet) > 500:
-                    snippet = snippet[:500] + "..."
-                detail = f" Response: {snippet!r}" if snippet else " The model returned no content."
                 raise ReflectToolCallError(
                     f"Reflect requires a tool-calling model, but {llm_config.provider}/{llm_config.model} "
-                    f"produced no usable tool call (the transport may not support function calling)." + detail
+                    "produced no usable tool call (the transport may not support function calling)."
                 )
             # Model tool-called earlier and is now stopping: fall through to a clean
             # forced final synthesis (tools disabled, prose expected).
@@ -974,23 +1062,8 @@ async def _run_reflect_agent_inner(
             with tracer.start_as_current_span(span_name) as span:
                 span.set_attribute("hindsight.scope", "reflect_tool_call")
                 span.set_attribute("hindsight.operation", "reflect_tool_call")
-                return await _process_done_tool(
-                    done_call,
-                    available_memory_ids,
-                    available_mental_model_ids,
-                    available_observation_ids,
-                    iteration + 1,
-                    total_tools_called,
-                    tool_trace,
-                    _get_llm_trace(),
-                    _get_usage(),
-                    _log_completion,
-                    reflect_id,
-                    directives_applied=directives_applied,
-                    llm_config=llm_config,
-                    response_schema=response_schema,
-                    max_tokens=max_tokens,
-                )
+                _raise_if_retrieval_unavailable()
+                return await _finish_done_call(done_call, iteration + 1)
 
         # Execute other tools in parallel (exclude done tool in all its format variants)
         other_tools = [tc for tc in result.tool_calls if not _is_done_tool(tc.name)]
@@ -1061,8 +1134,10 @@ async def _run_reflect_agent_inner(
             for tc, result_data in zip(other_tools, tool_results):
                 if isinstance(result_data, Exception):
                     # Tool execution failed - send error back to LLM so it can try again
-                    logger.warning(f"[REFLECT {reflect_id}] Tool {tc.name} failed with exception: {result_data}")
-                    output = {"error": f"Tool execution failed: {result_data}"}
+                    fingerprint = hashlib.sha256(str(result_data).encode()).hexdigest()[:16]
+                    logger.warning(f"[REFLECT {reflect_id}] Tool callback failed: type={type(result_data).__name__} hash={fingerprint}")
+                    category, retryable = _safe_retrieval_failure(result_data)
+                    output = {"error": category, "retryable": retryable}
                     duration_ms = 0
                 else:
                     output, duration_ms = result_data
@@ -1072,9 +1147,39 @@ async def _run_reflect_agent_inner(
 
                 # Check if tool returned an error response - log but continue (LLM will see the error)
                 if isinstance(output, dict) and "error" in output:
-                    logger.warning(
-                        f"[REFLECT {reflect_id}] Tool {normalized_tool_name} returned error: {output['error']}"
-                    )
+                    output = _public_retrieval_error(output)
+                    if normalized_tool_name in {"search_mental_models", "search_observations", "recall", "expand"}:
+                        retrieval_errors.append((output["error"], output["retryable"]))
+                else:
+                    result_key = {
+                        "search_mental_models": "mental_models", "search_observations": "observations",
+                        "recall": "memories", "expand": "results",
+                    }.get(normalized_tool_name)
+                    if result_key and normalized_tool_name != "expand" and isinstance(output, dict) and isinstance(output.get(result_key), list):
+                        completed_retrievals += 1
+                if normalized_tool_name == "expand" and isinstance(output, dict) and isinstance(output.get("results"), list):
+                    safe_rows = []
+                    valid_rows = 0
+                    failed_rows = False
+                    for row in output["results"]:
+                        if not isinstance(row, dict):
+                            continue
+                        if row.get("error"):
+                            failed_rows = True
+                            safe_rows.append({"memory_id":row.get("memory_id"), **_public_retrieval_error(row)})
+                            retrieval_errors.append(("retrieval_unavailable", True))
+                            continue
+                        safe_rows.append({key:row[key] for key in ("memory_id", "memory", "chunk", "document") if key in row})
+                        memory = row.get("memory")
+                        if (isinstance(memory, dict) and memory.get("id") == row.get("memory_id")
+                                and isinstance(memory.get("text"), str) and memory["text"]):
+                            available_memory_ids.add(memory["id"])
+                            valid_rows += 1
+                    if not output["results"] or valid_rows:
+                        completed_retrievals += 1
+                    output = {"results":safe_rows, "count":len(safe_rows)}
+                    if failed_rows:
+                        output.update({"error":"retrieval_unavailable", "message":"Some source lookups could not complete.", "retryable":True})
 
                 # Track available IDs from tool results (only for successful responses)
                 if (

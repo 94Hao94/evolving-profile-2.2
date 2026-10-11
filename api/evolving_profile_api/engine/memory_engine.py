@@ -11078,6 +11078,8 @@ class MemoryEngine(MemoryEngineInterface):
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         group: bool = False,
+        include_content: bool = True,
+        count_only: bool = False,
         limit: int = 50,
         offset: int = 0,
     ) -> LLMRequestListResponse | None:
@@ -11146,6 +11148,9 @@ class MemoryEngine(MemoryEngineInterface):
         where_sql = " AND ".join(where_clauses)
         table = fq_table("llm_requests")
         cols = self._LLM_REQUEST_COLUMNS
+        if not include_content:
+            cols = ", ".join("NULL AS " + col if col in {"input", "output"} else col
+                             for col in (part.strip() for part in cols.split(",")))
 
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
@@ -11157,6 +11162,8 @@ class MemoryEngine(MemoryEngineInterface):
                     *params,
                 )
                 total = count_row["total"] if count_row else 0
+                if count_only:
+                    return LLMRequestListResponse(bank_id=bank_id, total=total, limit=limit, offset=offset, items=[])
                 # Page of runs, most-recently-active first.
                 key_rows = await conn.fetch(
                     f"""
@@ -11185,6 +11192,8 @@ class MemoryEngine(MemoryEngineInterface):
             else:
                 count_row = await conn.fetchrow(f"SELECT COUNT(*) AS total FROM {table} WHERE {where_sql}", *params)
                 total = count_row["total"] if count_row else 0
+                if count_only:
+                    return LLMRequestListResponse(bank_id=bank_id, total=total, limit=limit, offset=offset, items=[])
                 rows = await conn.fetch(
                     f"""
                     SELECT {cols} FROM {table}

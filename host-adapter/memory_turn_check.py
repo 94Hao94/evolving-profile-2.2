@@ -13,13 +13,34 @@ NATIVE_PREFLIGHT_POLICY=('原生委派回合的记忆前置流程：在实质最
     '若尚未收到本回合check_id，省略该参数；支持的新宿主PreToolUse会按实际session/turn和原生发生自动绑定，不需要先读取Bank或read_preference。多条消息无法唯一绑定时按返回的真实ID分别处理。'
     '需要历史则继续recall/research并携带该ID；自足问题可说明not_needed，不为数量强行检索。不要沿用旧回合ID，不要等Stop后补录。'
     '使用宿主实际暴露的Evolving Profile（EP）MCP工具；宿主提供functions.exec时允许调用tools中的真实函数。枚举不是检索回执，独立脚本或HTTP探针不是宿主工具回执。工具不存在时不要求Stop补录；自足问题正常作答，仅在影响证据或调试时说明不可用。用户明确禁止工具时遵守。当前Prompt和更高优先级指令优先。')
-TOOLS={'mcp__evolving_profile_controller__recall','mcp__evolving_profile_controller__research','mcp__evolving_profile_controller__read_research',
+TOOLS={'mcp__evolving_profile_controller__user_recall','mcp__evolving_profile_controller__user_research','mcp__evolving_profile_controller__read_research',
        'mcp__evolving_profile_controller__find_sources','mcp__evolving_profile_controller__read_source',
-       'mcp__evolving_profile_controller__get_preference','mcp__evolving_profile_controller__audit_thread_history'}
+       'mcp__evolving_profile_controller__user_preference','mcp__evolving_profile_controller__agent_recall','mcp__evolving_profile_controller__agent_research','mcp__evolving_profile_controller__read_agent_process_memory','mcp__evolving_profile_controller__audit_thread_history'}
+TOOLS |= {'mcp__evolving_profile_controller__search_scenario_summary','mcp__evolving_profile_controller__search_scenario_contexts',
+          'mcp__evolving_profile_controller__read_scenario_summary','mcp__evolving_profile_controller__read_context_summary',
+          'mcp__evolving_profile_controller__scenario_gate'}
 _CODEX_MEMORY_PATH=re.compile(
     r'''(?<![A-Za-z0-9_.])(?:/(?:[^/\s"'`,;{}]+/)+\.codex/memories(?:/[^\s"'`,;{}]*)?|(?:~|\$HOME|\$\{HOME\})/\.codex/memories(?:/[^\s"'`,;{}]*)?)''',
     re.IGNORECASE,
 )
+_AGENT_PROCESS_MARKERS=(
+    '智能体过程','Agent过程','Agent 过程','过程记忆','过程经验','执行经验','执行路径','工具链经验',
+    '踩坑','失败与修复','失败后修复','调试路径','回归经验','解决步骤','可复用过程','过程策略',
+    '怎么解决过','之前如何执行','过去如何执行','反复遇到','走过的弯路','修复模式','修复过程','修复步骤','历史修复','修复经验','Agent过去','Agent 过去','Agent采用过',
+)
+_AGENT_RESEARCH_MARKERS=('跨任务','跨项目','跨会话','模型迁移','工具迁移','重复失败','根因模式','泛化','迁移评估')
+
+def process_memory_route_hint(full_prompt):
+    """Return an explicit process-memory route hint without performing retrieval."""
+    text=str(full_prompt or '')
+    if not any(marker.casefold() in text.casefold() for marker in _AGENT_PROCESS_MARKERS):
+        return {'required': False, 'primary_tool': None, 'escalation_tool': None, 'reason': '未检测到Agent过程经验信号'}
+    cross=any(marker.casefold() in text.casefold() for marker in _AGENT_RESEARCH_MARKERS)
+    primary='agent_research' if cross else 'agent_recall'
+    escalation='agent_research' if primary=='agent_recall' else None
+    return {'required': True, 'primary_tool': primary, 'escalation_tool': escalation,
+            'reason': '当前问题涉及Agent过去的失败、修复、执行路径或过程策略；不得用User Research替代Agent Process Memory。',
+            'boundary': '这是路由提示，不是检索回执；候选仍需当前Agent判断和验证。'}
 
 def _root(root):return Path(root) if root is not None else Path(os.environ.get('HINDSIGHT_TURN_CHECK_ROOT',str(ROOT)))
 def _db(root):
@@ -85,9 +106,54 @@ def retrieval_preflight(hook,root=None):
         decl=c.execute("SELECT payload FROM observations WHERE check_id=? AND kind='declaration' ORDER BY id DESC LIMIT 1",(cid,)).fetchone() if row else None
         allowed=bool(decl and json.loads(decl[0]).get('need')=='required')
         if allowed:
+            declaration = json.loads(decl[0]) if decl else {}
+            process_route = process_memory_route_hint(declaration.get('full_prompt') or json.loads(row['payload']).get('raw_prompt', ''))
+            # When a Prompt explicitly asks about Agent execution experience,
+            # do not let User Research silently replace the process-memory
+            # lane.  User Research remains allowed immediately after the
+            # required Agent Recall/Research call, so both lanes can coexist.
+            if process_route.get('required') and name.endswith('user_research'):
+                prior = []
+                for observed in c.execute("SELECT payload FROM observations WHERE kind='tool' AND session=? AND turn=? ORDER BY id", (session, turn)):
+                    try: prior.append(json.loads(observed[0]))
+                    except (ValueError, TypeError): continue
+                process_called = any(str(item.get('tool') or '').endswith(('agent_recall', 'agent_research')) and not item.get('failed') for item in prior)
+                if not process_called:
+                    reason = ('当前问题包含Agent过程经验信号；请先调用 ' + str(process_route.get('primary_tool') or 'agent_recall') +
+                              '，再按需调用 user_research。两条路线可以同时使用，但User Research不能替代Agent Process Memory。')
+                    _add(c, 'process_route_block', session, turn, cid, {'required_tool': process_route.get('primary_tool'), 'attempted_tool': name, 'reason': reason}, (session+':'+turn+':process-route:'+call) if call else None)
+                    c.commit()
+                    return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}
+            # Agent Recall/Research can surface multiple Session/Project
+            # scopes.  Resolve that context before reading source or merging
+            # another research branch; a failed scenario tool is a truthful
+            # degraded fallback, not a deadlock.
+            observations = []
+            for observed in c.execute("SELECT payload FROM observations WHERE kind='tool' AND session=? AND turn=? ORDER BY id", (session, turn)):
+                try: observations.append(json.loads(observed[0]))
+                except (ValueError, TypeError): continue
+            scenario_required = any(item.get('scenario_required') for item in observations)
+            scenario_tools = {'search_scenario_summary', 'search_scenario_contexts', 'read_scenario_summary', 'read_context_summary', 'scenario_gate'}
+            scenario_attempted = any(str(item.get('tool') or '').split('__')[-1] in scenario_tools for item in observations)
+            scenario_failed = any(str(item.get('tool') or '').split('__')[-1] in scenario_tools and item.get('failed') for item in observations)
+            blocked_before_scope = {'read_source', 'find_sources', 'user_research', 'agent_research', 'read_research'}
+            short_name = str(name).split('__')[-1]
+            process_id = str(args.get('memory_id') or args.get('process_memory_id') or '').strip()
+            if short_name == 'read_source' and (process_id.startswith('pm_') or process_id.startswith('skill_') or process_id.startswith('pattern_')):
+                reason = ('这是 Agent 过程记忆 ID，不属于用户事实 Bank；请改用 read_agent_process_memory。'
+                          'read_source 仅用于 User Memory 的事实、经历或原文证据。')
+                _add(c, 'readback_route_block', session, turn, cid, {'attempted_tool': name, 'process_memory_id': process_id, 'required_tool': 'read_agent_process_memory', 'reason': reason}, (session+':'+turn+':readback-route:'+call) if call else None)
+                c.commit()
+                return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}
+            if scenario_required and not scenario_attempted and not scenario_failed and short_name in blocked_before_scope:
+                reason = ('Agent 过程候选的 Session/Project 范围尚未核对；请先调用 search_scenario_summary 或 read_scenario_summary。'
+                          '情景工具失败时会降级为 unknown，但不能在范围未确认时直接合并来源或读取原文。')
+                _add(c, 'scenario_route_block', session, turn, cid, {'required': True, 'attempted_tool': name, 'reason': reason}, (session+':'+turn+':scenario-route:'+call) if call else None)
+                c.commit()
+                return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny', 'permissionDecisionReason': reason}}
             output={'hookEventName':'PreToolUse','permissionDecision':'allow'}
             effective=args.get('query')
-            if name in {'mcp__evolving_profile_controller__recall','mcp__evolving_profile_controller__research'} and isinstance(effective,str):
+            if name in {'mcp__evolving_profile_controller__user_recall','mcp__evolving_profile_controller__user_research','mcp__evolving_profile_controller__agent_recall','mcp__evolving_profile_controller__agent_research'} and isinstance(effective,str):
                 bound_query={'original_prompt':json.loads(row['payload']).get('raw_prompt',''),'agent_full_prompt':json.loads(decl[0])['full_prompt'],'search_question':effective}
                 effective=json.dumps(bound_query,ensure_ascii=False)
                 output['updatedInput']=dict(args,query=effective)
@@ -163,8 +229,12 @@ def declare(check_id,full_prompt,need,reason,root=None):
         original=json.loads(row['payload']).get('raw_prompt','')
         _add(c,'declaration',row['session'],row['turn'],check_id,{'full_prompt':full_prompt,'need':need,'reason':reason,'actor':'agent_declaration_not_execution','original_prompt':original,'policy_version':POLICY_VERSION,'semantic_alignment':'not_verified'});c.commit()
     finally:c.close()
-    return {'mode':'memory_check_declaration','check_id':check_id,'need':need,'execution_verified':False,'original_prompt':original,'agent_full_prompt':full_prompt,'semantic_alignment':'not_verified','policy_version':POLICY_VERSION,
-            'next_action':'Use recall/research with this check_id when required; declaration does not perform retrieval.'}
+    process_route=process_memory_route_hint(full_prompt)
+    next_action='Use recall/research with this check_id when required; declaration does not perform retrieval.'
+    if process_route['required']:
+        next_action=f"先调用{process_route['primary_tool']}；若候选不足、跨任务比较或存在迁移问题，再调用{process_route['escalation_tool'] or 'agent_research'}。不要用user_research替代Agent过程记忆检索。"
+    return {'mode':'memory_check_declaration','check_id':check_id,'need':need,'execution_verified':False,'original_prompt':original,'agent_full_prompt':full_prompt,'semantic_alignment':'not_verified','policy_version':POLICY_VERSION,'process_memory_route':process_route,
+            'next_action':next_action}
 
 def observe_tool(hook,root=None):
     name=hook.get('tool_name');session=hook.get('session_id');turn=hook.get('turn_id');call=hook.get('tool_use_id') or hook.get('tool_call_id')
@@ -185,7 +255,7 @@ def observe_tool(hook,root=None):
                     _add(c,'declaration_receipt',session,turn,ack['check_id'],{'adapter_version':ack.get('adapter_version'),'call_id':call,'boundary':'host_PostToolUse_declaration_response'},session+':'+turn+':'+call);c.commit()
             finally:c.close()
         return
-    ids=[];recognized=False;more=False;versions=[]
+    ids=[];recognized=False;more=False;versions=[];scenario_required=False;scenario_next_tool=None;scenario_ids=[]
     if not failed:
         for block in response.get('content',[]):
             if block.get('type')!='text':continue
@@ -193,6 +263,11 @@ def observe_tool(hook,root=None):
             except (ValueError,TypeError):continue
             if not isinstance(v,dict):continue
             if v.get('adapter_version'):versions.append(v['adapter_version'])
+            followup=v.get('scenario_followup') if isinstance(v.get('scenario_followup'),dict) else {}
+            if followup:
+                scenario_required = scenario_required or bool(followup.get('required'))
+                scenario_next_tool = scenario_next_tool or followup.get('next_tool')
+                scenario_ids += [str(item.get('scenario_id')) for item in (followup.get('scenarios') or []) if isinstance(item,dict) and item.get('scenario_id')]
             if v.get('mode')=='official_discovery_evidence_only':
                 recognized=True;ids += [m['id'] for m in v.get('memories',[]) if m.get('id') and m.get('state')=='valid']
             elif 'source' in v and v.get('memory',{}).get('id'):
@@ -206,6 +281,7 @@ def observe_tool(hook,root=None):
         if cid and (not row or row['session']!=session or row['turn']!=turn):cid=None
         _add(c,'tool',session,turn,cid,{'tool':name,'call_id':call,'query':args.get('query'),'failed':failed,
             'response_recognized':recognized,'record_ids':list(dict.fromkeys(ids)),'has_more':more,'adapter_versions':list(dict.fromkeys(versions)),
+            'scenario_required':scenario_required,'scenario_next_tool':scenario_next_tool,'scenario_ids':list(dict.fromkeys(scenario_ids)),
             'boundary':'host_PostToolUse_not_model_attention'},session+':'+turn+':'+call);c.commit()
     finally:c.close()
 
@@ -238,6 +314,31 @@ def completion_gate(hook,enabled=False,root=None):
         _add(c,'completion_gate',session,turn,None,{'missing_check_ids':missing,'decision':'block_once','reason':reason},key);c.commit()
         return {'decision':'block','reason':reason}
     finally:c.close()
+
+
+def scenario_completion_gate(hook, enabled=False, root=None):
+    """Block one premature Stop when process-memory scope requires a scenario read."""
+    session, turn = hook.get('session_id'), hook.get('turn_id')
+    if not enabled or not session or not turn or hook.get('stop_hook_active'):
+        return {}
+    c = _db(root)
+    try:
+        observations = []
+        for row in c.execute("SELECT payload FROM observations WHERE kind='tool' AND session=? AND turn=? ORDER BY id", (session, turn)):
+            try: observations.append(json.loads(row[0]))
+            except (ValueError, TypeError): continue
+        required = any(item.get('scenario_required') for item in observations)
+        scenario_tools = {'search_scenario_summary', 'search_scenario_contexts', 'read_scenario_summary', 'read_context_summary', 'scenario_gate'}
+        scenario_calls = [item for item in observations if str(item.get('tool') or '').split('__')[-1] in scenario_tools]
+        if not required or scenario_calls or c.execute('SELECT 1 FROM observations WHERE key=?', ('scenario-completion-gate:'+session+':'+turn,)).fetchone():
+            return {}
+        reason = ('本轮 Agent 过程候选存在未解决的 Session/Project 范围。结束回答前必须先调用 search_scenario_summary、read_scenario_summary 或 scenario_gate；'
+                  '本次只阻止一次，情景工具失败后可降级为 unknown 并继续回答。')
+        _add(c, 'scenario_completion_gate', session, turn, None, {'decision': 'block_once', 'reason': reason, 'required': True}, 'scenario-completion-gate:'+session+':'+turn)
+        c.commit()
+        return {'decision': 'block', 'reason': reason}
+    finally:
+        c.close()
 
 def is_recorded_completion_prompt(text,root=None):
     """Exclude only our exact recorded protocol text, not arbitrary lookalikes."""

@@ -2443,7 +2443,7 @@ class TestBuildResponseModel:
 
         result = await _consolidate_batch_with_llm(
             llm_config=llm_config,
-            memories=[{"id": "fact-0", "text": "a fact"}],
+            memories=[{"id": f"fact-{index}", "text": f"a fact {index}"} for index in range(3)],
             union_observations=[],
             union_source_facts={},
             config=config,
@@ -2452,7 +2452,16 @@ class TestBuildResponseModel:
         )
 
         response_model = llm_config.call.await_args.kwargs["response_format"]
-        assert response_model is _ConsolidationBatchResponse
+        from pydantic import ValidationError
+
+        assert issubclass(response_model, _ConsolidationBatchResponse)
+        assert "maxItems" not in response_model.model_json_schema()["properties"]["creates"]
+        # Bedrock-compatible schemas omit maxItems, while the batch-bound model
+        # still rejects foreign evidence and the runtime retains its hard cap.
+        assert len(response_model.model_validate({"creates": [c.model_dump() for c in creates]}).creates) == 3
+        with pytest.raises(ValidationError):
+            response_model.model_validate({"creates": [{"text": "unsupported", "source_fact_ids": ["foreign"]}]})
+        assert not result.failed
         assert len(result.creates) == expected_creates
 
 

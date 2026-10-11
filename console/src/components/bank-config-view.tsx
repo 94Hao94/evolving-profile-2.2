@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect, useRef, useMemo, type ReactNode } from "react";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
@@ -356,7 +358,7 @@ export function BankConfigView() {
   }, [bankId]);
 
   const loadAll = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
     setLoading(true);
     try {
       const [configResp, profileResp] = await Promise.all([
@@ -388,7 +390,7 @@ export function BankConfigView() {
   };
 
   const saveRetain = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
     setRetainSaving(true);
     setRetainError(null);
     try {
@@ -397,13 +399,14 @@ export function BankConfigView() {
       setBaseConfig((prev) => ({ ...prev, ...payload }));
     } catch (err: any) {
       setRetainError(err.message || t("retainFailedToSave"));
+      throw err;
     } finally {
       setRetainSaving(false);
     }
   };
 
   const saveObservations = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
     setObservationsSaving(true);
     setObservationsError(null);
     try {
@@ -411,13 +414,14 @@ export function BankConfigView() {
       setBaseConfig((prev) => ({ ...prev, ...observationsEdits }));
     } catch (err: any) {
       setObservationsError(err.message || t("observationsFailedToSave"));
+      throw err;
     } finally {
       setObservationsSaving(false);
     }
   };
 
   const saveReflect = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
     setReflectSaving(true);
     setReflectError(null);
     try {
@@ -430,13 +434,14 @@ export function BankConfigView() {
       setBaseProfile(reflectEdits);
     } catch (err: any) {
       setReflectError(err.message || t("reflectFailedToSave"));
+      throw err;
     } finally {
       setReflectSaving(false);
     }
   };
 
   const saveMCP = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
     setMcpSaving(true);
     setMcpError(null);
     try {
@@ -444,13 +449,14 @@ export function BankConfigView() {
       setBaseConfig((prev) => ({ ...prev, ...mcpEdits }));
     } catch (err: any) {
       setMcpError(err.message || t("mcpFailedToSave"));
+      throw err;
     } finally {
       setMcpSaving(false);
     }
   };
 
   const saveGemini = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
     setGeminiSaving(true);
     setGeminiError(null);
     try {
@@ -458,6 +464,7 @@ export function BankConfigView() {
       setBaseConfig((prev) => ({ ...prev, ...geminiEdits }));
     } catch (err: any) {
       setGeminiError(err.message || t("geminiFailedToSave"));
+      throw err;
     } finally {
       setGeminiSaving(false);
     }
@@ -505,6 +512,7 @@ export function BankConfigView() {
           dirty={retainDirty}
           saving={retainSaving}
           onSave={saveRetain}
+          resetKey={JSON.stringify({ retainEdits, strategiesEdits })}
         >
           <FieldRow label={t("defaultStrategyLabel")} description={t("defaultStrategyDescription")}>
             <Select
@@ -549,6 +557,7 @@ export function BankConfigView() {
           dirty={observationsDirty}
           saving={observationsSaving}
           onSave={saveObservations}
+          resetKey={JSON.stringify(observationsEdits)}
         >
           <FieldRow
             label={t("enableObservationsLabel")}
@@ -655,6 +664,7 @@ export function BankConfigView() {
           dirty={reflectDirty}
           saving={reflectSaving}
           onSave={saveReflect}
+          resetKey={JSON.stringify(reflectEdits)}
         >
           <TextareaRow
             label={t("missionLabel")}
@@ -698,6 +708,7 @@ export function BankConfigView() {
           dirty={mcpDirty}
           saving={mcpSaving}
           onSave={saveMCP}
+          resetKey={JSON.stringify(mcpEdits)}
         >
           <FieldRow label={t("restrictToolsLabel")} description={t("restrictToolsDescription")}>
             <div className="flex items-center gap-2 justify-end">
@@ -730,6 +741,7 @@ export function BankConfigView() {
           dirty={geminiDirty}
           saving={geminiSaving}
           onSave={saveGemini}
+          resetKey={JSON.stringify(geminiEdits)}
         >
           {/* Gemini subsection */}
           <div className="px-6 py-4 space-y-4">
@@ -1194,6 +1206,7 @@ function ConfigSection({
   dirty,
   saving,
   onSave,
+  resetKey,
 }: {
   title: string;
   description: string;
@@ -1201,7 +1214,8 @@ function ConfigSection({
   error: string | null;
   dirty: boolean;
   saving: boolean;
-  onSave: () => void;
+  onSave: () => Promise<unknown>;
+  resetKey: string;
 }) {
   const t = useTranslations("bankConfig");
   return (
@@ -1221,7 +1235,7 @@ function ConfigSection({
           </div>
         )}
         <div className="px-6 py-4 flex justify-end border-t border-border/40">
-          <Button size="sm" disabled={!dirty || saving} onClick={onSave}>
+          <ActionButton resetKey={resetKey} size="sm" disabled={!dirty || saving} onAction={onSave}>
             {saving ? (
               <>
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
@@ -1230,7 +1244,7 @@ function ConfigSection({
             ) : (
               t("saveChanges")
             )}
-          </Button>
+          </ActionButton>
         </div>
       </Card>
     </section>

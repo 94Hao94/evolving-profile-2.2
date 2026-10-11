@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { TagList } from "@/components/ui/tag-list";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { ObservationHistoryView, type HistoryEntry } from "@/components/observation-history-view";
 import { InvalidateMemoryDialog } from "@/components/invalidate-memory-dialog";
 import { EditMemoryForm, type EditMemoryFields } from "@/components/edit-memory-form";
@@ -73,6 +74,7 @@ export function MemoryDetailModal({
   const [memory, setMemory] = useState<MemoryDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [curating, setCurating] = useState(false);
+  const [restoredMemoryId, setRestoredMemoryId] = useState<string | null>(null);
   const [askingReason, setAskingReason] = useState(false);
   const [editingText, setEditingText] = useState(false);
   const [savingText, setSavingText] = useState(false);
@@ -121,7 +123,7 @@ export function MemoryDetailModal({
 
   // Invalidate / restore this fact (world/experience only).
   const handleCurate = async (nextState: "valid" | "invalidated", reason?: string) => {
-    if (!memory || !currentBank || curating) return;
+    if (!memory || !currentBank || curating) return false;
     setCurating(true);
     try {
       await client.updateMemory(memory.id, currentBank, {
@@ -130,10 +132,11 @@ export function MemoryDetailModal({
       });
       const data = await client.getMemory(memory.id, currentBank);
       setMemory(data);
-      setAskingReason(false);
+      if (nextState === "valid") setRestoredMemoryId(memory.id);
       onChanged?.();
     } catch (err) {
       console.error("Failed to curate memory:", err);
+      throw err;
     } finally {
       setCurating(false);
     }
@@ -142,7 +145,7 @@ export function MemoryDetailModal({
   // Edit this fact's text (world/experience only). Re-embeds + re-derives its
   // observations server-side; the previous text is kept in history.
   const handleSaveEdit = async (fields: EditMemoryFields) => {
-    if (!memory || !currentBank || savingText) return;
+    if (!memory || !currentBank || savingText) return false;
     setSavingText(true);
     try {
       await client.updateMemory(memory.id, currentBank, {
@@ -155,10 +158,10 @@ export function MemoryDetailModal({
       });
       const data = await client.getMemory(memory.id, currentBank);
       setMemory(data);
-      setEditingText(false);
       onChanged?.();
     } catch (err) {
       console.error("Failed to edit memory:", err);
+      throw err;
     } finally {
       setSavingText(false);
     }
@@ -287,7 +290,7 @@ export function MemoryDetailModal({
                       <div className="text-xs font-bold text-muted-foreground uppercase mb-2">
                         {t("sectionText")}
                       </div>
-                      <p className="text-sm text-foreground leading-relaxed">{memory.text}</p>
+                      <p data-i18n-ignore="true" className="text-sm text-foreground leading-relaxed">{memory.text}</p>
                     </div>
 
                     {/* Dates */}
@@ -399,7 +402,7 @@ export function MemoryDetailModal({
                                   {t("sourceMemoryViewButton")}
                                 </Button>
                               </div>
-                              <p className="text-sm text-foreground mb-2">{source.text}</p>
+                              <p data-i18n-ignore="true" className="text-sm text-foreground mb-2">{source.text}</p>
                               {source.context && (
                                 <p className="text-xs text-muted-foreground mb-2 italic">
                                   {t("sourceContextPrefix", { context: source.context })}
@@ -535,7 +538,7 @@ export function MemoryDetailModal({
                               </Button>
                             )}
                           </div>
-                          <p className="text-sm text-foreground leading-relaxed">{memory.text}</p>
+                          <p data-i18n-ignore="true" className="text-sm text-foreground leading-relaxed">{memory.text}</p>
                         </div>
 
                         {/* Curation: invalidate / restore (raw facts only) */}
@@ -545,22 +548,24 @@ export function MemoryDetailModal({
                               {tCuration("curationActions")}
                             </div>
                             <div className="flex items-center gap-2">
-                              {memory.state === "invalidated" ? (
+                              {memory.state === "invalidated" || restoredMemoryId === memory.id ? (
                                 <>
-                                  <Button
+                                  <ActionButton
                                     variant="secondary"
                                     size="sm"
-                                    disabled={curating}
-                                    onClick={() => handleCurate("valid")}
+                                    resetKey={memory.id}
+                                    disabled={curating || memory.state !== "invalidated"}
+                                    onAction={() => handleCurate("valid")}
                                   >
                                     <RotateCcw className="h-4 w-4 mr-1.5" />
                                     {tCuration("curationRevert")}
-                                  </Button>
-                                  <span className="inline-flex items-center rounded-full bg-muted text-muted-foreground px-2 py-0.5 text-xs font-medium">
+                                  </ActionButton>
+                                  {memory.state === "invalidated" && <span className="inline-flex items-center rounded-full bg-muted text-muted-foreground px-2 py-0.5 text-xs font-medium">
                                     {tCuration("curationStateInvalidated")}
-                                  </span>
+                                  </span>}
                                 </>
-                              ) : (
+                              ) : null}
+                              {memory.state !== "invalidated" && (
                                 <Button
                                   variant="destructive"
                                   size="sm"
@@ -836,7 +841,7 @@ export function MemoryDetailModal({
         open={askingReason}
         onOpenChange={setAskingReason}
         onConfirm={(reason) => handleCurate("invalidated", reason)}
-        busy={curating}
+        busy={curating || memory?.state === "invalidated"}
       />
     </>
   );

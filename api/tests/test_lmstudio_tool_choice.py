@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from openai import APIStatusError
+from openai.types import CompletionUsage
 
 from evolving_profile_api.engine.llm_interface import LLM_TOOL_CHOICE_REQUIRED, LLMToolChoice
 from evolving_profile_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
@@ -104,12 +105,13 @@ def _make_tool_call_response(tool_name: str, arguments: dict) -> MagicMock:
     mock_tc.function.arguments = json.dumps(arguments)
 
     mock_response = MagicMock()
-    mock_response.usage.prompt_tokens = 120
-    mock_response.usage.completion_tokens = 40
-    mock_response.usage.total_tokens = 160
-    # Explicit None: an auto-MagicMock here is truthy, so the reasoning-token
-    # accounting (#2378) would do arithmetic on a MagicMock and crash.
-    mock_response.usage.completion_tokens_details = None
+    mock_response.usage = CompletionUsage(
+        prompt_tokens=120,
+        completion_tokens=40,
+        total_tokens=160,
+        prompt_tokens_details=None,
+        completion_tokens_details=None,
+    )
     mock_response.choices[0].finish_reason = "tool_calls"
     mock_response.choices[0].message.content = None
     mock_response.choices[0].message.tool_calls = [mock_tc]

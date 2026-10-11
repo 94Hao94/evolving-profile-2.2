@@ -17,6 +17,35 @@ THREAD_ID = "01a0c6a2-8e59-7e23-b595-15917157a2ca"
 
 
 class ScenarioSourceTest(unittest.TestCase):
+    def test_native_app_page_context_is_audited_metadata_not_a_human_message(self):
+        with tempfile.TemporaryDirectory() as root:
+            path=self._source(root)
+            lines=path.read_text().splitlines()
+            meta=json.loads(lines[2]); meta['payload']['content'][0]['text']='<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>'
+            lines.insert(2,json.dumps(meta))
+            path.write_text('\n'.join(lines)+'\n')
+            result=scenario_source.read_session_source(THREAD_ID,root,max_chars=1000)
+            self.assertEqual([row['text'] for row in result['messages']],['先按一周统计','已列出一周事项','改成全部历史'])
+            self.assertEqual(len(result['context_metadata_exclusions']),1)
+            excluded=result['context_metadata_exclusions'][0]
+            self.assertEqual(excluded['original_role'],'user')
+            self.assertEqual(excluded['fact_authority'],'none')
+            self.assertTrue(excluded['raw_line_sha256'])
+            self.assertEqual(result['source_record_coverage']['excluded_context_metadata_count'],1)
+            original_revision=result['source_revision']
+            meta['payload']['content'][0]['text']='<external_codex_apps_open_page>{"page_id":"changed-page"}</external_codex_apps_open_page>'
+            lines[2]=json.dumps(meta); path.write_text('\n'.join(lines)+'\n')
+            changed=scenario_source.read_session_source(THREAD_ID,root,max_chars=1000)
+            self.assertNotEqual(changed['source_revision'],original_revision)
+
+    def test_quoted_app_context_mention_remains_human_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            path=self._source(root); lines=path.read_text().splitlines(); row=json.loads(lines[2])
+            text='请解释这个文字示例："<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"'
+            row['payload']['content'][0]['text']=text; lines[2]=json.dumps(row); path.write_text('\n'.join(lines)+'\n')
+            result=scenario_source.read_session_source(THREAD_ID,root,max_chars=1000)
+            self.assertEqual(result['messages'][0]['text'],text)
+
     def _source(self, root):
         path = Path(root) / "2026" / "09" / "26" / f"rollout-2026-09-26T10-00-00-{THREAD_ID}.jsonl"
         path.parent.mkdir(parents=True)

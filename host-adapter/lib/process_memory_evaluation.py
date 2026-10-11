@@ -1,4 +1,4 @@
-"""Deterministic A/B and transfer-gate helpers for EP5.0 evaluation."""
+"""Deterministic A/B and transfer-gate helpers for EP5.1 evaluation."""
 from __future__ import annotations
 
 from statistics import mean

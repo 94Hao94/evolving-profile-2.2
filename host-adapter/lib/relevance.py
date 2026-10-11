@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 # Bump whenever admission semantics change.  Controller-side cached decisions
 # from an older policy must never silently cross the Hook boundary.
-POLICY = "v15_guidance_source_isolation"
+POLICY = "v17_weak_background_subject_boundary"
 
 WEAK_TERMS = {
     "这个", "那个", "这些", "问题", "什么", "怎么", "如何", "为什么", "是不是",
@@ -1225,7 +1225,7 @@ def concrete_artifact_scope_alignment(query: str, text: str) -> dict[str, Any]:
 
 
 _PATH_SCOPE_GENERIC_COMPONENTS = {
-    "users", "user", "apple", "ep-test-user", "home", "documents", "downloads", "desktop",
+    "users", "user", "apple", "home", "documents", "downloads", "desktop",
     "projects", "project", "codex", "tmp", "var", "private", "work", "ag",
     "outputs", "output", "files", "file", "data", "src", "dist", "main",
 }
@@ -3612,6 +3612,65 @@ def admission_decision(
 
     if direct:
         reason += " 直接原话只证明来源真实性，不会绕过主题相关性检查。"
+    # Recall-first policy: preserve a weakly related candidate when it has at
+    # least one independent topic/relation signal (or a modest semantic score)
+    # so missing a useful memory costs more than carrying background context.
+    # This does not bypass hard source, scope, provenance, diagnostic, or
+    # explicit-conflict gates below; completely unrelated candidates remain
+    # rejected.  The strength is recorded for the UI/agent to treat as
+    # background rather than as a fact.
+    weak_related = False
+    weak_signal = bool(
+        # The subject alignment can contain grammatical common fragments
+        # rejected by _meaningful_current_anchor. Scores rank a relation;
+        # they cannot manufacture one after a structural boundary failed.
+        topical_hits or matched_concepts or alignment["relation_support"]
+    )
+    # A named endpoint occurring only in an explicit exclusion clause is
+    # evidence of non-membership, not a weaker positive membership claim.
+    # Reuse the current named-system projection and ordinary clause scope;
+    # no query/entity list is introduced into the fallback.
+    boundary_subjects = set(comparison_alignment.get("shared_systems") or []) | set(taxonomy_alignment.get("shared_systems") or [])
+    positive_scope_text = compact(" ".join(
+        clause for clause in re.split(r"[，,。！？!?；;\n]+", text)
+        if not re.search(r"未涉及|不涉及|不属于|未包含|不包含|无关|不相关", clause)
+    ))
+    excluded_named_subject = bool(
+        boundary_subjects
+        and (comparison_alignment["requested"] or taxonomy_alignment["requested"] or entity_fact_alignment["requested"])
+        and not any(compact(subject) in positive_scope_text for subject in boundary_subjects)
+    )
+    preference_scope_missing = bool(
+        preference_alignment["requested"] and preference_alignment["research_scoped"]
+        and len(preference_alignment["shared_anchors"]) < preference_alignment["minimum_shared_anchors"]
+        and not alignment["relation_support"]
+    )
+    if preference_scope_missing:
+        qualified = False
+        reason = "当前要求带选择边界的研究或实现路径；候选只重复单个模型/工具名，未建立方向、论文或实现关系，不能作为弱相关背景恢复。"
+    denied_structural_boundary = bool(
+        (operational_audit and cls != "raw_evidence" and not operational_alignment["qualified"])
+        or (audit_alignment["required"] and not audit_alignment["qualified"])
+        # Reuse the existing clause-aware positive/negated named anchors.
+        # An excluded endpoint or parent-name substring is not ownership.
+        or (entity_fact_alignment["requested"] and not entity_fact_alignment["shared_anchors"])
+        or excluded_named_subject
+        or preference_scope_missing
+    )
+    hard_block = bool(
+        denied_structural_boundary
+        or legacy_candidate_wrapper or diagnostic_artifact or named_target_missing or component_only_candidate
+        or (document_change_alignment["required"] and not document_change_alignment["passes"])
+        or (artifact_scope_alignment["requested"] and not artifact_scope_alignment["qualified"])
+        or (path_scope_alignment["requested"] and not path_scope_alignment["qualified"])
+        or (current_operation_alignment["requested"] and not current_operation_alignment["qualified"])
+        or (procurement_alignment["requested"] and not procurement_alignment["qualified"])
+        or (provenance_alignment["requested"] and cls != "raw_evidence" and not provenance_alignment["passes"] and not operational_audit)
+    )
+    if not qualified and weak_signal and not hard_block:
+        qualified = True
+        weak_related = True
+        reason = "召回优先策略：存在部分主题、关系或语义信号，作为弱相关背景候选保留；不作为已核实事实。"
     decision = "qualified" if qualified else "rejected"
     if not qualified and document_change_alignment["required"] and not document_change_alignment["passes"]:
         decision = "rejected_document_change_scope_mismatch"
@@ -3662,6 +3721,8 @@ def admission_decision(
         "query_concepts": sorted(query_concepts),
         "candidate_concepts": sorted(candidate_concepts),
         "matched_concepts": matched_concepts,
+        "relevance_strength": "weak" if weak_related else ("direct" if qualified else "none"),
+        "recall_first_policy": True,
         "proposition_alignment": alignment,
         "real_dialogue_alignment": real_dialogue,
         "recent_activity_alignment": recent_activity,

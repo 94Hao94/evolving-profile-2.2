@@ -354,6 +354,32 @@ async def test_retain_extract_json_parse_failure_keeps_usage(registered_recorder
     assert r.output_tokens == 18
     assert r.cached_tokens == 20
     assert r.total_tokens == 158
+    assert r.llm_info["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_length_error_trace_keeps_finish_reason_and_requested_format(registered_recorder):
+    from evolving_profile_api.engine.llm_interface import OutputTooLongError
+
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="gpt-4o-mini")
+    response = _openai_response_with_usage('{"fact": "a parseable prefix"}')
+    response.choices[0].finish_reason = "length"
+    llm._provider_impl._client.chat.completions.create = AsyncMock(return_value=response)
+    with pytest.raises(OutputTooLongError):
+        await llm.call(
+            messages=[{"role": "user", "content": "synthetic json"}],
+            response_format=_Extracted,
+            scope="consolidation",
+            max_retries=0,
+            strict_schema=True,
+            max_completion_tokens=4096,
+        )
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.llm_info["finish_reason"] == "length"
+    assert r.llm_info["request"]["max_completion_tokens"] == 4096
+    assert r.llm_info["request"]["response_format"] == "json_schema"
+    assert r.llm_info["request"]["strict_schema"] is True
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,2 @@
+// Exact locator from the private actual history-return sample, with no body.
+export const navigation = {memory_id:"08a12714-7b63-4635-a729-16072cd55140",document_id:"codex-batch-f45492d5abe8176901512734",chunk_id:"personal-memory_codex-batch-f45492d5abe8176901512734_1",source_revision:"31adc74c1a21663f9e44384e92e6e114e0f8f05f6b90d9130d38863854b735a8",subject_relation:"unverified",claim_verification:"not_performed",authority:"unverified_source_claim",next_action:{tool:"read_source",arguments:{memory_id:"08a12714-7b63-4635-a729-16072cd55140",scope:"chunk"}}};

@@ -1,12 +1,15 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useLocale } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { Calendar, List, Network, ScatterChart } from "lucide-react";
-import { Constellation } from "./constellation";
-import { Graph2D, type GraphData } from "./graph-2d";
-import { describeManualSourceCoverage } from "@/lib/context-node";
+import dynamic from "next/dynamic";
+import type { GraphData } from "./graph-2d";
+const Constellation = dynamic(() => import("./constellation").then(module => module.Constellation), { ssr:false });
+const Graph2D = dynamic(() => import("./graph-2d").then(module => module.Graph2D), { ssr:false });
+import { describeManualSourceCoverage, selectContextEpisode, summaryDisplayStatus, type AutomatedSourceCoverage, type ContextSourceOffset, type ScenarioProcessing } from "@/lib/context-node";
 
+import { useWindowedGraph } from "@/lib/use-windowed-graph";
 import { inlineUiText } from "@/lib/inline-i18n";
 type ContextNode = {
   id: string;
@@ -14,9 +17,17 @@ type ContextNode = {
   label: string;
   identityStatus?: string;
   status?: string;
+  processing?:ScenarioProcessing;
   reviewScope?: string;
   rawSourceCount?: number;
   sourceMessageCount?: number;
+  automatedSourceCoverage?: AutomatedSourceCoverage;
+  episodes?: ContextNode[];
+  episodeCount?: number;
+  sourceRevision?: string | null;
+  nodeVersion?: string;
+  sourceCount?: number;
+  summaryPage?: {offset:number;limit:number;total:number;nextOffset:number|null};
   manualSourceCoverage?: {
     scopeVerdict?: string;
     reviewedSourceMessageCount?: number;
@@ -25,6 +36,7 @@ type ContextNode = {
   summary?: Record<string, string>;
   summaryBudget?: Record<string, { truncated?: boolean; source_already_truncated?: boolean }>;
   sourceIds?: string[];
+  sourceOffsets?: ContextSourceOffset[];
   projectKey?: string;
   sessionIds?: string[];
 };
@@ -36,6 +48,8 @@ type ContextPayload = {
     status?: string;
     sessionCount: number;
     projectCount: number;
+    workspaceCount?: number;
+    verifiedProjectCount?: number;
     pendingReview?: number;
     qualityStatus?: string;
     graph?: {
@@ -64,6 +78,13 @@ const shortId = (value: string) =>
     .split(":")
     .map((part) => (part.length > 12 ? `…${part.slice(-8)}` : part))
     .join(":");
+export function ContextTableNodeButton({nodeId,role,onSelect}:{nodeId:string;role:"source"|"target";onSelect:()=>void}) {
+  const t=useTranslations("releaseUi");
+  const label=t(role==="source" ? "viewSourceNode" : "viewTargetNode");
+  return <button type="button" title={label} aria-label={`${label} ${shortId(nodeId)}`}
+    className="w-full text-left hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+    onClick={onSelect}>{shortId(nodeId)}</button>;
+}
 const relationName = (value: string) =>
   ({
     project_contains_session: inlineUiText("包含会话"),
@@ -85,20 +106,81 @@ const typeName = (type: string) =>
             ? inlineUiText("Bank 经历")
             : inlineUiText("Bank 记录");
 
-function ContextDetails({
-  node,
+export function ContextDetails({
+  node: rootNode,
   typeName,
+  remote,
 }: {
   node: ContextNode;
   typeName: (value: string) => string;
+  remote?: { bankId: string; version: string; onRefresh: () => void };
 }) {
   const [tier, setTier] = useState<"compact" | "standard" | "full">("compact");
-  const summary = node.summary?.[tier] || inlineUiText("当前节点没有可显示的摘要。");
-  const truncated = node.summaryBudget?.[tier]?.truncated || summary.endsWith("…");
+  const [episodeId,setEpisodeId]=useState("");
+  const [episodeChoices, setEpisodeChoices] = useState<ContextNode[]>([]);
+  const [episodeNext, setEpisodeNext] = useState<number | null>(null);
+  const [episodeOffset, setEpisodeOffset] = useState(0);
+  const [episodeError, setEpisodeError] = useState<string | null>(null);
+  const [episodeLoading,setEpisodeLoading] = useState(false);
+  const [detailResult, setDetailResult] = useState<{ key: string; node: ContextNode } | null>(null);
+  const [detailError, setDetailError] = useState<{ key: string; message: string } | null>(null);
+  const choices = remote ? episodeChoices : rootNode.episodes ?? [];
+  const selectedEpisodeId=choices.some(episode=>episode.id===episodeId) ? episodeId : "";
+  const selectedNodeVersion=selectedEpisodeId ? choices.find(episode=>episode.id===selectedEpisodeId)?.nodeVersion:rootNode.nodeVersion;
+  const detailKey = `${rootNode.id}:${selectedEpisodeId}:${tier}:${remote?.bankId}:${remote?.version}:${selectedNodeVersion}`;
+  const [textWindow,setTextWindow] = useState<{key:string;offset:number}>({key:"",offset:0});
+  const textOffset = textWindow.key===detailKey ? textWindow.offset : 0;
+  const loaded = !remote || detailResult?.key === detailKey;
+  const node = remote ? (detailResult?.key === detailKey ? detailResult.node : rootNode) : selectContextEpisode(rootNode,selectedEpisodeId);
+  const currentError = detailError?.key === detailKey ? detailError.message : null;
+  useEffect(() => {
+    if (!remote || !rootNode.episodeCount) return;
+    const controller = new AbortController();
+    const params = new URLSearchParams({ id:rootNode.id,bankId:remote.bankId,version:remote.version,offset:String(episodeOffset) });
+    if(rootNode.nodeVersion)params.set("nodeVersion",rootNode.nodeVersion);
+    setEpisodeError(null);
+    setEpisodeLoading(true);
+    void fetch(`/api/evolving-profile/scenario/episodes?${params}`, {cache:"no-store",signal:controller.signal}).then(async response => {
+      const value = await response.json();
+      if (!response.ok) throw new Error(response.status === 409 ? "stale" : "failed");
+      if (!controller.signal.aborted) { setEpisodeChoices(previous => episodeOffset ? [...previous,...value.items] : value.items); setEpisodeNext(value.page.nextOffset); }
+    }).catch(error => { if (!controller.signal.aborted) setEpisodeError(error.message); }).finally(()=>{if(!controller.signal.aborted)setEpisodeLoading(false);});
+    return () => controller.abort();
+  },[rootNode.id,rootNode.episodeCount,rootNode.nodeVersion,remote?.bankId,remote?.version,episodeOffset]);
+  useEffect(() => {
+    if (!remote) return;
+    const controller = new AbortController();
+    const params = new URLSearchParams({ id:rootNode.id,tier,bankId:remote.bankId,version:remote.version });
+    if(selectedNodeVersion)params.set("nodeVersion",selectedNodeVersion);
+    params.set("textOffset",String(textOffset));
+    if (selectedEpisodeId) params.set("episodeId",selectedEpisodeId);
+    if (rootNode.sourceRevision) params.set("sourceRevision",rootNode.sourceRevision);
+    void fetch(`/api/evolving-profile/scenario/detail?${params}`,{cache:"no-store",signal:controller.signal}).then(async response => {
+      const value=await response.json();
+      if (!response.ok) throw new Error(response.status === 409 ? "stale" : "failed");
+      if (!controller.signal.aborted) { setDetailResult(previous => ({key:detailKey,node:textOffset && previous?.key===detailKey ? {...value.node,summary:{[tier]:(previous.node.summary?.[tier] || "")+value.node.summary[tier]}} : value.node})); setDetailError(null); }
+    }).catch(error => { if (!controller.signal.aborted) setDetailError({key:detailKey,message:error.message}); });
+    return () => controller.abort();
+  },[rootNode.id,rootNode.sourceRevision,remote?.bankId,remote?.version,tier,selectedEpisodeId,selectedNodeVersion,detailKey,textOffset]);
+  const locale=useLocale();
+  const ui=(text:string)=>inlineUiText(text,locale);
+  const t=useTranslations("releaseUi");
+  const summary = remote && !loaded ? t(currentError ? (currentError === "stale" ? "scenarioStaleVersion" : "scenarioLoadError") : "scenarioLoading") : node.summary?.[tier] || ui("当前节点没有可显示的摘要。");
+  const displayStatus=summaryDisplayStatus(summary,node.summaryBudget?.[tier]);
   const unreviewed = node.status !== "model_reviewed";
-  const scopeCoverage = describeManualSourceCoverage(node.manualSourceCoverage, node.sourceMessageCount);
+  const scopeCoverage = describeManualSourceCoverage(node.manualSourceCoverage, node.sourceMessageCount,locale);
   return (
     <div className="mt-4 space-y-4 text-xs">
+      {choices.length ? <label className="block" htmlFor={`context-episode-${rootNode.id}`}>
+        <span>{t("scenarioEpisodeSelect")}</span>
+        <select id={`context-episode-${rootNode.id}`} className="mt-1 w-full rounded border bg-background px-2 py-1.5" value={selectedEpisodeId} onChange={event=>setEpisodeId(event.target.value)}>
+          <option value="">{t("scenarioSessionOverview")}</option>
+          {choices.map(episode=><option key={episode.id} value={episode.id}>{episode.label}</option>)}
+        </select>
+      </label> : null}
+      {remote && episodeLoading ? <p role="status">{t("scenarioLoading")}</p> : null}
+      {remote && episodeNext != null ? <button type="button" disabled={episodeLoading} className="rounded border px-2 py-1 disabled:opacity-40" onClick={() => setEpisodeOffset(episodeNext)}>{t("scenarioLoadMore")}</button> : null}
+      {remote && (currentError || episodeError) ? <div role="alert"><p>{t(currentError === "stale" || episodeError === "stale" ? "scenarioStaleVersion" : "scenarioLoadError")}</p><button type="button" onClick={remote.onRefresh} className="mt-1 rounded border px-2 py-1">{t("scenarioRefresh")}</button></div> : null}
       <div className="flex gap-1 rounded-lg bg-muted p-1">
         {(["compact", "standard", "full"] as const).map((value, index) => (
           <button
@@ -106,66 +188,82 @@ function ContextDetails({
             onClick={() => setTier(value)}
             className={`flex-1 rounded-md px-2 py-1.5 ${tier === value ? "bg-background font-medium shadow-sm" : "text-muted-foreground"}`}
           >
-            第 {index + 1} 层
+            {ui("层级")} {index + 1}
           </button>
         ))}
       </div>
       {node.type === "workspace" && (
-        <p className="text-amber-700">{inlineUiText("这只是相同工作目录的会话集合，不能据此认定为同一个项目。")}</p>
+        <p className="text-amber-700">{ui("这只是相同工作目录的会话集合，不能据此认定为同一个项目。")}</p>
       )}
-      {unreviewed && <p className="text-amber-700">{inlineUiText("确定性来源投影，尚未完成语义复核。")}</p>}
+      {loaded && node.processing ? <section role="status" className="space-y-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+        <p className="font-semibold">{t(`scenarioProcessing_${node.processing.state}`)}</p>
+        {node.processing.errorCode ? <p>{t("scenarioFailureCode")} <code className="break-all">{node.processing.errorCode}</code></p>:null}
+        {node.processing.reason ? <p>{t(node.processing.reason==="state_contract_violations" ? "scenarioFailureContract":"scenarioFailureCoverage")}</p>:null}
+        {node.processing.violations?.length ? <ul className="space-y-1 break-all">{node.processing.violations.slice(0,8).map((item,index)=><li key={index}><code>{item.field}</code>{item.actual!=null && item.maximum!=null ? ` · ${item.actual} / ${item.maximum}`:""}</li>)}</ul>:null}
+        {((node.processing.totalViolations ?? node.processing.violations?.length ?? 0)>8 || node.processing.truncated) ? <p>{t("scenarioFailureDetailsBounded")}</p>:null}
+        <p>{t("scenarioFailureBoundary")}</p>
+      </section>:null}
+      {unreviewed && !node.processing && node.status!=="episode_directory_ready" && <p className="text-amber-700">{ui("确定性来源投影，尚未完成语义复核。")}</p>}
+      {node.status==="episode_directory_ready" ? <p>{t("scenarioEpisodeDirectoryHint")}</p> : null}
+      {loaded && node.automatedSourceCoverage?.reviewTransport==="native_agent_review_not_provider_http" ? <p className="rounded border border-sky-200 bg-sky-50 p-2 text-sky-900 dark:bg-sky-950 dark:text-sky-100">{t("scenarioNativeReview")}</p>:null}
       {!unreviewed && node.reviewScope === "conversation_only_not_external_fact_verification" && (
-        <p className="text-emerald-700">{inlineUiText("已按会话原文复核摘要；文件、发送和外部事实未在此核验。")}</p>
+        <p className="text-emerald-700">{ui("已按会话原文复核摘要；文件、发送和外部事实未在此核验。")}</p>
       )}
       <div className="rounded-lg border bg-muted/30 p-3">
         <div className="mb-2 text-[11px] text-muted-foreground">
           {typeName(node.type)} ·{" "}
-          {tier === "compact" ? inlineUiText("概览") : tier === "standard" ? inlineUiText("标准摘要") : inlineUiText("详细摘要")}
-          {truncated ? inlineUiText(" · 已截断") : ""}
+          {tier === "compact" ? ui("概览") : tier === "standard" ? ui("标准摘要") : ui("详细摘要")}
+          {displayStatus==="budget_truncated" ? ` · ${t("summaryBudgetTruncated")}` : displayStatus==="preview_omitted" ? ` · ${t("summaryPreviewOmitted")}` : ""}
         </div>
-        <div className="max-h-[320px] overflow-y-scroll pr-2 [scrollbar-gutter:stable]"><p className="break-all whitespace-pre-wrap leading-5">{summary}</p></div>
+        <div className="max-h-[320px] overflow-y-scroll pr-2 [scrollbar-gutter:stable]"><p data-i18n-ignore="true" className="break-all whitespace-pre-wrap leading-5">{summary}</p></div>
       </div>
+      {remote && loaded && node.summaryPage && node.summaryPage.offset!==textOffset ? <p role="status">{t("scenarioLoading")}</p> : null}
+      {remote && loaded && node.summaryPage?.nextOffset != null ? <button type="button" disabled={node.summaryPage.offset!==textOffset} className="rounded border px-2 py-1 disabled:opacity-40" onClick={()=>setTextWindow({key:detailKey,offset:node.summaryPage!.nextOffset!})}>{t("scenarioLoadMore")}</button> : null}
       <dl className="grid grid-cols-[80px_1fr] gap-y-2">
-        <dt className="text-muted-foreground">{inlineUiText("节点名称")}</dt>
+        <dt className="text-muted-foreground">{ui("节点名称")}</dt>
         <dd className="break-all">{node.label}</dd>
         {node.type === "session" ? (
           <>
-            <dt className="text-muted-foreground">{inlineUiText("范围复核")}</dt>
-            <dd className="break-words">{scopeCoverage ?? inlineUiText("未记录")}</dd>
+            <dt className="text-muted-foreground">{ui("范围复核")}</dt>
+            <dd className="break-words" data-testid="context-source-coverage">
+              {scopeCoverage ?? (node.automatedSourceCoverage ? <>
+                {t(node.automatedSourceCoverage.status==="reviewed" ? "automatedSourceCoverageReviewed" : "automatedSourceCoverageUnverified")}
+                {node.automatedSourceCoverage.status==="reviewed" ? ` · ${node.automatedSourceCoverage.reviewedSourceMessageCount}/${node.sourceMessageCount ?? "—"}` : ""}
+              </> : ui("未记录"))}
+            </dd>
           </>
         ) : null}
-        <dt className="text-muted-foreground">{inlineUiText("来源数")}</dt>
-        <dd>{node.sourceIds?.length ?? 0}</dd>
-        <dt className="text-muted-foreground">{inlineUiText("来源定位")}</dt>
+        <dt className="text-muted-foreground">{ui("来源数")}</dt>
+        <dd>{remote && !loaded ? "—" : node.sourceCount ?? node.sourceIds?.length ?? 0}</dd>
+        <dt className="text-muted-foreground">{ui("来源定位")}</dt>
         <dd className="break-all font-mono text-[10px]">
-          {(node.sourceIds ?? []).slice(0, 3).join("、") || inlineUiText("无")}
+          {(node.sourceIds ?? []).slice(0, 3).join("、") || ui("无")}
+          {node.sourceOffsets?.length ? <div className="mt-1" data-testid="context-source-offsets" data-i18n-ignore="true">
+            {node.sourceOffsets.slice(0,3).map((offset,index)=><div key={`${offset.sourcePath}:${offset.byteOffset}:${index}`}>{(node.sourceIds?.length ?? 0)>1 ? `${offset.sourcePath} · ` : ""}byte_offset: {offset.byteOffset}{offset.messageId ? ` · message_id: ${offset.messageId}` : ""}</div>)}
+          </div> : null}
         </dd>
-        <dt className="text-muted-foreground">{inlineUiText("边界")}</dt>
-        <dd>{inlineUiText("来源定位是本机摘要路径，不是 Bank 的 read_source ID；关键事实仍需回到原始证据核验。")}</dd>
+        <dt className="text-muted-foreground">{ui("边界")}</dt>
+        <dd>{ui("来源定位是本机摘要路径，不是 Bank 的 read_source ID；关键事实仍需回到原始证据核验。")}</dd>
       </dl>
     </div>
   );
 }
 
 export function ContextMemoryView({ bankId }: { bankId: string | null }) {
+  const scenarioText=useTranslations("releaseUi");
   const locale = useLocale();
   const dateLocale = locale.startsWith("zh") ? locale : "en-US";
-  const [data, setData] = useState<ContextPayload | null>(null);
   const [viewMode, setViewMode] = useState<"constellation" | "graph" | "table" | "timeline">(
     "constellation"
   );
   const [selectedNode, setSelectedNode] = useState<ContextNode | null>(null);
   const detailsRef = useRef<HTMLElement | null>(null);
-  useEffect(() => {
-    if (!bankId) return;
-    fetch(`/api/evolving-profile/runtime?bankId=${encodeURIComponent(bankId)}`, {
-      cache: "no-store",
-    })
-      .then((r) => r.json())
-      .then(setData)
-      .catch(() => setData(null));
-  }, [bankId]);
-  const graph = data?.context?.graph;
+  const [queryDraft, setQueryDraft] = useState("");
+  const [query, setQuery] = useState("");
+  const windowed = useWindowedGraph("/api/evolving-profile/scenario/graph", new URLSearchParams({ bankId:bankId || "",q:query,mode:viewMode === "table" ? "relations" : viewMode === "timeline" ? "timeline" : "nodes" }).toString(),Boolean(bankId));
+  const data = windowed.data as (ContextPayload & { graph?: NonNullable<ContextPayload["context"]>["graph"]; version: string; page: { offset:number;total:number;indexedTotal:number;limit:number;nextOffset:number|null;unit?:string;edgesTruncated?:boolean } }) | null;
+  useEffect(() => { setSelectedNode(null); },[bankId,query,viewMode,data?.version,data?.page.offset]);
+  const graph = data?.graph;
   const edges = graph?.edges ?? [];
   const timeline = graph?.timeline ?? [];
   const visualData = useMemo<GraphData>(() => {
@@ -185,7 +283,6 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
       nodes,
       links: edges
         .filter((edge) => ids.has(edge.source) && ids.has(edge.target))
-        .slice(0, 360)
         .map((edge) => ({
           source: edge.source,
           target: edge.target,
@@ -214,9 +311,15 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
       rawSourceCount: meta.rawSourceCount,
       sourceMessageCount: meta.sourceMessageCount,
       manualSourceCoverage: meta.manualSourceCoverage,
+      automatedSourceCoverage:meta.automatedSourceCoverage,
+      episodes:meta.episodes,
+      episodeCount:meta.episodeCount,
+      sourceRevision:meta.sourceRevision,
+      nodeVersion:meta.nodeVersion,
       summary: meta.summary,
       summaryBudget: meta.summaryBudget,
       sourceIds: meta.sourceIds,
+      sourceOffsets:meta.sourceOffsets,
       projectKey: meta.projectKey,
       sessionIds: meta.sessionIds,
     });
@@ -241,7 +344,7 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
       <span className="hidden sm:inline">{label}</span>
     </button>
   );
-  if (data?.context?.status === "not_available_for_bank")
+  if (windowed.error === "scope" || data?.context?.status === "not_available_for_bank")
     return (
       <p className="py-8 text-sm text-muted-foreground">{inlineUiText("当前 Bank 尚未建立独立的情景摘要索引。")}</p>
     );
@@ -250,10 +353,10 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
       <div className="grid gap-3 sm:grid-cols-4">
         <div className="rounded-lg border p-4">
           <div className="text-xs text-muted-foreground">{inlineUiText("工作目录候选 · 非项目数")}</div>
-          <div className="mt-1 text-2xl font-semibold">{data?.context?.projectCount ?? "—"}</div>
+          <div className="mt-1 text-2xl font-semibold">{data?.context?.workspaceCount ?? data?.context?.projectCount ?? "—"}</div>
         </div>
         <div className="rounded-lg border p-4">
-          <div className="text-xs text-muted-foreground">{inlineUiText("Session Scenario Summary")}</div>
+          <div className="text-xs text-muted-foreground">{scenarioText("sessionScenarioEntries")}</div>
           <div className="mt-1 text-2xl font-semibold">{data?.context?.sessionCount ?? "—"}</div>
         </div>
         <div className="rounded-lg border p-4">
@@ -265,7 +368,21 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
           <div className="mt-1 text-2xl font-semibold">{graph?.bankRecordLinks.linked ?? "—"}</div>
         </div>
       </div>
+      <p className="text-xs text-muted-foreground">{scenarioText("scenarioEntryHint")}</p>
       <article className="rounded-lg border p-5">
+        <form className="mb-3 flex flex-wrap gap-2" onSubmit={event => {event.preventDefault();setSelectedNode(null);setQuery(queryDraft);}}>
+          <input aria-label={scenarioText("scenarioSearch")} placeholder={scenarioText("scenarioSearch")} value={queryDraft} onChange={event=>setQueryDraft(event.target.value)} className="min-w-0 flex-1 rounded border bg-background px-3 py-2 text-xs" />
+          <button type="submit" className="rounded border px-3 py-2 text-xs">{scenarioText("scenarioSearchAction")}</button>
+          <button type="button" onClick={()=>{setSelectedNode(null);windowed.refresh();}} className="rounded border px-3 py-2 text-xs">{scenarioText("scenarioRefresh")}</button>
+        </form>
+        {windowed.loading ? <p role="status" className="mb-3 text-xs">{scenarioText("scenarioLoading")}</p> : null}
+        {windowed.error ? <p role="alert" className="mb-3 text-xs text-amber-700">{scenarioText(windowed.error === "stale" ? "scenarioStaleVersion" : "scenarioLoadError")}</p> : null}
+        {data ? <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
+          <span>{scenarioText("scenarioSampleCount",{shown:viewMode === "table" ? edges.length : graph?.nodes.length ?? 0,total:data.page.total,indexed:data.page.indexedTotal,unit:scenarioText(viewMode === "table" ? "scenarioWindowRelations" : "scenarioWindowNodes")})}</span>
+          <button type="button" disabled={data.page.offset===0} className="rounded border px-2 py-1 disabled:opacity-40" onClick={()=>windowed.go(Math.max(0,data.page.offset-data.page.limit))}>{scenarioText("scenarioPrevious")}</button>
+          <button type="button" disabled={data.page.nextOffset==null} className="rounded border px-2 py-1 disabled:opacity-40" onClick={()=>{if(data.page.nextOffset!=null)windowed.go(data.page.nextOffset);}}>{scenarioText("scenarioNext")}</button>
+          <span>{scenarioText("scenarioEdgeWindow")}</span>
+        </div> : null}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold">
@@ -339,39 +456,29 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
                         className="border-t hover:bg-muted/60"
                       >
                         <td className="break-all p-2 font-mono">
-                          <button
-                            type="button"
-                            title={inlineUiText("查看来源节点")}
-                            aria-label={`查看来源节点 ${shortId(edge.source)}`}
-                            className="w-full text-left hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
-                            onClick={() =>
+                          <ContextTableNodeButton
+                            nodeId={edge.source} role="source"
+                            onSelect={() =>
                               selectNode({
                                 id: edge.source,
                                 group: edge.source.split(":")[0],
                                 label: edge.source,
                               })
                             }
-                          >
-                            {shortId(edge.source)}
-                          </button>
+                          />
                         </td>
                         <td className="p-2 text-muted-foreground">{relationName(edge.type)}</td>
                         <td className="break-all p-2 font-mono">
-                          <button
-                            type="button"
-                            title={inlineUiText("查看目标节点")}
-                            aria-label={`查看目标节点 ${shortId(edge.target)}`}
-                            className="w-full text-left hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
-                            onClick={() =>
+                          <ContextTableNodeButton
+                            nodeId={edge.target} role="target"
+                            onSelect={() =>
                               selectNode({
                                 id: edge.target,
                                 group: edge.target.split(":")[0],
                                 label: edge.target,
                               })
                             }
-                          >
-                            {shortId(edge.target)}
-                          </button>
+                          />
                         </td>
                       </tr>
                     ))}
@@ -424,11 +531,11 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
                       : inlineUiText("时间线说明")}
             </div>
             {selectedNode ? (
-              <ContextDetails node={selectedNode} typeName={typeName} />
+              <ContextDetails key={`${selectedNode.id}:${data?.version}`} node={selectedNode} typeName={typeName} remote={bankId && data ? {bankId,version:data.version,onRefresh:()=>{setSelectedNode(null);windowed.refresh();}} : undefined} />
             ) : (
               <div className="mt-4 space-y-3 text-xs leading-5 text-muted-foreground">
                 <p>{inlineUiText("点击图谱节点、表格中的来源或目标节点、时间线项目，详情显示在此处。")}</p>
-                <p>{inlineUiText("紫色是 Project，绿色是 Session，蓝色是 Bank 事实/经历/记录。")}</p>
+                <p>{scenarioText("workspaceLegendScope")}</p>
                 <p>
                   {inlineUiText("当前图谱展示")} {visualData.nodes.length} {inlineUiText("个样本节点，共")}{" "}
                   {graph?.bankRecordLinks.linked ?? 0} {inlineUiText("条 Bank 关联。")}
@@ -440,7 +547,7 @@ export function ContextMemoryView({ bankId }: { bankId: string | null }) {
         <p className="mt-3 text-xs text-muted-foreground">
           {inlineUiText("Bank 关联快照：")}
           {graph?.bankRecordLinks.available
-            ? `${graph.bankRecordLinks.linked} / ${graph.bankRecordLinks.scanned ?? inlineUiText("未知")} 条扫描记录（页面样本 ${graph.bankRecordLinks.sampled ?? 0} 条）`
+            ? `${graph.bankRecordLinks.linked} / ${graph.bankRecordLinks.scanned ?? inlineUiText("未知")} ${inlineUiText("条扫描记录（页面样本")} ${graph.bankRecordLinks.sampled ?? 0} ${inlineUiText("条）")}`
             : inlineUiText("尚无可用关联快照")}
           {inlineUiText("。当前 Bank 共")} {graph?.bankRecordLinks.liveTotal ?? inlineUiText("未知")} {inlineUiText("条，快照后新增")}{" "}
           {graph?.bankRecordLinks.unscanned ?? inlineUiText("未知")} {inlineUiText("条未扫描；快照时间")}{" "}

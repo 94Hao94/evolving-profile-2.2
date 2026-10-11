@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -7,6 +8,36 @@ from task_state import TaskStateStore
 
 
 class TaskStateStoreTest(unittest.TestCase):
+    def test_metadata_only_ingress_preserves_task_version_and_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            store=TaskStateStore(Path(root))
+            initial=store.record('s1','核验原生来源，不要部署','t1','h1',continuation=False)
+            state=store.record('s1','<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>','t2','h2',continuation=False)
+            self.assertEqual(state,initial)
+            self.assertEqual(store.load('s1'),initial)
+            empty=store.record('fresh','<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>','t3','h3',continuation=False)
+            self.assertEqual(empty,{})
+            self.assertIsNone(store.load('fresh'))
+
+    def test_mixed_metadata_keeps_real_user_directive_and_quote_is_a_task(self):
+        with tempfile.TemporaryDirectory() as root:
+            store=TaskStateStore(Path(root));page='<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>'
+            first=store.record('s1',page+'\n检查材料附件','t1','h1',continuation=False)
+            self.assertEqual(first['current_objective'],'检查材料附件')
+            quoted='解释这个示例：'+page
+            second=store.record('s1',quoted,'t2','h2',continuation=False)
+            self.assertEqual(second['current_objective'],quoted)
+
+    def test_new_human_turn_does_not_reuse_a_legacy_metadata_objective(self):
+        with tempfile.TemporaryDirectory() as root:
+            store=TaskStateStore(Path(root))
+            old=store.record('s1','old human task','t1','h1',continuation=False)
+            old['current_objective']='<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>'
+            store._path('s1').write_text(json.dumps(old))
+            resumed=store.record('s1','继续处理','t2','h2',continuation=True)
+            self.assertEqual(resumed['current_objective'],'继续处理')
+            self.assertIsNone(resumed['continuation_context'])
+            self.assertFalse(resumed['continuation'])
     def test_standalone_prompt_does_not_inherit_previous_topic(self):
         with tempfile.TemporaryDirectory() as root:
             store = TaskStateStore(Path(root))

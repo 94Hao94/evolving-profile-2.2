@@ -1,10 +1,11 @@
+import { epStatePath, EP_STATE_ROOT, EP_API_ENV, EP_HOST_SESSIONS } from "@/lib/ep-state-paths";
 import { NextResponse } from "next/server";
 import { mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { homedir } from "node:os";
 
-const stateRoot = process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(process.env.HOME ?? homedir(), ".evolving-profile");
+const stateRoot = EP_STATE_ROOT;
 const settingsPath = path.join(stateRoot, "config/guidance-settings.json");
 const defaults = { schema: "evolving-profile.guidance-settings.v1", max_candidates: 6, adaptive_budget: true, auto_probe: true, probe_max_tokens: 500 };
 

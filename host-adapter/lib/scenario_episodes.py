@@ -7,6 +7,31 @@ from .scenario_source import revision_for_messages
 
 EPISODE_BUNDLE_SCHEMA = "evolving-profile.scenario-episode-bundle.v1"
 MAX_EPISODES = 64
+DEFAULT_MAX_EPISODE_USER_MESSAGES = 4
+
+
+def deterministic_size_boundaries(source: dict, *, max_user_messages: int = DEFAULT_MAX_EPISODE_USER_MESSAGES) -> list[str]:
+    """Return safe user-message boundaries for long Sessions.
+
+    This is a transport/coverage guard, not a semantic claim that the task
+    changed. It never splits two user messages from the same host turn and
+    leaves semantic boundary decisions to the model for all other positions.
+    """
+    if type(max_user_messages) is not int or max_user_messages < 1:
+        raise ValueError("scenario_episode_size_limit_invalid")
+    messages=source.get("messages") if isinstance(source,dict) else None
+    if not isinstance(messages,list): raise ValueError("scenario_source_incomplete")
+    user_seen=0; boundaries=[]; pending=False
+    for index,row in enumerate(messages):
+        if not isinstance(row,dict) or row.get("role")!="user": continue
+        if pending:
+            prior=messages[index-1] if index else {}
+            if prior.get("turn_id")!=row.get("turn_id") or not prior.get("turn_id"):
+                boundaries.append(row["evidence_id"]); pending=False; user_seen=0
+        user_seen+=1
+        if user_seen>=max_user_messages:
+            pending=True
+    return list(dict.fromkeys(boundaries))
 
 
 def episode_id_for(session_id: str, start_message_id: str) -> str:
@@ -114,11 +139,13 @@ def validate_episode_bundle(source: dict, bundle: dict) -> dict:
     for row in decisions:
         decision, method = row.get("decision"), row.get("method")
         if (not isinstance(decision, str) or decision not in {"new_episode", "same_episode", "uncertain"}
-                or not isinstance(method, str) or method not in {"model_boundary_review", "same_turn_join"}):
+                or not isinstance(method, str) or method not in {"model_boundary_review", "same_turn_join", "deterministic_size_boundary"}):
             raise ValueError("scenario_episode_decision_invalid")
         if decision == "uncertain":
             raise ValueError("scenario_episode_boundary_unresolved")
-        if method == "same_turn_join" and decision != "same_episode":
+        if method in {"same_turn_join"} and decision != "same_episode":
+            raise ValueError("scenario_episode_decision_invalid")
+        if method == "deterministic_size_boundary" and decision != "new_episode":
             raise ValueError("scenario_episode_decision_invalid")
         normalized_decisions.append({"message_id": row["message_id"], "decision": decision,
                                      "method": method})

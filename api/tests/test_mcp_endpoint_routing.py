@@ -35,7 +35,6 @@ async def test_mcp_endpoint_routing_integration(memory):
             async with streamable_http_client("http://test/mcp/", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -66,7 +65,6 @@ async def test_mcp_endpoint_routing_integration(memory):
             async with streamable_http_client("http://test/mcp/test-bank/", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -110,7 +108,6 @@ async def test_mcp_no_trailing_slash_works(memory):
             async with streamable_http_client("http://test/mcp", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -126,7 +123,6 @@ async def test_mcp_no_trailing_slash_works(memory):
             async with streamable_http_client("http://test/mcp/my-bank", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -155,7 +151,6 @@ async def test_mcp_tool_execution_through_client(memory):
             async with streamable_http_client("http://test/mcp/", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -190,7 +185,6 @@ async def test_mcp_mental_model_validation_through_client(memory):
             async with streamable_http_client("http://test/mcp/", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -236,7 +230,6 @@ async def test_mcp_bank_named_sse_routes_to_single_bank(memory):
             async with streamable_http_client("http://test/mcp/sse/", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -272,7 +265,6 @@ async def test_mcp_bank_named_messages_routes_to_single_bank(memory):
             async with streamable_http_client("http://test/mcp/messages/", http_client=http_client) as (
                 read_stream,
                 write_stream,
-                _,
             ):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -318,7 +310,6 @@ async def test_mcp_tool_execution_with_different_mcp_and_tenant_tokens(memory):
                 async with streamable_http_client("http://test/mcp/", http_client=http_client) as (
                     read_stream,
                     write_stream,
-                    _,
                 ):
                     async with ClientSession(read_stream, write_stream) as session:
                         await session.initialize()

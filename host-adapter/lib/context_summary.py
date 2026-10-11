@@ -16,13 +16,55 @@ from pathlib import Path
 from typing import Iterable
 import re
 import hashlib
+import fcntl
+import threading
+from contextlib import contextmanager
+from functools import wraps
+
+
+_INDEX_LOCKS = {}
+_INDEX_LOCKS_GUARD = threading.Lock()
+_INDEX_ACTIVE = threading.local()
+
+
+@contextmanager
+def context_index_lock(path):
+    """Serialize whole index transactions across workers/processes."""
+    key = str(Path(path).expanduser().resolve())
+    with _INDEX_LOCKS_GUARD:
+        mutex = _INDEX_LOCKS.setdefault(key, threading.RLock())
+    with mutex:
+        active = getattr(_INDEX_ACTIVE, 'paths', None)
+        if active is None:
+            active = set(); _INDEX_ACTIVE.paths = active
+        if key in active:
+            yield
+            return
+        target = Path(key); target.parent.mkdir(parents=True, exist_ok=True)
+        with target.with_suffix(target.suffix + '.lock').open('a+') as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX); active.add(key)
+            try:
+                yield
+            finally:
+                active.remove(key); fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _serialize_index_write(method):
+    @wraps(method)
+    def wrapped(path, *args, **kwargs):
+        with context_index_lock(path):
+            return method(path, *args, **kwargs)
+    return wrapped
 
 
 BUDGETS = {
     "session": {
         "compact": {"max_chars": 500, "max_tokens": 400},
-        "standard": {"max_chars": 1200, "max_tokens": 900},
-        "full": {"max_chars": 4000, "max_tokens": 3000},
+        "standard": {"max_chars": 5000, "max_tokens": 3000},
+        # Long Sessions can contain many explicit user constraints. Keep
+        # compact/standard cheap, but give the source-linked full tier enough
+        # room to preserve them without silently truncating conditions.
+        "full": {"max_chars": 12000, "max_tokens": 7000},
     },
     "project": {
         "compact": {"max_chars": 800, "max_tokens": 600},
@@ -178,11 +220,13 @@ def build_project_context(project_key: str, sessions: Iterable[dict], updated_at
     }
 
 
-def write_context_index(path: str | os.PathLike, sessions: Iterable[dict], projects: Iterable[dict]) -> dict:
+@_serialize_index_write
+def write_context_index(path: str | os.PathLike, sessions: Iterable[dict], projects: Iterable[dict], *, _preserved_metadata=None) -> dict:
     """Atomically write the derived index; raw source files are untouched."""
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        **(_preserved_metadata or {}),
         "schema": SCHEMA,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "sessions": list(sessions),
@@ -206,6 +250,22 @@ def write_context_index(path: str | os.PathLike, sessions: Iterable[dict], proje
     return {"ok": True, "path": str(target), "session_count": len(payload["sessions"]), "project_count": len(payload["projects"])}
 
 
+def update_context_index(path, transform):
+    """Read/transform/write one latest snapshot without dropping unrelated rows.
+
+    Explicit rebuild callers continue to use write_context_index replacement.
+    A transform executes under the same lock and may reject a changed source row.
+    """
+    with context_index_lock(path):
+        current = read_context_index(path)
+        if current.get('status', '').startswith('unavailable_') and Path(path).exists():
+            raise ValueError('context_index_unavailable_for_update')
+        changed = transform(current)
+        if not isinstance(changed, dict) or not isinstance(changed.get('sessions'), list) or not isinstance(changed.get('projects'), list):
+            raise ValueError('context_index_update_invalid')
+        return write_context_index(path, changed['sessions'], changed['projects'], _preserved_metadata=changed)
+
+
 def read_context_index(path: str | os.PathLike) -> dict:
     target = Path(path).expanduser()
     if not target.is_file():
@@ -214,8 +274,18 @@ def read_context_index(path: str | os.PathLike) -> dict:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {"schema": SCHEMA, "status": "unavailable_invalid_index", "sessions": [], "projects": []}
-    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
+    if not isinstance(payload, dict):
         return {"schema": SCHEMA, "status": "unavailable_schema_mismatch", "sessions": [], "projects": []}
+    # Older local indexes may predate the schema marker.  Preserve their
+    # navigation-only session/project rows while marking the source as a
+    # legacy projection; this does not promote summaries to facts.
+    if payload.get("schema") not in (None, SCHEMA):
+        return {"schema": SCHEMA, "status": "unavailable_schema_mismatch", "sessions": [], "projects": []}
+    if payload.get("schema") is None and not isinstance(payload.get("sessions"), list) and not isinstance(payload.get("projects"), list):
+        return {"schema": SCHEMA, "status": "unavailable_schema_mismatch", "sessions": [], "projects": []}
+    if payload.get("schema") is None:
+        payload["schema"] = SCHEMA
+        payload["status"] = "legacy_ready"
     payload.setdefault("status", "ready")
     payload.setdefault("sessions", [])
     payload.setdefault("projects", [])

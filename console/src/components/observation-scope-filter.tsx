@@ -105,7 +105,7 @@ export function ObservationScopeFilter({ scopes, value, onChange }: ObservationS
         </Button>
       </PopoverTrigger>
       <PopoverContent
-        className="w-[min(22rem,var(--radix-popover-content-available-width))] p-0"
+        className="w-full max-w-sm p-0"
         align="start"
       >
         <Command

@@ -24,12 +24,14 @@ import { ContextMemoryView } from "@/components/context-memory-view";
 import { FlowView } from "@/components/flow-view";
 import { AuditLogsView } from "@/components/audit-logs-view";
 import { LLMRequestsView } from "@/components/llm-requests-view";
+import { MemoryQualityEngineView } from "@/components/memory-quality-engine-view";
 import { FeatureNotEnabled } from "@/components/feature-not-enabled";
 import { useFeatures } from "@/lib/features-context";
 import { useBank } from "@/lib/bank-context";
 import { bankRoute } from "@/lib/bank-url";
 import { client } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { ActionButton, ActionMenuItem } from "@/components/ui/action-button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -62,7 +64,7 @@ import { LlmHealthDialog } from "@/components/llm-health-dialog";
 import { ExtractDialog } from "@/components/extract-dialog";
 
 import { inlineUiText, setInlineLocale } from "@/lib/inline-i18n";
-type NavItem = "recall" | "data" | "documents" | "agent-memory" | "flow" | "profile";
+type NavItem = "recall" | "data" | "documents" | "agent-memory" | "flow" | "quality" | "profile";
 type BankConfigTab =
   | "general"
   | "data"
@@ -85,6 +87,7 @@ export default function BankPage() {
   const locale = useLocale();
   setInlineLocale(locale);
   const tCommon = useTranslations("common");
+  const tAction = useTranslations("actionFeedback");
   const { features } = useFeatures();
   const { currentBank: bankId, setCurrentBank, loadBanks } = useBank();
 
@@ -129,7 +132,7 @@ export default function BankPage() {
   };
 
   const handleDeleteBank = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
 
     setIsDeleting(true);
     try {
@@ -139,64 +142,62 @@ export default function BankPage() {
       await loadBanks();
       router.push("/");
     } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setIsDeleting(false);
     }
   };
 
   const handleClearObservations = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
 
     setIsClearingObservations(true);
     try {
       const result = await client.clearObservations(bankId);
-      setShowClearObservationsDialog(false);
       toast.success(t("observationsCleared"), {
         description: result.message || t("observationsClearedDefault"),
       });
     } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setIsClearingObservations(false);
     }
   };
 
   const handleResetConfig = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
     setIsResettingConfig(true);
     try {
       await client.resetBankConfig(bankId);
-      setShowResetConfigDialog(false);
-    } catch {
-      // Error toast shown by API client interceptor
+    } catch (error) {
+      throw error;
     } finally {
       setIsResettingConfig(false);
     }
   };
 
   const handleTriggerConsolidation = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
 
     setIsConsolidating(true);
     try {
       await client.triggerConsolidation(bankId);
     } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setIsConsolidating(false);
     }
   };
 
   const handleRecoverConsolidation = async () => {
-    if (!bankId) return;
+    if (!bankId) return false;
 
     setIsRecoveringConsolidation(true);
     try {
       const result = await client.recoverConsolidation(bankId);
       toast.success(t("recoveredMemories", { count: result.retried_count }));
     } catch (error) {
-      // Error toast is shown automatically by the API client interceptor
+      throw error;
     } finally {
       setIsRecoveringConsolidation(false);
     }
@@ -229,22 +230,22 @@ export default function BankPage() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" className="w-48">
-                      <DropdownMenuItem
-                        onClick={async () => {
-                          if (!bankId) return;
+                      <ActionMenuItem
+                        onAction={async () => {
+                          if (!bankId) return false;
                           try {
                             const manifest = await client.exportBankTemplate(bankId);
                             const json = JSON.stringify(manifest, null, 2);
                             await navigator.clipboard.writeText(json);
                             toast.success(t("templateCopied"));
-                          } catch {
-                            toast.error(t("failedToExportTemplate"));
+                          } catch (error) {
+                            throw error;
                           }
                         }}
                       >
                         <Download className="w-4 h-4 mr-2" />
                         {t("exportTemplate")}
-                      </DropdownMenuItem>
+                      </ActionMenuItem>
                       <DropdownMenuItem onClick={() => setShowExtractDialog(true)}>
                         <FlaskConical className="w-4 h-4 mr-2" />
                         {t("dryRunExtraction")}
@@ -256,8 +257,9 @@ export default function BankPage() {
                         </DropdownMenuItem>
                       )}
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        onClick={handleTriggerConsolidation}
+                      <ActionMenuItem
+                        onAction={handleTriggerConsolidation}
+                        successLabel={tAction("submitted")}
                         disabled={isConsolidating || !observationsEnabled}
                         title={
                           !observationsEnabled ? "Observations feature is not enabled" : undefined
@@ -272,9 +274,10 @@ export default function BankPage() {
                         {!observationsEnabled && (
                           <span className="ml-auto text-xs text-muted-foreground">Off</span>
                         )}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onClick={handleRecoverConsolidation}
+                      </ActionMenuItem>
+                      <ActionMenuItem
+                        onAction={handleRecoverConsolidation}
+                        successLabel={tAction("submitted")}
                         disabled={isRecoveringConsolidation || !observationsEnabled}
                         title={
                           !observationsEnabled ? "Observations feature is not enabled" : undefined
@@ -289,7 +292,7 @@ export default function BankPage() {
                         {!observationsEnabled && (
                           <span className="ml-auto text-xs text-muted-foreground">Off</span>
                         )}
-                      </DropdownMenuItem>
+                      </ActionMenuItem>
                       <DropdownMenuItem
                         onClick={() => setShowClearObservationsDialog(true)}
                         disabled={!observationsEnabled}
@@ -354,13 +357,15 @@ export default function BankPage() {
                             : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
-                        {locale.startsWith("zh") ? inlineUiText("数据与路由防护") : "Data and routing protection"}
+                        {locale.startsWith("zh")
+                          ? inlineUiText("数据与路由防护")
+                          : "Data and routing protection"}
                         {bankConfigTab === "memory-defense" && (
                           <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                         )}
                       </button>
                     )}
-                    {(
+                    {
                       <button
                         onClick={() => handleBankConfigTabChange("configuration")}
                         className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold transition-colors sm:px-6 ${
@@ -369,18 +374,54 @@ export default function BankPage() {
                             : "text-muted-foreground hover:text-foreground"
                         }`}
                       >
-                        {locale.startsWith("zh") ? inlineUiText("运行配置") : "Runtime configuration"}
+                        {locale.startsWith("zh")
+                          ? inlineUiText("运行配置")
+                          : "Runtime configuration"}
                         {bankConfigTab === "configuration" && (
                           <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                         )}
                       </button>
-                    )}
-                    <button onClick={() => handleBankConfigTabChange("memory")} className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "memory" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}>{locale.startsWith("zh") ? inlineUiText("EP 记忆") : "EP Memory"}</button>
-                    <button onClick={() => handleBankConfigTabChange("models")} className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "models" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}>{locale.startsWith("zh") ? inlineUiText("检索与判断模型") : "Retrieval and judge models"}</button>
-                    <button onClick={() => handleBankConfigTabChange("rag")} className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "rag" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}>{locale.startsWith("zh") ? inlineUiText("外部 RAG") : "External RAG"}</button>
-                    <button onClick={() => handleBankConfigTabChange("providers")} className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "providers" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}>{locale.startsWith("zh") ? inlineUiText("Provider 与 Fallback") : "Providers and fallback"}</button>
-                    <button onClick={() => handleBankConfigTabChange("scenario")} className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "scenario" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}>{locale.startsWith("zh") ? inlineUiText("情景摘要") : "Scenario summaries"}</button>
-                    <button onClick={() => handleBankConfigTabChange("backup")} className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "backup" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}>{locale.startsWith("zh") ? inlineUiText("备份") : "Backup"}</button>
+                    }
+                    <button
+                      onClick={() => handleBankConfigTabChange("memory")}
+                      className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "memory" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      {locale.startsWith("zh") ? inlineUiText("EP 记忆") : "EP Memory"}
+                    </button>
+                    <button
+                      onClick={() => handleBankConfigTabChange("models")}
+                      className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "models" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      {locale.startsWith("zh")
+                        ? inlineUiText("检索与判断模型")
+                        : "Retrieval and judge models"}
+                    </button>
+                    <button
+                      onClick={() => handleBankConfigTabChange("rag")}
+                      className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "rag" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      {locale.startsWith("zh") ? inlineUiText("外部 RAG") : "External RAG"}
+                    </button>
+                    <button
+                      onClick={() => handleBankConfigTabChange("providers")}
+                      className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "providers" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      {locale.startsWith("zh")
+                        ? inlineUiText("Provider 与 Fallback")
+                        : "Providers and fallback"}
+                    </button>
+                    <button
+                      onClick={() => handleBankConfigTabChange("scenario")}
+                      className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "scenario" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      {locale.startsWith("zh") ? inlineUiText("情景摘要") : "Scenario summaries"}
+                    </button>
+                    <button
+                      onClick={() => handleBankConfigTabChange("backup")}
+                      className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold ${bankConfigTab === "backup" ? "text-primary" : "text-muted-foreground hover:text-foreground"}`}
+                    >
+                      {locale.startsWith("zh") ? inlineUiText("备份") : "Backup"}
+                    </button>
                     <button
                       onClick={() => handleBankConfigTabChange("audit-logs")}
                       className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold transition-colors sm:px-6 ${
@@ -427,7 +468,9 @@ export default function BankPage() {
                       <OperationalOverview />
                       <div className="space-y-6">
                         <BankStatsView />
-                        <div id="bank-operations"><BankOperationsView /></div>
+                        <div id="bank-operations">
+                          <BankOperationsView />
+                        </div>
                         <BankProfileView hideReflectFields />
                       </div>
                     </div>
@@ -452,7 +495,11 @@ export default function BankPage() {
                     (auditLogEnabled ? (
                       <div>
                         <p className="text-sm text-muted-foreground mb-4">
-                          {locale.startsWith("zh") ? inlineUiText("原始操作记录，包含当前 Evolving Profile 与迁移前底层操作；当前宿主链路以“运行配置”和“链路”页为准。") : "Raw operation records include current Evolving Profile activity and pre-migration records. Use Runtime Configuration and Flow for the active host path."}
+                          {locale.startsWith("zh")
+                            ? inlineUiText(
+                                "原始操作记录，包含当前 Evolving Profile 与迁移前底层操作；当前宿主链路以“运行配置”和“链路”页为准。"
+                              )
+                            : "Raw operation records include current Evolving Profile activity and pre-migration records. Use Runtime Configuration and Flow for the active host path."}
                         </p>
                         <AuditLogsView />
                       </div>
@@ -472,7 +519,9 @@ export default function BankPage() {
                     (llmTraceEnabled ? (
                       <div>
                         <p className="text-sm text-muted-foreground mb-4">
-                          {inlineUiText("原始模型调用记录，包含迁移前后台任务；前台查询不会因浏览该页额外调用模型。")}
+                          {inlineUiText(
+                            "原始模型调用记录，包含迁移前后台任务；前台查询不会因浏览该页额外调用模型。"
+                          )}
                         </p>
                         <LLMRequestsView />
                       </div>
@@ -556,7 +605,9 @@ export default function BankPage() {
                           : "text-muted-foreground hover:text-foreground"
                       }`}
                     >
-                      {locale.startsWith("zh") ? inlineUiText("多维度偏好") : "Multi-dimensional Preferences"}
+                      {locale.startsWith("zh")
+                        ? inlineUiText("多维度偏好")
+                        : "Multi-dimensional Preferences"}
                       {subTab === "preferences" && (
                         <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                       )}
@@ -564,11 +615,15 @@ export default function BankPage() {
                     <button
                       onClick={() => handleDataSubTabChange("context")}
                       className={`relative whitespace-nowrap px-3 py-3 text-sm font-semibold transition-colors sm:px-6 ${
-                        subTab === "context" ? "text-primary" : "text-muted-foreground hover:text-foreground"
+                        subTab === "context"
+                          ? "text-primary"
+                          : "text-muted-foreground hover:text-foreground"
                       }`}
                     >
                       {locale.startsWith("zh") ? inlineUiText("情景摘要") : "Scenario Summary"}
-                      {subTab === "context" && <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />}
+                      {subTab === "context" && (
+                        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
+                      )}
                     </button>
                   </div>
                 </div>
@@ -613,6 +668,7 @@ export default function BankPage() {
             )}
 
             {view === "flow" && <FlowView />}
+            {view === "quality" && <MemoryQualityEngineView />}
           </div>
         </main>
       </div>
@@ -649,8 +705,8 @@ export default function BankPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={isDeleting}>{tCommon("cancel")}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDeleteBank}
+            <ActionButton
+              onAction={handleDeleteBank}
               disabled={isDeleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
@@ -665,7 +721,7 @@ export default function BankPage() {
                   {t("deleteBank")}
                 </>
               )}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -690,7 +746,7 @@ export default function BankPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={isResettingConfig}>{tCommon("cancel")}</AlertDialogCancel>
-            <AlertDialogAction onClick={handleResetConfig} disabled={isResettingConfig}>
+            <ActionButton onAction={handleResetConfig} disabled={isResettingConfig}>
               {isResettingConfig ? (
                 <>
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
@@ -702,7 +758,7 @@ export default function BankPage() {
                   {t("resetConfiguration")}
                 </>
               )}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
@@ -729,8 +785,8 @@ export default function BankPage() {
             <AlertDialogCancel disabled={isClearingObservations}>
               {tCommon("cancel")}
             </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleClearObservations}
+            <ActionButton
+              onAction={handleClearObservations}
               disabled={isClearingObservations}
               className="bg-amber-500 text-white hover:bg-amber-600"
             >
@@ -745,7 +801,7 @@ export default function BankPage() {
                   {t("clearObservations")}
                 </>
               )}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

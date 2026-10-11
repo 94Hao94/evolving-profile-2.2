@@ -26,6 +26,91 @@ def claim(text,mid):
 
 
 class ScenarioStateV3Tests(unittest.TestCase):
+    def test_new_user_clause_protocol_rejects_negation_condition_and_question_loss(self):
+        for raw,bad in [('不要公开密钥','公开密钥'),('不指名道姓','指名道姓'),
+                        ('不应优先SearXNG','应优先SearXNG'),('是否支持批量抓取？','支持批量抓取'),
+                        ('如果额度不足，才调用后备引擎','调用后备引擎'),
+                        ('readme还是中英两版','readme还是中英两版，顶部互相切换')]:
+            with self.subTest(raw=raw):
+                original=source([('user',raw),('assistant','已答复，尚未核验')])
+                state={'subject':claim('项目要求','id1'),'goal':claim('处理请求','id1'),'phase':'assistant_reported',
+                       'constraints':[claim(bad,'id1')],'corrections':[],
+                       'assistant_reports':[claim('已答复，尚未核验','id2')],'unresolved':[]}
+                with self.assertRaisesRegex(ValueError,'scenario_user_claim_not_verbatim'):
+                    validate_state_draft(original,state,model='test',user_claim_protocol='user_constraints_corrections_whole_source_clause.v1')
+
+    def test_new_user_clause_protocol_preserves_whole_clause_and_legacy_paraphrase_mode(self):
+        original=source([('user','不要公开密钥，只有本机使用；README中英两版。'),('assistant','已答复')])
+        state={'subject':claim('项目要求','id1'),'goal':claim('处理请求','id1'),'phase':'assistant_reported',
+               'constraints':[claim('不要公开密钥，只有本机使用；','id1'),claim('README中英两版。','id1')],
+               'corrections':[],'assistant_reports':[claim('已答复','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test',user_claim_protocol='user_constraints_corrections_whole_source_clause.v1')
+        self.assertEqual(draft['state_claim_protocol'],'user_constraints_corrections_whole_source_clause.v1')
+        state['constraints']=[claim('禁止公开凭据','id1')]
+        legacy=validate_state_draft(original,state,model='test')
+        self.assertNotIn('state_claim_protocol',legacy)
+
+    def test_field_catalog_exposes_only_real_paths_roles_source_refs_and_summary_tiers(self):
+        from lib.scenario_state_v3 import state_field_catalog
+        original=source([('user','编制方案'),('assistant','旧报告尚待核验'),('user','说明实际路径'),('assistant','实际未采用EP线索')])
+        state={'subject':claim('方案','id1'),'goal':claim('说明路径','id3'),'phase':'assistant_reported',
+               'constraints':[],'corrections':[],'assistant_reports':[claim('旧报告尚待核验','id2'),claim('实际未采用EP线索','id4')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test')
+        catalog=state_field_catalog(original,draft)
+        prior=next(r for r in catalog if r['state_path']=='assistant_reports/0/text')
+        self.assertEqual(prior['role'],'assistant')
+        self.assertEqual(prior['supported_message_refs'],['id2'])
+        self.assertEqual(prior['field_text'],'旧报告尚待核验')
+        self.assertEqual(prior['summary_paths'],['full'])
+
+    def test_model_receives_claim_cardinality_limits_without_weakening_source_guard(self):
+        original=source([('user',f'第{i}项项目条件') for i in range(1,6)]+[('assistant','已答复，结果未独立核验')])
+        def reply(request,**_kwargs):
+            body=json.loads(request.data)
+            payload=json.loads(body['messages'][0]['content'].split('输入：',1)[1].split('\n上次输出',1)[0])
+            ids=payload['allowed_message_ids_by_role']['user']
+            limit=(payload.get('state_limits') or {}).get('message_ids_max_per_claim',len(ids))
+            state={'subject':{'text':'项目条件','message_ids':ids[:limit]},'goal':claim('讨论项目条件','id1'),
+                   'phase':'assistant_reported','constraints':[],'corrections':[],
+                   'assistant_reports':[claim('已答复，结果未独立核验','id6')],'unresolved':[]}
+            return io.BytesIO(json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'source_revision':'revision-1','state':state})}}]}).encode())
+        draft=scenario_model.request_session_state_draft(original,base_url='https://fake.invalid',api_key='test-private',model='fake',opener=reply)
+        self.assertEqual(draft['state']['subject']['message_ids'],['id1','id2','id3','id4'])
+        self.assertEqual(draft['state']['phase'],'assistant_reported')
+        invalid=dict(draft['state']);invalid['subject']={'text':'项目条件','message_ids':['id1','id2','id3','id4','id5']}
+        with self.assertRaisesRegex(ValueError,'scenario_state_invalid'):
+            validate_state_draft(original,invalid,model='test')
+
+    def test_generation_and_validator_share_claim_limits(self):
+        original=source([('user',f'第{i}项项目条件') for i in range(1,4)]+[('assistant','已答复')])
+        def reply(request,**_kwargs):
+            payload=json.loads(json.loads(request.data)['messages'][0]['content'].split('输入：',1)[1].split('\n上次输出',1)[0])
+            count=payload['state_limits']['message_ids_max_per_claim']
+            state={'subject':{'text':'项目条件','message_ids':['id1','id2','id3'][:count]},'goal':claim('讨论条件','id1'),
+                   'phase':'assistant_reported','constraints':[],'corrections':[],
+                   'assistant_reports':[claim('已答复','id4')],'unresolved':[]}
+            return io.BytesIO(json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'source_revision':'revision-1','state':state})}}]}).encode())
+        limits={'text_max_chars_per_claim':180,'message_ids_min_per_claim':1,'message_ids_max_per_claim':2,'claims_max_per_array':8}
+        with patch('lib.scenario_state_v3.STATE_LIMITS',limits,create=True):
+            draft=scenario_model.request_session_state_draft(original,base_url='https://fake.invalid',api_key='test-private',model='fake',opener=reply)
+            self.assertEqual(draft['state']['subject']['message_ids'],['id1','id2'])
+            state=dict(draft['state']);state['subject']={'text':'项目条件','message_ids':['id1','id2','id3']}
+            with self.assertRaisesRegex(ValueError,'scenario_state_invalid'):validate_state_draft(original,state,model='test')
+
+    def test_episode_review_receives_validator_roles_and_limits(self):
+        original=source([('user','编制项目方案'),('assistant','已提供答复但尚未核验')])
+        state={'subject':claim('项目方案','id1'),'goal':claim('编制方案','id1'),'phase':'assistant_reported',
+               'constraints':[],'corrections':[],'assistant_reports':[claim('已提供答复但尚未核验','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test')
+        def reply(request,**_kwargs):
+            payload=json.loads(json.loads(request.data)['messages'][0]['content'].split('输入：',1)[1])
+            roles=payload.get('allowed_roles_by_field') or {};limits=payload.get('state_limits') or {}
+            accepted=roles.get('subject')==roles.get('corrections')=='user' and roles.get('assistant_reports')=='assistant' and limits.get('message_ids_max_per_claim')==4
+            issues=[] if accepted else [{'tier':'evidence','code':'role_contract_missing','detail':'Explicit role or limit contract absent'}]
+            return io.BytesIO(json.dumps({'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'source_revision':'revision-1','accept':accepted,'issues':issues})}}]}).encode())
+        review=scenario_model.request_session_review(original,draft,base_url='https://fake.invalid',api_key='test-private',model='fake',opener=reply)
+        self.assertEqual(review['status'],'model_review_passed')
+
     def test_long_source_uses_smaller_default_state_chunks_without_splitting_messages(self):
         original=source([('user','甲'*4000),('assistant','乙'*3000)]*5)
         self.assertEqual(scenario_model.adaptive_state_chunk_chars(original,30000),8000)
@@ -51,6 +136,27 @@ class ScenarioStateV3Tests(unittest.TestCase):
         self.assertEqual([row['message_id'] for row in hints],['id3'])
         self.assertIn('师燕超',hints[0]['excerpt'])
         self.assertEqual(hints[0]['evidence_role'],'review_hint_not_verified_claim')
+
+    def test_explicit_user_correction_misclassified_as_constraint_is_recategorized(self):
+        original=source([('user','不要把采购月份写死，保留后续安排空间。'),('assistant','已记录，尚未核验。')])
+        state={'subject':claim('采购前方案','id1'),'goal':claim('整理方案','id1'),'phase':'assistant_reported',
+               'constraints':[claim('不要把采购月份写死，保留后续安排空间。','id1')],
+               'corrections':[],'assistant_reports':[claim('已记录，尚未核验。','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test',
+                                   user_claim_protocol='user_constraints_corrections_whole_source_clause.v1')
+        self.assertEqual(draft['state']['constraints'],[])
+        self.assertEqual(draft['state']['corrections'],[claim('不要把采购月份写死，保留后续安排空间。','id1')])
+
+    def test_missing_later_user_correction_is_added_from_exact_source_clause(self):
+        original=source([('user','先做方案。'),('assistant','已回复。'),
+                         ('user','不要把标题写成采购清单，要保留合作方案语气。'),('assistant','已修改。')])
+        state={'subject':claim('方案','id1'),'goal':claim('修改方案','id3'),'phase':'assistant_reported',
+               'constraints':[],'corrections':[],'assistant_reports':[claim('已回复。','id2'),claim('已修改。','id4')],
+               'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test',
+                                   user_claim_protocol='user_constraints_corrections_whole_source_clause.v1')
+        self.assertEqual(draft['state']['corrections'],[
+            claim('不要把标题写成采购清单，要保留合作方案语气。','id3')])
 
     def test_correction_hints_mask_credentials_before_model_exposure(self):
         secret='sk-'+'A'*32
@@ -81,8 +187,8 @@ class ScenarioStateV3Tests(unittest.TestCase):
                          ('user',raw),('assistant','已完成旧稿'),('user','现在软件平台与硬件算力分开')])
         state={'subject':claim('天津财经大学商学院人工智能实训平台申报书','id1'),
                'goal':claim('编制申报书','id1'),'phase':'requested',
-               'constraints':[claim('未申报其他专项资金','id2')],
-               'corrections':[claim('软件平台与硬件算力分开','id4')],
+               'constraints':[claim('问题：是否申报其他专项？ 回答：否','id2')],
+               'corrections':[claim('现在软件平台与硬件算力分开','id4')],
                'assistant_reports':[claim('已完成旧稿','id3')],
                'unresolved':[claim('新要求尚无完成答复','id4')]}
         sent=[]
@@ -731,13 +837,51 @@ class ScenarioStateV3Tests(unittest.TestCase):
         draft=validate_state_draft(original,state,model='test')
         self.assertIn('最近进展',draft['summaries']['compact'])
         self.assertIn('未独立核验',draft['summaries']['compact'])
-        self.assertIn('助手有后续答复',draft['summaries']['compact'])
-        self.assertNotIn('新版Word已改好',draft['summaries']['compact'])
+        self.assertIn('已答复',draft['summaries']['compact'])
+        self.assertIn('最近进展（助手报告，未独立核验）：新版Word已改好',draft['summaries']['compact'])
         self.assertIn('新版Word已改好',draft['summaries']['standard'])
         self.assertEqual(draft['summaries']['standard'].count('新版Word已改好'),1)
         self.assertEqual(draft['summaries']['full'].count('新版Word已改好'),1)
         self.assertIn('对象：天津大学墙体巡检方案 [来源:id1]',draft['summaries']['full'])
         self.assertIn('纠正：不写机器人型号 [来源:id3]',draft['summaries']['full'])
+
+    def test_answered_request_with_unknown_external_result_is_not_an_unanswered_request(self):
+        original=source([('user','把报告上传到公开仓库'),('assistant','已上传公开仓库，尚无独立验收')])
+        state={'subject':claim('报告公开仓库上传','id1'),'goal':claim('上传报告','id1'),
+               'phase':'assistant_reported','constraints':[],'corrections':[],
+               'assistant_reports':[claim('已上传公开仓库，尚无独立验收','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test')
+        self.assertEqual(draft['state']['unresolved'],[])
+        self.assertEqual(draft['state']['phase'],'assistant_reported')
+        self.assertIn('最近进展（助手报告，未独立核验）：已上传公开仓库，尚无独立验收',draft['summaries']['compact'])
+        self.assertNotIn('待处理',draft['summaries']['compact'])
+        self.assertNotIn('verified',draft['summaries']['compact'])
+
+    def test_compact_report_excerpt_preserves_attribution_and_full_report_in_standard(self):
+        report='助手自述已生成报告；'+'尚需外部核验。'*18
+        original=source([('user','编制报告'),('assistant',report)])
+        state={'subject':claim('报告','id1'),'goal':claim('编制报告','id1'),
+               'phase':'assistant_reported','constraints':[],'corrections':[],
+               'assistant_reports':[claim(report,'id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test')
+        self.assertIn('最近进展（助手报告，未独立核验）：助手自述已生成报告',draft['summaries']['compact'])
+        self.assertIn('…',draft['summaries']['compact'])
+        self.assertIn(report,draft['summaries']['standard'])
+        for tier,text in draft['summaries'].items():
+            self.assertLessEqual(len(text),BUDGETS['session'][tier]['max_chars'])
+
+    def test_recent_report_follows_source_order_even_when_model_array_is_reversed(self):
+        original=source([('user','EP里的线索是否有作用'),('assistant','尚未核对EP记录，不能断言无效'),
+                         ('user','刚才实际用了EP吗'),('assistant','实际查找未采用EP线索，但不证明记录不存在')])
+        state={'subject':claim('EP定位线索','id1'),'goal':claim('核对实际检索路径','id3'),
+               'phase':'assistant_reported','constraints':[],'corrections':[],
+               'assistant_reports':[claim('实际查找未采用EP线索，但不证明记录不存在','id4'),
+                                    claim('尚未核对EP记录，不能断言无效','id2')],'unresolved':[]}
+        draft=validate_state_draft(original,state,model='test')
+        self.assertEqual([r['message_ids'] for r in draft['state']['assistant_reports']],[['id2'],['id4']])
+        self.assertIn('最近进展（助手报告，未独立核验）：实际查找未采用EP线索',draft['summaries']['compact'])
+        self.assertIn('尚未核对EP记录，不能断言无效',draft['summaries']['full'])
+        self.assertEqual(draft['state']['unresolved'],[])
 
     def test_state_rejects_claim_from_wrong_role_or_unknown_source(self):
         original=source([('user','天津大学墙体巡检方案'),('assistant','已完成方案')])

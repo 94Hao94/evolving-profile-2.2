@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { client, LLMRequestEntry } from "@/lib/api";
@@ -9,6 +9,7 @@ import { useFeatures } from "@/lib/features-context";
 import { DataView } from "./data-view";
 import { TraceDialog } from "./llm-requests-view";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { Input } from "@/components/ui/input";
 import {
   Table,
@@ -40,12 +41,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
   AlertDialog,
-  AlertDialogAction,
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
@@ -409,6 +408,7 @@ function InvalidatedFactsSection({ bankId, documentId }: { bankId: string; docum
   const [rows, setRows] = useState<any[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [restoringId, setRestoringId] = useState<string | null>(null);
+  const [restoredIds, setRestoredIds] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     if (!bankId || !documentId) return;
@@ -427,6 +427,7 @@ function InvalidatedFactsSection({ bankId, documentId }: { bankId: string; docum
   }, [bankId, documentId]);
 
   useEffect(() => {
+    setRestoredIds([]);
     load();
   }, [load]);
 
@@ -434,7 +435,7 @@ function InvalidatedFactsSection({ bankId, documentId }: { bankId: string; docum
     setRestoringId(id);
     try {
       await client.updateMemory(id, bankId, { state: "valid" });
-      await load();
+      setRestoredIds((previous) => [...previous, id]);
     } finally {
       setRestoringId(null);
     }
@@ -443,7 +444,7 @@ function InvalidatedFactsSection({ bankId, documentId }: { bankId: string; docum
   if (!loaded || rows.length === 0) return null;
 
   return (
-    <InfoCard title={`${t("invalidatedFactsTitle")} (${rows.length})`}>
+    <InfoCard title={`${t("invalidatedFactsTitle")} (${rows.filter((row) => !restoredIds.includes(row.id)).length})`}>
       <div className="space-y-2">
         {rows.map((row) => (
           <div key={row.id} className="flex items-start justify-between gap-3">
@@ -492,16 +493,16 @@ function InvalidatedFactsSection({ bankId, documentId }: { bankId: string; docum
                 </div>
               )}
             </div>
-            <Button
+            <ActionButton
               variant="secondary"
               size="sm"
-              disabled={restoringId === row.id}
-              onClick={() => restore(row.id)}
+              disabled={restoringId === row.id || restoredIds.includes(row.id)}
+              onAction={() => restore(row.id)}
               className="shrink-0 h-7 px-2 text-xs gap-1"
             >
               <RotateCcw className="w-3 h-3" />
               {tCuration("curationRevert")}
-            </Button>
+            </ActionButton>
           </div>
         ))}
       </div>
@@ -596,6 +597,7 @@ export function DocumentsView() {
   const locale = useLocale();
   const tCommon = useTranslations("common");
   const tBank = useTranslations("bank");
+  const tAction = useTranslations("actionFeedback");
   const { currentBank } = useBank();
   const { features } = useFeatures();
   const [documents, setDocuments] = useState<any[]>([]);
@@ -622,11 +624,13 @@ export function DocumentsView() {
   const [selectedDocument, setSelectedDocument] = useState<any>(null);
   const [loadingDocument, setLoadingDocument] = useState(false);
   const [deletingDocumentId, setDeletingDocumentId] = useState<string | null>(null);
+  const [deletedDocumentId, setDeletedDocumentId] = useState<string | null>(null);
 
   // Tag editing state
   const [editingTags, setEditingTags] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [savingTags, setSavingTags] = useState(false);
+  const saveTagsButton = useRef<HTMLButtonElement>(null);
 
   // Content editing state
   const [editingContent, setEditingContent] = useState(false);
@@ -641,19 +645,12 @@ export function DocumentsView() {
 
   // Reprocess state
   const [reprocessing, setReprocessing] = useState(false);
-  const [reprocessResult, setReprocessResult] = useState<{
-    success: boolean;
-    message: string;
-  } | null>(null);
 
   // Delete confirmation dialog state
   const [documentToDelete, setDocumentToDelete] = useState<{
     id: string;
     memoryCount?: number;
   } | null>(null);
-  const [deleteResult, setDeleteResult] = useState<{ success: boolean; message: string } | null>(
-    null
-  );
 
   const loadDocuments = useCallback(
     async (page: number = 1) => {
@@ -799,38 +796,28 @@ export function DocumentsView() {
   };
 
   const reprocessDocument = async () => {
-    if (!currentBank || !selectedDocument) return;
+    if (!currentBank || !selectedDocument) return false;
 
     setReprocessing(true);
     try {
       const result = await client.reprocessDocument(selectedDocument.id, currentBank);
-      setReprocessResult({
-        success: true,
-        message: `Reprocessing started (operation: ${result.operation_id})`,
-      });
+      return result;
     } catch (error) {
-      setReprocessResult({
-        success: false,
-        message: "Error reprocessing document: " + (error as Error).message,
-      });
+      throw error;
     } finally {
       setReprocessing(false);
     }
   };
 
   const confirmDeleteDocument = async () => {
-    if (!currentBank || !documentToDelete) return;
+    if (!currentBank || !documentToDelete) return false;
 
     const documentId = documentToDelete.id;
     setDeletingDocumentId(documentId);
-    setDocumentToDelete(null);
 
     try {
-      const result = await client.deleteDocument(documentId, currentBank);
-      setDeleteResult({
-        success: true,
-        message: t("toastDeletedDocumentAndUnits", { count: result.memory_units_deleted }),
-      });
+      await client.deleteDocument(documentId, currentBank);
+      setDeletedDocumentId(documentId);
 
       // Close panel if this document was selected
       if (selectedDocument?.id === documentId) {
@@ -841,16 +828,14 @@ export function DocumentsView() {
       loadDocuments(currentPage);
     } catch (error) {
       console.error("Error deleting document:", error);
-      setDeleteResult({
-        success: false,
-        message: t("toastErrorDeletingDocument") + (error as Error).message,
-      });
+      throw error;
     } finally {
       setDeletingDocumentId(null);
     }
   };
 
   const requestDeleteDocument = (documentId: string, memoryCount?: number) => {
+    setDeletedDocumentId(null);
     setDocumentToDelete({ id: documentId, memoryCount });
   };
 
@@ -875,10 +860,10 @@ export function DocumentsView() {
   };
 
   const saveDocumentContent = async () => {
-    if (!currentBank || !selectedDocument) return;
+    if (!currentBank || !selectedDocument) return false;
 
     const newContent = contentInput;
-    if (!newContent.trim()) return;
+    if (!newContent.trim()) return false;
 
     const retainParams = selectedDocument.retain_params ?? {};
     const item: Parameters<typeof client.retain>[0]["items"][number] = {
@@ -904,18 +889,17 @@ export function DocumentsView() {
       // Refresh the document and the list
       const doc: any = await client.getDocument(selectedDocument.id, currentBank);
       setSelectedDocument(doc);
-      setEditingContent(false);
-      setContentInput("");
       loadDocuments(currentPage);
     } catch (error) {
       console.error("Error updating document content:", error);
+      throw error;
     } finally {
       setSavingContent(false);
     }
   };
 
   const saveDocumentTags = async () => {
-    if (!currentBank || !selectedDocument) return;
+    if (!currentBank || !selectedDocument) return false;
 
     const newTags = tagInput
       .split(",")
@@ -930,10 +914,9 @@ export function DocumentsView() {
       setDocuments((prev) =>
         prev.map((d) => (d.id === selectedDocument.id ? { ...d, tags: newTags } : d))
       );
-      setEditingTags(false);
-      setTagInput("");
     } catch (error) {
       console.error("Error updating document tags:", error);
+      throw error;
     } finally {
       setSavingTags(false);
     }
@@ -999,23 +982,22 @@ export function DocumentsView() {
   };
 
   const exportDocuments = async (documentIds?: string[], includeObservations = false) => {
-    if (!currentBank || exporting) return;
+    if (!currentBank || exporting) return false;
     setExporting(true);
     try {
       const blob = await client.exportDocuments(currentBank, documentIds, includeObservations);
       const suffix = documentIds && documentIds.length === 1 ? `-${documentIds[0]}` : "-documents";
       triggerDownload(blob, `${currentBank}${suffix}.zip`);
       toast.success(t("exportSuccess"));
-      setExportDialogOpen(false);
-    } catch {
-      // Errors surface via the API client / route; nothing extra to do here.
+    } catch (error) {
+      throw error;
     } finally {
       setExporting(false);
     }
   };
 
   const runImport = async (file: File) => {
-    if (!file || !currentBank) return;
+    if (!file || !currentBank) return false;
     setImporting(true);
     try {
       // Import is an async operation: submit, then poll until it completes.
@@ -1029,14 +1011,12 @@ export function DocumentsView() {
           break;
         }
         if (op.status === "failed") {
-          toast.error(op.error_message || t("importFailed"));
-          return;
+          throw new Error(op.error_message || t("importFailed"));
         }
         await new Promise((r) => setTimeout(r, 1000));
       }
       if (meta === null) {
-        toast.error(t("importTimeout"));
-        return;
+        throw new Error(t("importTimeout"));
       }
       toast.success(
         t("importSuccess", {
@@ -1046,10 +1026,8 @@ export function DocumentsView() {
         })
       );
       loadDocuments(currentPage);
-      setImportDialogOpen(false);
-      setImportFile(null);
-    } catch {
-      // Error toast handled by the API client.
+    } catch (error) {
+      throw error;
     } finally {
       setImporting(false);
     }
@@ -1132,14 +1110,15 @@ export function DocumentsView() {
             >
               {tCommon("cancel")}
             </Button>
-            <Button
+            <ActionButton
               size="sm"
-              onClick={() => exportDocuments(undefined, exportIncludeObservations)}
+              resetKey={`${exportDialogOpen}:${currentBank}:${exportIncludeObservations}`}
+              onAction={() => exportDocuments(undefined, exportIncludeObservations)}
               disabled={exporting}
             >
               <Download className="h-4 w-4 mr-2" />
               {exporting ? t("exporting") : t("exportButton")}
-            </Button>
+            </ActionButton>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1195,14 +1174,15 @@ export function DocumentsView() {
             >
               {tCommon("cancel")}
             </Button>
-            <Button
+            <ActionButton
               size="sm"
-              onClick={() => importFile && runImport(importFile)}
+              resetKey={`${importDialogOpen}:${currentBank}:${importFile?.name}:${importFile?.lastModified}:${importOnConflict}`}
+              onAction={() => importFile ? runImport(importFile) : Promise.resolve(false)}
               disabled={!importFile || importing}
             >
               <Upload className="h-4 w-4 mr-2" />
               {importing ? t("importing") : t("importButton")}
-            </Button>
+            </ActionButton>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1460,6 +1440,17 @@ export function DocumentsView() {
                     {t("tabChunks")}{chunksLoaded ? ` (${chunksTotal})` : ""}
                   </TabsTrigger>
                 </TabsList>
+                <div className="flex flex-wrap items-start justify-end gap-2">
+                  <ActionButton resetKey={selectedDocument.id} successLabel={tAction("submitted")} variant="outline" size="sm" onAction={reprocessDocument} disabled={reprocessing}>
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Reprocess
+                  </ActionButton>
+                  {canExport && (
+                    <ActionButton resetKey={selectedDocument.id} variant="outline" size="sm" onAction={() => exportDocuments([selectedDocument.id])} disabled={exporting}>
+                      <Download className="h-4 w-4 mr-2" />
+                      {t("exportButton")}
+                    </ActionButton>
+                  )}
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
@@ -1473,20 +1464,6 @@ export function DocumentsView() {
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem onClick={reprocessDocument} disabled={reprocessing}>
-                      <RefreshCw className="h-4 w-4 mr-2" />
-                      Reprocess
-                    </DropdownMenuItem>
-                    {canExport && (
-                      <DropdownMenuItem
-                        onClick={() => exportDocuments([selectedDocument.id])}
-                        disabled={exporting}
-                      >
-                        <Download className="h-4 w-4 mr-2" />
-                        {t("exportButton")}
-                      </DropdownMenuItem>
-                    )}
-                    <DropdownMenuSeparator />
                     <DropdownMenuItem
                       onClick={() =>
                         requestDeleteDocument(
@@ -1501,6 +1478,7 @@ export function DocumentsView() {
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto mt-4">
@@ -1577,14 +1555,17 @@ export function DocumentsView() {
                                   placeholder={t("tagsInputPlaceholder")}
                                   className="text-sm h-7 w-64"
                                   onKeyDown={(e) => {
-                                    if (e.key === "Enter") saveDocumentTags();
+                                    if (e.key === "Enter") saveTagsButton.current?.click();
                                     if (e.key === "Escape") cancelEditTags();
                                   }}
                                   autoFocus
                                 />
-                                <Button
-                                  size="sm"
-                                  onClick={saveDocumentTags}
+                                <ActionButton
+                                  ref={saveTagsButton}
+                                  resetKey={`${selectedDocument.id}:${tagInput}`}
+                                  size="icon"
+                                  aria-label={t("saveButton")}
+                                  onAction={saveDocumentTags}
                                   disabled={savingTags}
                                   className="h-7 w-7 p-0"
                                 >
@@ -1593,7 +1574,7 @@ export function DocumentsView() {
                                   ) : (
                                     <Check className="h-3 w-3" />
                                   )}
-                                </Button>
+                                </ActionButton>
                                 <Button
                                   variant="outline"
                                   size="sm"
@@ -1693,9 +1674,10 @@ export function DocumentsView() {
                         <div className="space-y-2">
                           <div className="flex items-center justify-end mb-2">
                             <div className="flex gap-2">
-                              <Button
+                              <ActionButton
                                 size="sm"
-                                onClick={saveDocumentContent}
+                                resetKey={`${selectedDocument.id}:${contentInput}`}
+                                onAction={saveDocumentContent}
                                 disabled={savingContent || !contentInput.trim()}
                                 className="h-7 px-3 gap-1 text-xs"
                               >
@@ -1705,7 +1687,7 @@ export function DocumentsView() {
                                   <Check className="h-3 w-3" />
                                 )}
                                 {t("saveButton")}
-                              </Button>
+                              </ActionButton>
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -1829,53 +1811,19 @@ export function DocumentsView() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("cancelButton")}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={confirmDeleteDocument}
+            <AlertDialogCancel disabled={!!deletingDocumentId}>{deletedDocumentId ? tCommon("close") : t("cancelButton")}</AlertDialogCancel>
+            <ActionButton
+              variant="destructive"
+              disabled={!!deletingDocumentId || deletedDocumentId === documentToDelete?.id}
+              onAction={confirmDeleteDocument}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
               {t("deleteButton")}
-            </AlertDialogAction>
+            </ActionButton>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Delete Result Dialog */}
-      <AlertDialog open={!!deleteResult} onOpenChange={(open) => !open && setDeleteResult(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {deleteResult?.success ? t("deleteResultSuccessTitle") : t("deleteResultErrorTitle")}
-            </AlertDialogTitle>
-            <AlertDialogDescription>{deleteResult?.message}</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogAction onClick={() => setDeleteResult(null)}>
-              {t("okButton")}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      {/* Reprocess Result Dialog */}
-      <AlertDialog
-        open={!!reprocessResult}
-        onOpenChange={(open) => !open && setReprocessResult(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {reprocessResult?.success ? "Reprocessing Started" : t("deleteResultErrorTitle")}
-            </AlertDialogTitle>
-            <AlertDialogDescription>{reprocessResult?.message}</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogAction onClick={() => setReprocessResult(null)}>
-              {t("okButton")}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   );
 }

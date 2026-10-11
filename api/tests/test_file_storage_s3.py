@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import subprocess
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -116,20 +115,15 @@ def _wait_for_seaweedfs(endpoint: str, timeout: int = 30) -> None:
 def seaweedfs_container():
     """Start a SeaweedFS container for the test module, shared across all tests.
 
-    Mounts an s3.json config file to set up S3 credentials for the test user.
+    Copies an s3.json config file to the Docker daemon before startup.
     """
     if not _docker_available():
         pytest.skip("Docker is not available")
 
-    # Write S3 IAM config to a temp file that persists for the module scope
-    s3_config_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-    json.dump(_S3_CONFIG, s3_config_file)
-    s3_config_file.flush()
-
     container = (
         DockerContainer(image="chrislusf/seaweedfs:latest")
         .with_exposed_ports(SEAWEEDFS_S3_PORT)
-        .with_volume_mapping(s3_config_file.name, "/etc/seaweedfs/s3.json", "ro")
+        .with_copy_into_container(json.dumps(_S3_CONFIG).encode("utf-8"), "/etc/seaweedfs/s3.json", mode=0o644)
         .with_command(f"server -s3 -s3.port={SEAWEEDFS_S3_PORT} -s3.config=/etc/seaweedfs/s3.json -ip.bind=0.0.0.0")
     )
 
@@ -167,9 +161,6 @@ def seaweedfs_container():
         }
     finally:
         container.stop()
-        import os
-
-        os.unlink(s3_config_file.name)
 
 
 @pytest.fixture

@@ -7,7 +7,7 @@ and publishes bounded Context tiers with explicit provenance and status.
 import argparse, json, os, sys
 from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib.context_summary import read_context_index, write_context_index, reproject_context_row
+from lib.context_summary import update_context_index, reproject_context_row
 from lib.context_pipeline import write_progress
 
 parser = argparse.ArgumentParser()
@@ -15,19 +15,21 @@ parser.add_argument('--index', default=os.path.expanduser('~/.evolving-profile/c
 parser.add_argument('--queue', default=os.path.expanduser('~/.evolving-profile/context/context-pipeline.json'))
 parser.add_argument('--progress', default=os.path.expanduser('~/.evolving-profile/context/context-pipeline-progress.json'))
 args = parser.parse_args()
-index = read_context_index(args.index)
-rows = list(index.get('sessions') or []) + list(index.get('projects') or [])
 updated = datetime.now(timezone.utc).isoformat()
 success = 0
-for row in rows:
-    context_type = row.get('context_type')
-    seed = str((row.get('summary') or {}).get('full') or (row.get('summary') or {}).get('standard') or '')
-    if context_type not in ('session', 'project') or not seed:
-        continue
-    row.update(reproject_context_row(row))
-    row['processed_at'] = updated
-    success += 1
-write_context_index(args.index, index.get('sessions') or [], index.get('projects') or [])
+def project_latest(index):
+    global success
+    rows = list(index.get('sessions') or []) + list(index.get('projects') or [])
+    for row in rows:
+        context_type = row.get('context_type')
+        seed = str((row.get('summary') or {}).get('full') or (row.get('summary') or {}).get('standard') or '')
+        if context_type not in ('session', 'project') or not seed:
+            continue
+        row.update(reproject_context_row(row))
+        row['processed_at'] = updated
+        success += 1
+    return index
+update_context_index(args.index, project_latest)
 queue = json.loads(open(args.queue, encoding='utf-8').read())
 for job in queue.get('jobs') or []:
     job['status'] = 'projection_complete_review_pending'

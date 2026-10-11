@@ -208,7 +208,7 @@ def _observation_fact(observation_id: str):
     )
 
 
-def _patch_update_action_deps(consolidator, conn, source_ids, append_mock) -> ExitStack:
+def _patch_update_action_deps(consolidator, conn, source_ids, append_mock, observation_id, *, row_present) -> ExitStack:
     """Enter the common patch set for the two _execute_update_action guard tests
     and return the live ExitStack (use as ``with _patch_update_action_deps(...):``).
 
@@ -219,7 +219,20 @@ def _patch_update_action_deps(consolidator, conn, source_ids, append_mock) -> Ex
     """
     # The capability is consulted per bank (#3388), so the stub answers the bank-scoped
     # form rather than carrying the bare class attribute it replaced.
-    store = SimpleNamespace(writes_memory_rows_in_sql_for=lambda bank_id: True)
+    async def get_memories(*, conn, fq_table, bank_id, unit_ids):
+        assert bank_id == "bank-x"
+        if unit_ids == [observation_id]:
+            return [SimpleNamespace(unit_id=observation_id, source_memory_ids=[], metadata={})] if row_present else []
+        assert unit_ids == [str(source_id) for source_id in source_ids]
+        return [
+            SimpleNamespace(
+                unit_id=str(source_id),
+                metadata={"source_role": "user", "independent_user_evidence": "true"},
+            )
+            for source_id in source_ids
+        ]
+
+    store = SimpleNamespace(writes_memory_rows_in_sql_for=lambda bank_id: True, get_memories=AsyncMock(side_effect=get_memories))
     stack = ExitStack()
     stack.enter_context(patch("evolving_profile_api.config.get_config", _fake_config))
     stack.enter_context(patch.object(consolidator, "acquire_with_retry", MagicMock(return_value=_AsyncNullCtx(conn))))
@@ -261,7 +274,7 @@ async def test_update_action_bails_when_observation_row_missing():
     conn.transaction = MagicMock(return_value=_AsyncNullCtx(None))
 
     append_mock = AsyncMock()
-    with _patch_update_action_deps(consolidator, conn, source_ids, append_mock):
+    with _patch_update_action_deps(consolidator, conn, source_ids, append_mock, observation_id, row_present=False):
         result = await consolidator._execute_update_action(
             pool=MagicMock(),
             memory_engine=MagicMock(),
@@ -294,7 +307,7 @@ async def test_update_action_writes_history_when_row_present():
     memory_engine._backend.ops.uses_observation_sources_table = False
 
     append_mock = AsyncMock()
-    with _patch_update_action_deps(consolidator, conn, source_ids, append_mock):
+    with _patch_update_action_deps(consolidator, conn, source_ids, append_mock, observation_id, row_present=True):
         result = await consolidator._execute_update_action(
             pool=MagicMock(),
             memory_engine=memory_engine,
@@ -308,6 +321,10 @@ async def test_update_action_writes_history_when_row_present():
 
     assert result is not None, "Expected the embedding string back on a successful update"
     append_mock.assert_called_once()
+    write_args = conn.execute_rows_affected.await_args.args
+    assert write_args[3] == source_ids
+    assert write_args[4] == len(source_ids)
+    assert json.loads(write_args[11])["independent_user_evidence"] == "false"
 
 
 @pytest.mark.parametrize(

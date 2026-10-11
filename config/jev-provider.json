@@ -1,0 +1,10 @@
+{
+  "schema": "evolving-profile.jev-provider.v1",
+  "provider": "typesafe",
+  "endpoint": "https://api.typesafe.ai/v1/systemone",
+  "model": "jev-latest",
+  "protocol": "systemone",
+  "documentation": "https://docs.typesafe.ai/api",
+  "scopes": {"internal_memory": true, "quality_diagnosis": true, "external_rag": true},
+  "risk_gate_enabled": false
+}

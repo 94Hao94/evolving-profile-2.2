@@ -58,7 +58,7 @@ _FACT_FIELDS = """One per line, formatted as `[uuid] fact text (temporal fields)
 - `occurred_start` / `occurred_end`: when the described event happened. This can be long before the fact was stated — a fact recorded today may describe a 2019 event.
 - `mentioned_at`: when the source material that states this fact was written. This is the fact's recency: how up to date the statement is, NOT when it was added to memory. A fact taken from an old document keeps its old `mentioned_at` even if it was only just processed."""
 
-_OBSERVATION_FIELDS = """- `id`: unique identifier — copy this exactly when issuing an UPDATE or DELETE
+_OBSERVATION_FIELDS = """- `id`: unique identifier — copy this exact value into the output field `observation_id` when issuing an UPDATE or DELETE; never emit an output field named `id`
 - `text`: the observation content
 - `proof_count`: how many source facts this observation has already merged
 - `occurred_start` / `occurred_end`: the span of the events behind the observation — earliest start and latest end across its source facts

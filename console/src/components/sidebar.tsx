@@ -14,12 +14,13 @@ import {
   Settings,
   GitBranch,
   Bot,
+  Activity,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import Link from "next/link";
 
 import { inlineUiText } from "@/lib/inline-i18n";
-type NavItem = "recall" | "data" | "documents" | "agent-memory" | "flow" | "profile";
+type NavItem = "recall" | "data" | "documents" | "agent-memory" | "flow" | "quality" | "profile";
 
 interface SidebarProps {
   currentTab: NavItem;
@@ -43,6 +44,7 @@ export function Sidebar({ currentTab, onTabChange }: SidebarProps) {
     { id: "recall" as NavItem, label: t("recall"), icon: Search },
     { id: "documents" as NavItem, label: t("documents"), icon: FileText },
     { id: "flow" as NavItem, label: locale.startsWith("zh") ? inlineUiText("链路") : "Flow", icon: GitBranch },
+    { id: "quality" as NavItem, label: locale.startsWith("zh") ? inlineUiText("质量引擎") : "Quality Engine", icon: Activity },
     { id: "profile" as NavItem, label: tBank("bankConfiguration"), icon: Settings },
   ];
 

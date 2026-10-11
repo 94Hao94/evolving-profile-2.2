@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { projectFlowAudit, type FlowPrompt } from "@/lib/flow-projection";
 
+it("keeps navigation-only receipts observed with zero bodies without calling the result empty",()=>{
+ const audit=projectFlowAudit({prompt_id:"nav",at:"2026-10-09",user_prompt:"history",memory_route_receipt:{tool_events:[{tool:"user_recall",returned_count:0,source_navigation_returned_count:2,source_navigation_returned_ids:["nav-a","nav-b"]}]}} as any);
+ expect(audit.hostEvidence.result).toBe("source_navigation_returned");
+ expect(audit.history.state).toBe("observed");expect(audit.history.metrics.returned).toBe(0);
+ expect(audit.history.routeAudit).toMatchObject({status:"ep_history_source_navigation_returned",delivery_state:"source_navigation_returned",source_navigation_returned_count:2});
+});
+
 it("actual bound Recall calls override the earlier not-needed routing decision", () => {
   const audit = projectFlowAudit({
     prompt_id: "p", at: "2026-09-26T12:32:49Z", user_prompt: "test",
@@ -14,6 +21,16 @@ it("actual bound Recall calls override the earlier not-needed routing decision",
   expect(audit.history.calls).toBe(1);
   expect(audit.history.metrics.returned).toBe(0);
   expect(audit.history.decision).toBe("needed");
+});
+it("uses the same occurrence inventory as the quality and topology projections",()=>{
+ const prompt:any={prompt_id:"p",at:"2026-10-08",user_prompt:"x",memory_route_receipt:{tool_events:[{tool:"user_recall",tool_call_id:"a",returned_count:2},{tool:"user_recall",tool_call_id:"a",returned_count:2}]}};
+ const audit=projectFlowAudit(prompt);
+ expect(audit.history.calls).toBe(1);expect(audit.history.metrics.returned).toBe(2);
+});
+it("does not turn an observed call with unknown result count into an empty result",()=>{
+ const prompt:any={prompt_id:"p",at:"2026-10-08",user_prompt:"x",memory_route_receipt:{call_coverage:"partial",tool_events:[{tool:"user_recall",tool_call_id:"running",returned_count:null}]}};
+ const audit=projectFlowAudit(prompt);
+ expect(audit.history.metrics.returned).toBeNull();expect(audit.history.state).toBe("executed_no_result");expect(audit.history.routeAudit.returned_count).toBeNull();
 });
 
 const prompt: FlowPrompt = {
@@ -63,6 +80,20 @@ describe("projectFlowAudit", () => {
     });
     expect(audit.history.routeAudit.status).toBe("ep_history_tool_called_empty");
     expect(audit.history.routeAudit.tool_called).toBe(true);
+  });
+  it("treats scenario navigation and readback as real bound MCP tool events", () => {
+    const audit = projectFlowAudit({
+      ...prompt,
+      memory_route_receipt: { tool_events: [
+        { tool: "search_scenario_summary", returned_count: 2, scenario_ids: ["session-1", "session-2"] },
+        { tool: "read_scenario_summary", returned_count: 1, scenario_ids: ["session-1"] },
+      ] },
+      historical_audit: null,
+    });
+    expect(audit.hostEvidence.history).toBe("observed");
+    expect(audit.history.routeAudit.tool_called).toBe(true);
+    expect(audit.history.value).toContain("search_scenario_summary");
+    expect(audit.history.value).toContain("read_scenario_summary");
   });
   it("does not infer current-host MCP availability from an entry receipt or system probe", () => {
     const audit = projectFlowAudit({

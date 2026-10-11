@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
@@ -594,6 +596,7 @@ function FailedConsolidationsDialog({
 }) {
   const t = useTranslations("bankStats");
   const tFailed = useTranslations("failedConsolidations");
+  const tAction = useTranslations("actionFeedback");
   const { currentBank } = useBank();
   const [items, setItems] = useState<FailedMemoryItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -634,8 +637,10 @@ function FailedConsolidationsDialog({
       }
       toast.success(tFailed("recoverSuccess", { count: res.retried_count }));
       setRefreshTick((t) => t + 1);
-    } catch {
+    } catch (error) {
       // toast shown by interceptor
+
+      throw error;
     } finally {
       setRecovering(false);
     }
@@ -655,10 +660,10 @@ function FailedConsolidationsDialog({
           <span className="text-sm text-muted-foreground">
             {loading ? tFailed("loading") : tFailed("totalFailed", { total })}
           </span>
-          <Button size="sm" onClick={handleRecover} disabled={recovering || loading || total === 0}>
+          <ActionButton size="sm" successLabel={tAction("submitted")} onAction={handleRecover} disabled={recovering || loading || total === 0}>
             <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${recovering ? "animate-spin" : ""}`} />
             {tFailed("recoverAll")}
-          </Button>
+          </ActionButton>
         </div>
         <div className="flex-1 min-h-0 overflow-auto border border-border rounded-md">
           <Table>

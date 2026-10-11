@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.context_pipeline import promote_session_draft
-from lib.context_summary import read_context_index, write_context_index
+from lib.context_summary import read_context_index, update_context_index
 from lib.scenario_model import fingerprint_draft, validate_latest_v3_attempt
 from lib.scenario_source import read_session_source
 
@@ -32,7 +32,6 @@ def main():
     args = parser.parse_args()
 
     target = Path(args.index).expanduser()
-    before = target.read_bytes()
     index = read_context_index(target)
     rows = list(index.get("sessions") or [])
     position = next((i for i, row in enumerate(rows) if row.get("session_id") == args.session_id), None)
@@ -56,12 +55,16 @@ def main():
                "draft_sha256": fingerprint_draft(draft),
                "review_scope": published["review_scope"], "dry_run": args.dry_run}
     if not args.dry_run:
-        if hashlib.sha256(target.read_bytes()).digest() != hashlib.sha256(before).digest():
-            raise RuntimeError("context_index_changed_during_promotion")
         backup = target.with_name(target.name + ".pre-pilot-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
-        shutil.copy2(target, backup)
-        rows[position] = published
-        write_context_index(target, rows, index.get("projects") or [])
+        def replace(latest):
+            current = list(latest.get('sessions') or [])
+            selected = next((i for i, row in enumerate(current) if row.get('session_id') == identity), None)
+            if selected is None or current[selected] != rows[position]:
+                raise RuntimeError('context_index_changed_during_promotion')
+            shutil.copy2(target, backup)
+            current[selected] = published
+            return {**latest, 'sessions': current}
+        update_context_index(target, replace)
         receipt["backup"] = str(backup)
     print(json.dumps(receipt, ensure_ascii=False))
     return 0

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { ActionButton } from "@/components/ui/action-button";
 import { useTranslations } from "next-intl";
 import { Check, Copy } from "lucide-react";
 
@@ -27,30 +27,28 @@ function toDisplayText(value: unknown): string {
  */
 export function JsonViewer({ value, className = "bg-muted" }: JsonViewerProps) {
   const t = useTranslations("common");
-  const [copied, setCopied] = useState(false);
   const text = toDisplayText(value);
 
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard API unavailable (e.g. non-secure context) — ignore.
-    }
+    await navigator.clipboard.writeText(text);
   };
 
   return (
     <div className="relative group">
-      <button
-        type="button"
-        onClick={handleCopy}
-        title={copied ? t("copied") : t("copy")}
-        aria-label={copied ? t("copied") : t("copy")}
-        className="absolute top-1.5 right-1.5 p-1.5 rounded-md border border-border bg-background/70 text-muted-foreground opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-foreground hover:bg-muted transition-all"
-      >
-        {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-      </button>
+      <div className="absolute top-1.5 right-1.5 max-w-64">
+        <ActionButton
+          type="button"
+          onAction={handleCopy}
+          resetKey={text}
+          size="icon"
+          variant="outline"
+          title={t("copy")}
+          aria-label={t("copy")}
+          className="h-7 w-7"
+        >
+          <Copy className="w-3.5 h-3.5" />
+        </ActionButton>
+      </div>
       <pre className={`p-3 pr-10 rounded-md text-xs whitespace-pre-wrap break-words ${className}`}>
         {text}
       </pre>

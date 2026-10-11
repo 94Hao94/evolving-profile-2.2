@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 HISTORY_TOOL_NAMES={f'mcp__{controller}__{operation}'
  for controller in ('evolving_profile_controller','hindsight_controller')
- for operation in ('recall','research','read_research','read_source','find_sources','scenario_gate','read_scenario_summary','read_context_summary')}
+ for operation in ('recall','research','user_recall','user_research','agent_recall','agent_research','read_research','read_source','read_agent_process_memory','find_sources','search_scenario_summary','search_scenario_contexts','scenario_gate','read_scenario_summary','read_context_summary')}
 HOME=Path.home()
 ROOT=Path(__file__).resolve().parent.parent
 STATE_ROOT=Path(os.environ.get('EVOLVING_PROFILE_STATE_ROOT', str(HOME/'.evolving-profile')))
@@ -31,6 +31,10 @@ GUIDANCE_CANDIDATES=STATE_ROOT/'guidance-v1/codex-consolidation.json'
 SELECTOR_REVIEWED_EVAL=STATE_ROOT/'control-plane/selector-reviewed-eval.json'
 TOPIC_CATALOG_PATH=STATE_ROOT/'catalog/topics.sqlite3'
 if str(GUIDANCE_V1_SRC) not in sys.path:sys.path.insert(0,str(GUIDANCE_V1_SRC))
+from prompt_origin import PromptOriginResolver,select_prompt_occurrences
+from status_projection import prompt_population_projection
+CODEX_SESSION_ROOTS=[Path(os.environ.get('EVOLVING_PROFILE_HOST_SESSIONS_ROOT',str(HOME/'.codex/sessions' if STATE_ROOT==HOME/'.evolving-profile' else STATE_ROOT/'host-sessions'))),
+                     Path(os.environ.get('EVOLVING_PROFILE_HOST_ARCHIVED_SESSIONS_ROOT',str(HOME/'.codex/archived_sessions' if STATE_ROOT==HOME/'.evolving-profile' else STATE_ROOT/'archived-host-sessions')))]
 _cache_spec=importlib.util.spec_from_file_location('dashboard_cache',RUNTIME_ROOT/'host-adapter/dashboard_cache.py')
 _cache_module=importlib.util.module_from_spec(_cache_spec);_cache_spec.loader.exec_module(_cache_module)
 _receipts_spec=importlib.util.spec_from_file_location('turn_host_receipts',RUNTIME_ROOT/'host-adapter/host_receipt_projection.py')
@@ -206,42 +210,16 @@ def selector_evaluation_snapshot():
 def _norm_prompt(value):
  return ' '.join(str(value or '').split()).strip()
 
-def _looks_agent_generated_prompt(prompt):
- text=_norm_prompt(prompt).casefold()
- markers=(
-  'memory writing agent:',
-  'you are a memory writing agent',
-  'consolidate raw memories and rollout summaries',
-  'codex://threads/',
-  'test probe',
- )
- return any(marker in text for marker in markers)
-
-def _looks_non_user_prompt(prompt):
- text=_norm_prompt(prompt).casefold()
- markers=(
-  '[trainer_automatic_next_context]',
-  '[trainer_automatic_',
-  '[system_',
-  '[internal_',
-  'automatic_next_context',
- )
- return any(marker in text for marker in markers)
-
-def _prompt_ingress_rows():
- path=STATE_ROOT/'audit/prompt-ingress.jsonl';rows=[]
+def _prompt_ingress_rows(detail_id=None,**priority_options):
+ path=STATE_ROOT/'audit/prompt-ingress.jsonl';raw_rows=[];resolver=PromptOriginResolver(CODEX_SESSION_ROOTS)
  try:
   for line in _tail_lines(path,2000):
    try:
     row=json.loads(line)
    except Exception: continue
-   prompt=_norm_prompt(row.get('prompt_preview'))
-   origin=str(row.get('prompt_origin') or 'user_direct').casefold()
-   source=str(row.get('source') or '')
-   if not prompt or _looks_agent_generated_prompt(prompt) or _looks_non_user_prompt(prompt) or origin in {'agent_generated','agent_tool_call','test_probe','automatic','system'} or source!='codex-userpromptsubmit': continue
-   row['prompt_preview']=prompt;rows.append(row)
+   raw_rows.append(row)
  except OSError: pass
- return sorted(rows,key=lambda x:str(x.get('at') or ''),reverse=True)
+ return resolver.resolve_rows(select_prompt_occurrences(raw_rows),detail_id=detail_id,**priority_options)
 
 def _hook_output_rows():
  root=STATE_ROOT/'audit/hook-output-receipts';rows=[]
@@ -298,6 +276,11 @@ def _bound_to_prompt(event, prompt_binding, prompt_ingress, fallback_binding=Non
  event_id=str(event.get('hook_invocation_id') or event.get('check_id') or event.get('tool_call_id') or fallback_binding.get('hook_invocation_id') or '')
  prompt_id=str((prompt_binding or {}).get('hook_invocation_id') or '')
  if not prompt_id or event_id!=prompt_id:return False
+ for scope in (event,fallback_binding):
+  for field in ('hook_invocation_id','check_id'):
+   if scope.get(field) and str(scope[field])!=prompt_id:return False
+  for field in ('session_id','turn_id'):
+   if scope.get(field) and (prompt_binding or {}).get(field) and str(scope[field])!=str(prompt_binding[field]):return False
  session_id=str(event.get('session_id') or fallback_binding.get('session_id') or '')
  prompt_session=str((prompt_binding or {}).get('session_id') or '')
  if session_id and prompt_session and session_id!=prompt_session:return False
@@ -341,13 +324,20 @@ def _time_window_tool_activity(prompt_at, route_receipts=None, window_minutes=2,
   binding=dict(next(((receipt.get('prompt_binding') or {}) for receipt in route_receipts or []
                      if (receipt.get('prompt_binding') or {}).get('hook_invocation_id')),{}))
  exact=[];unattributed=[];seen_exact=set();seen_unattributed=set()
- allowed={'recall','research','read_research','read_source','find_sources','scenario_gate','read_scenario_summary','read_context_summary'}
+ allowed={'recall','research','user_recall','user_research','agent_recall','agent_research','read_research','read_source','find_sources','read_agent_process_memory','search_scenario_summary','search_scenario_contexts','scenario_gate','read_scenario_summary','read_context_summary'}
  def in_window(event):
   at=_as_utc(event.get('at'))
   return at is not None and start<=at<=end
  def compact(event):
   raw=str(event.get('tool') or 'unknown');tool=raw.rsplit('__',1)[-1]
   return {'tool':tool,'at':event.get('at'),'check_id':event.get('check_id') or event.get('hook_invocation_id'),
+          'tool_call_id':event.get('tool_call_id'),'session_id':event.get('session_id'),'turn_id':event.get('turn_id'),
+          'mapping_items':list(event.get('mapping_items') or [])[:200],
+          'returned_content_snapshot':event.get('returned_content_snapshot'),
+          'delivered_count':event.get('delivered_count'),'delivery':event.get('delivery') or {},
+          'source_navigation':list(event.get('source_navigation') or [])[:200],
+          'source_navigation_returned_count':event.get('source_navigation_returned_count'),
+          'source_navigation_returned_ids':list(event.get('source_navigation_returned_ids') or [])[:200],
           'returned_count':event.get('returned_count'),'candidate_count':event.get('candidate_count'),
           'research_id':event.get('research_id'),'memory_id':event.get('memory_id'),
           'memory_ids':list(event.get('memory_ids') or [])[:50],
@@ -398,7 +388,7 @@ def _time_window_guidance_activity(prompt_at, entry_receipts=None, deliveries=No
  records=[];unattributed=[];seen=set()
  sources=list(entry_receipts or [])+list(deliveries or [])
  sources.extend(row for row in (global_activity or [])
-                if str(row.get('tool') or '').rsplit('__',1)[-1] in {'get_preference','read_preference','get_task_guidance'})
+                if str(row.get('tool') or '').rsplit('__',1)[-1] in {'user_preference','get_preference','read_preference','read_preference_unit','get_task_guidance','read_guidance','read_guidance_unit'})
  for row in sources:
   raw=row.get('at')
   if raw is None:continue
@@ -719,10 +709,15 @@ def _captured_history_for_turn(capture_path,session_id,turn_id):
  tools={page['tool_name'] for page in pages};research=any(name.endswith('__research') or name.endswith('__read_research') for name in tools)
  return {'route':'agent_mcp_research' if research else 'agent_mcp_recall','mode':'research' if research else 'recall','controller_state':'same_turn_host_receipt','state':'observed','recall':None,'research':pages if research else [],'candidate_count':sum(int(page.get('returned_to_host_count') or 0) for page in pages),'returned_to_host_count':len(seen),'unread_candidate_count':sum(1 for page in pages if page.get('next_offset') is not None),'items':items[:20],'boundary':'same_turn_PostToolUse_MCP_response'}
 
-def guidance_prompt_list(limit=20,cursor='0',host='all',detail_id=None,query_text=''):
+def guidance_prompt_list(limit=20,cursor='0',host='all',detail_id=None,query_text='',prompt_source='natural'):
  try: offset=max(0,int(cursor or 0))
  except Exception: offset=0
- ingress=_prompt_ingress_rows();hooks=_hook_output_rows();needle_terms=[part for part in _norm_prompt(query_text).split() if part]
+ try: page_limit=max(1,min(50,int(limit)))
+ except (ValueError,TypeError,OverflowError):page_limit=20
+ ingress=_prompt_ingress_rows(detail_id=detail_id,page_offset=offset,page_limit=page_limit,host=host,query_text=query_text,prompt_source=prompt_source);hooks=_hook_output_rows();needle_terms=[part for part in _norm_prompt(query_text).split() if part]
+ population=[row for row in ingress if (str(host or 'all').casefold()=='all' or str(row.get('host_id') or 'codex').casefold()==str(host).casefold()) and
+             (not needle_terms or all(term in _norm_prompt(row.get('prompt_preview')) for term in needle_terms))]
+ population,source_projection=prompt_population_projection(population,prompt_source,detail_id=detail_id)
  # UserPromptSubmit's forced get_preference call is recorded in the
  # entry-adapter receipt lane, separately from full guidance deliveries.
  entry_receipts=[]
@@ -758,7 +753,7 @@ def guidance_prompt_list(limit=20,cursor='0',host='all',detail_id=None,query_tex
  delivery=guidance_delivery_list(100).get('items') or []
  research_rows=research_snapshot(include_host_receipts=False).get('items') or []
  selected=[]; used_delivery=set(); used_hook=set(); route_receipts=_route_receipt_rows(); global_activity=_global_mcp_activity_rows()
- for row in ingress:
+ for row in population:
   if str(host or 'all').casefold()!='all' and str(row.get('host_id') or 'codex').casefold()!=str(host).casefold(): continue
   prompt=_norm_prompt(row.get('prompt_preview')); fp=row.get('prompt_fingerprint')
   if needle_terms and not all(term in prompt for term in needle_terms): continue
@@ -887,10 +882,10 @@ def guidance_prompt_list(limit=20,cursor='0',host='all',detail_id=None,query_tex
   navigation=entry_record.get('navigation_map') or None
   row['system_probe']=system_probe
   history_plan = next((item.get('history_plan') for item in hook_matches if item.get('history_plan')), None)
-  selected.append({'prompt_id':str(fp or hashlib.sha256(prompt.encode()).hexdigest()[:16])+':'+str(row.get('at') or ''),'at':row.get('at'),'user_prompt':prompt,'prompt_origin':row.get('prompt_origin'),'session_id':row.get('session_id'),'turn_id':row.get('turn_id'),'hook_invocation_id':row.get('hook_invocation_id'),'source':row.get('source'),'instruction_receipt':manual,'navigation_map':navigation,'guidance_receipt':guidance,'system_probe':system_probe,'history_plan':history_plan,'task_state':entry_record.get('task_state') or (guidance or {}).get('task_state'),'evidence_decision':evidence_decision,'hook_receipts':memory,'historical_audit':historical_audit,'memory_route_receipt':route_receipt,'time_window_activity':time_window_activity,'time_window_guidance_activity':time_window_guidance_activity,'history_decision':history_decision,'history_decision_evidence':history_decision_evidence,'routes':{'entry_guidance':'observed_entry_adapter','multi_dimensional_preference':'observed' if guidance or memory else 'not_observed','historical_memory':historical_state,'source_read':'observed' if source_observed else 'unknown'}})
- items=([row for row in selected if row.get('prompt_id')==detail_id] if detail_id else selected[offset:offset+max(1,min(50,int(limit)))])
+  selected.append({'prompt_id':str(fp or hashlib.sha256(prompt.encode()).hexdigest()[:16])+':'+str(row.get('at') or ''),'at':row.get('at'),'user_prompt':prompt,'prompt_origin':row.get('prompt_origin'),'origin_kind':row.get('origin_kind','unknown'),'origin_status':row.get('origin_status','unknown'),'origin_evidence':row.get('origin_evidence'),'session_id':row.get('session_id'),'turn_id':row.get('turn_id'),'hook_invocation_id':row.get('hook_invocation_id'),'source':row.get('source'),'instruction_receipt':manual,'navigation_map':navigation,'guidance_receipt':guidance,'system_probe':system_probe,'history_plan':history_plan,'task_state':entry_record.get('task_state') or (guidance or {}).get('task_state'),'evidence_decision':evidence_decision,'hook_receipts':memory,'historical_audit':historical_audit,'memory_route_receipt':route_receipt,'time_window_activity':time_window_activity,'time_window_guidance_activity':time_window_guidance_activity,'history_decision':history_decision,'history_decision_evidence':history_decision_evidence,'routes':{'entry_guidance':'observed_entry_adapter','multi_dimensional_preference':'observed' if guidance or memory else 'not_observed','historical_memory':historical_state,'source_read':'observed' if source_observed else 'unknown'}})
+ items=([row for row in selected if row.get('prompt_id')==detail_id] if detail_id else selected[offset:offset+page_limit])
  next_cursor=str(offset+len(items)) if offset+len(items)<len(selected) else None
- return {'schema':'guidance.user-prompt-list.v1','items':items,'count':len(items),'total':len(selected),'has_more':next_cursor is not None,'next_cursor':next_cursor,'host':host}
+ return {'schema':'guidance.user-prompt-list.v2','items':items,'count':len(items),'total':len(selected),'has_more':next_cursor is not None,'next_cursor':next_cursor,'host':host,**source_projection}
 
 def guidance_prompt_detail(prompt_id,candidate_group=None,offset=0,limit=10):
  all_rows=guidance_prompt_list(1,0,'all',detail_id=prompt_id).get('items') or []
@@ -2481,7 +2476,7 @@ class H(BaseHTTPRequestHandler):
    elif re.fullmatch(r'/api/guidance/deliveries/[^/]+',path):
     occurrence_id=urllib.parse.unquote(path.rsplit('/',1)[-1]);body,etag=api_payload(path,guidance_delivery_detail(occurrence_id));ctype='application/json; charset=utf-8'
    elif path=='/api/guidance/prompts':
-    query=urllib.parse.parse_qs(parsed.query);limit=int((query.get('limit') or ['20'])[0]);cursor=(query.get('cursor') or ['0'])[0];host=(query.get('host') or ['all'])[0];search=(query.get('q') or [''])[0];body,etag=api_payload(path+':'+str(limit)+':'+str(cursor)+':'+str(host)+':'+str(search),guidance_prompt_list(limit,cursor,host,query_text=search));ctype='application/json; charset=utf-8'
+    query=urllib.parse.parse_qs(parsed.query);limit=(query.get('limit') or ['20'])[0];cursor=(query.get('cursor') or ['0'])[0];host=(query.get('host') or ['all'])[0];search=(query.get('q') or [''])[0];prompt_source=(query.get('prompt_source') or ['natural'])[0];body,etag=api_payload(path+':'+str(limit)+':'+str(cursor)+':'+str(host)+':'+str(search)+':'+str(prompt_source),guidance_prompt_list(limit,cursor,host,query_text=search,prompt_source=prompt_source));ctype='application/json; charset=utf-8'
    elif re.fullmatch(r'/api/guidance/prompts/[^/]+',path):
     prompt_id=urllib.parse.unquote(path.rsplit('/',1)[-1]);query=urllib.parse.parse_qs(parsed.query)
     group=(query.get('candidate_group') or [None])[0];offset=int((query.get('offset') or ['0'])[0]);limit=int((query.get('limit') or ['10'])[0])

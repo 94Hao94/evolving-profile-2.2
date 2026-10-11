@@ -6,11 +6,10 @@ import tempfile
 import unittest
 
 
-SCRIPT=Path('/tmp/ep-test-user/Documents/Codex/2026-09-09/hind/outputs/evolving-profile-2.1/rollback-2.1.zsh')
-BASELINE=Path('/tmp/ep-test-user/.evolving-profile/backups/code/evolving-profile-2.1-pre-20260919T1730')
+SCRIPT=Path('/Users/apple/Documents/Codex/2026-09-09/hind/outputs/evolving-profile-2.1/rollback-2.1.zsh')
+BASELINE=Path('/Users/apple/.evolving-profile/backups/code/evolving-profile-2.1-pre-20260919T1730')
 
 
-@unittest.skipUnless(SCRIPT.exists(), "sanitized distribution does not ship the private rollback fixture")
 class RollbackDrillTest(unittest.TestCase):
     def fixture(self, root:Path):
         for name in ('source','state','backup','runtime','launch','release'):
@@ -47,7 +46,7 @@ class RollbackDrillTest(unittest.TestCase):
             completed=subprocess.run([str(SCRIPT),'--dry-run'],env=env,text=True,capture_output=True)
             self.assertIn(str(root/'source'),completed.stdout)
             self.assertNotIn('launchctl bootout',completed.stdout)
-            self.assertNotIn('required path missing: /tmp/ep-test-user/',completed.stderr)
+            self.assertNotIn('required path missing: /Users/apple/',completed.stderr)
 
     def test_apply_restores_isolated_copy_and_keeps_quarantine_paths_unique(self):
         with tempfile.TemporaryDirectory(prefix='ep21-rollback-apply-') as directory:

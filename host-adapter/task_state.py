@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from lib.content import extract_task_user_request
 
 
 class TaskStateStore:
@@ -92,8 +93,15 @@ class TaskStateStore:
                update_reason: str = "prompt_ingress") -> dict:
         with self._lock(session_id, exclusive=True):
             existing = self._load_unlocked(session_id)
+            current_message = " ".join(extract_task_user_request(str(prompt or "")).split())
+            if not current_message:
+                # A host context message is not a new mission or continuation.
+                # Keep the existing task's version, identity and expiry intact.
+                return existing or {}
             previous = existing if continuation else None
-            current_message = " ".join(str(prompt or "").split())
+            if previous:
+                prior_objective = extract_task_user_request(str(previous.get('current_objective') or ''))
+                previous = {**previous, 'current_objective': prior_objective} if prior_objective else None
             objective = (previous or {}).get("current_objective") or current_message
             context = objective if previous and objective != current_message else None
             value = {

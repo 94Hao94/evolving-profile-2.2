@@ -1761,6 +1761,14 @@ class TestDeltaRefreshGeminiEval:
     not that the contract holds against an actual model.
     """
 
+    @pytest.fixture(autouse=True)
+    def english_style_contract(self, monkeypatch):
+        from evolving_profile_api.config import clear_config_cache
+        monkeypatch.setenv("EVOLVING_PROFILE_API_LLM_OUTPUT_LANGUAGE", "English")
+        clear_config_cache()
+        yield
+        clear_config_cache()
+
     async def _seed(
         self,
         memory: MemoryEngine,
@@ -1768,12 +1776,13 @@ class TestDeltaRefreshGeminiEval:
         bank_id: str,
         existing_markdown: str,
         memories: list[str],
+        source_query: str = "Document the news-feed skill: purpose, rules, procedure, stop conditions.",
     ) -> dict[str, Any]:
         await memory.get_bank_profile(bank_id, request_context=request_context)
         mm = await memory.create_mental_model(
             bank_id=bank_id,
             name="Skill Doc",
-            source_query="Document the news-feed skill: purpose, rules, procedure, stop conditions.",
+            source_query=source_query,
             content=existing_markdown,
             trigger={"mode": "delta"},
             request_context=request_context,
@@ -2103,9 +2112,14 @@ class TestDeltaRefreshGeminiEval:
             bank_id,
             existing_markdown=existing_markdown,
             memories=["The API exposes retain and recall operations."],
+            source_query="Document the API operations, performance, failure handling, examples, constraints, and procedures.",
         )
         mental_model_id = seeded["mm"]["id"]
         previous_content = seeded["first"]["content"]
+        first_stored = await gemini_memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mental_model_id, request_context=request_context
+        )
+        previous_doc = StructuredDocument.model_validate(first_stored["structured_content"])
 
         def touched_sections(refresh: dict[str, Any]) -> set[str]:
             applied = (refresh.get("reflect_response") or {}).get("delta_operations_applied") or []
@@ -2113,15 +2127,15 @@ class TestDeltaRefreshGeminiEval:
             ids |= {op.get("assigned_id") for op in applied}
             return {i for i in ids if i}
 
-        def owning_section(markdown: str, line: str) -> str | None:
-            return next((s.id for s in split_markdown(markdown).sections if line in render_section(s)), None)
+        def owning_section(document: StructuredDocument, line: str) -> str | None:
+            return next((s.id for s in document.sections if line in render_section(s)), None)
 
         # The seeding refresh is a real delta refresh: the model may deliberately
         # rewrite sections there too, so the contract is the same as every later
         # round — a construct in a section no operation named must survive.
         first_touched = touched_sections(seeded["first"])
         for name, canary in canaries.items():
-            if owning_section(existing_markdown, canary) in first_touched:
+            if owning_section(split_markdown(existing_markdown), canary) in first_touched:
                 continue
             assert canary in previous_content.splitlines(), (
                 f"{name} was lost by the first refresh, which never named its section "
@@ -2130,7 +2144,7 @@ class TestDeltaRefreshGeminiEval:
         # Constructs the seed refresh edited away are no longer part of the contract.
         canaries = {n: c for n, c in canaries.items() if c in previous_content.splitlines()}
 
-        previous_sections = {s.id: render_section(s) for s in split_markdown(previous_content).sections}
+        previous_sections = {s.id: render_section(s) for s in previous_doc.sections}
         # Sections no operation has *ever* named must still be byte-identical at
         # the end of the run, not just between consecutive rounds.
         never_touched = dict(previous_sections)
@@ -2181,7 +2195,7 @@ class TestDeltaRefreshGeminiEval:
                 f"touched={sorted(i for i in touched if i)} bytes={len(content)}"
             )
 
-            current = split_markdown(content)
+            current = doc
             for section in current.sections:
                 if section.id in touched:
                     continue
@@ -2197,13 +2211,14 @@ class TestDeltaRefreshGeminiEval:
             for name, canary in canaries.items():
                 if canary not in previous_lines:
                     continue  # an earlier round deliberately edited it away
-                if owning_section(previous_content, canary) in touched:
+                if owning_section(previous_doc, canary) in touched:
                     continue  # the model deliberately edited that section
                 assert canary in content.splitlines(), (
                     f"{where}: {name} disappeared from a section the model never touched.\n{content}"
                 )
 
             previous_content = content
+            previous_doc = current
             previous_sections = {s.id: render_section(s) for s in current.sections}
 
         print(f"[delta-stability] final document after {len(rounds)} rounds:\n{previous_content}")
@@ -2215,7 +2230,7 @@ class TestDeltaRefreshGeminiEval:
             "Every section was edited at least once, so this run proves nothing about "
             "preservation — the fixture's facts have drifted too close to the seed document."
         )
-        final_by_id = {s.id: render_section(s) for s in split_markdown(previous_content).sections}
+        final_by_id = {s.id: render_section(s) for s in previous_doc.sections}
         for section_id, original in never_touched.items():
             assert final_by_id.get(section_id) == original, (
                 f"Section {section_id!r} eroded across {len(rounds)} rounds without any "
@@ -2264,10 +2279,14 @@ class TestDeltaRefreshGeminiEval:
         await gemini_memory.update_mental_model(
             bank_id=bank_id,
             mental_model_id=mental_model_id,
+            content=f"{current}\n{stale_sections}\n",
             max_tokens=budget,
             request_context=request_context,
         )
-        before = count_cl100k_tokens(seeded["first"]["content"])
+        persisted = await gemini_memory.get_mental_model(
+            bank_id=bank_id, mental_model_id=mental_model_id, request_context=request_context
+        )
+        before = count_cl100k_tokens(persisted["content"])
         assert before > budget, f"the fixture must start over budget, got {before} <= {budget}"
 
         await gemini_memory.retain_batch_async(

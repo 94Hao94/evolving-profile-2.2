@@ -4,12 +4,15 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { JEV_BASE_URL, JEV_MODEL, normalizeJevJudge } from "@/lib/jev-provider";
+import { discoverModelProposal, modelIdentityMatches, parseModelEnvironment, resolveEffectiveEmbedding, maskRetrievalModels, restoreMaskedRetrievalKeys } from "@/lib/retrieval-model-identity";
+import { EP_STATE_ROOT, EP_API_ENV, EP_MANAGED_MAC_HOST } from "@/lib/ep-state-paths";
 import { homedir } from "node:os";
 
-const ROOT = process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(homedir(), ".evolving-profile");
+const ROOT = EP_STATE_ROOT;
 const SETTINGS = path.join(ROOT, "config/runtime-settings.json");
 const OVERLAY = path.join(ROOT, "config/retrieval-models.env");
-const ENV = path.join(ROOT, "profiles/evolving-profile-api.env");
+const ENV = EP_API_ENV;
 const execFileAsync = promisify(execFile);
 
 function merge(base: any, value: any): any {
@@ -20,9 +23,7 @@ function merge(base: any, value: any): any {
 }
 
 function mask(value: any) {
-  const copy = structuredClone(value);
-  for (const model of [copy.embedding, copy.reranker]) if (model?.api_key) model.api_key = `••••${String(model.api_key).slice(-4)}`;
-  return copy;
+  return maskRetrievalModels(value);
 }
 
 function envValue(value: unknown) {
@@ -43,6 +44,33 @@ async function modelFiles(root: string, depth = 0): Promise<string[]> {
     }
     return files;
   } catch { return []; }
+}
+
+async function discoverLocalModelCandidates() {
+  const roots = [path.join(ROOT,"models"), path.join(ROOT,"eval"), ...(EP_MANAGED_MAC_HOST ? [path.join(homedir(),".cache/chroma/onnx_models")] : [])];
+  const candidates: any[] = [];
+  async function walk(root: string, depth = 0): Promise<void> {
+    if (depth > 4) return;
+    let entries: any[] = [];
+    try { entries = await readdir(root, { withFileTypes: true }); } catch { return; }
+    const directFiles = entries.filter((entry) => entry.isFile()).map((entry) => entry.name.toLowerCase());
+    const hasConfig = directFiles.includes("config.json") || await access(path.join(root, "encoder/config.json")).then(() => true).catch(() => false);
+    const hasTokenizer = directFiles.some((file) => ["tokenizer.json", "tokenizer.model", "vocab.txt", "spiece.model"].includes(file)) || await access(path.join(root, "tokenizer/tokenizer.json")).then(() => true).catch(() => false);
+    const hasWeights = directFiles.some((file) => /^(model\.onnx|pytorch_model.*\.(bin|safetensors)|model.*\.(bin|safetensors|gguf))$/.test(file)) || await access(path.join(root, "onnx/model.onnx")).then(() => true).catch(() => false);
+    if (hasConfig && hasTokenizer && hasWeights) {
+      let config: any = {};
+      for (const name of ["config.json", "encoder/config.json"]) { try { config = JSON.parse(await readFile(path.join(root, name), "utf8")); break; } catch { /* inspect next known location */ } }
+      const label = String(config._name_or_path || path.basename(root));
+      const haystack = `${root} ${label}`.toLowerCase();
+      const kind = /rerank|cross.encoder|bge-reranker/.test(haystack) ? "reranker" : "embedding";
+      const modelRoot = path.basename(root).toLowerCase() === "onnx" ? path.dirname(root) : root;
+      candidates.push({ kind, path: modelRoot, model: label, dimensions: Number(config.hidden_size || config.embedding_size || config.projection_dim || 0) || null, status: "ready" });
+      return;
+    }
+    for (const entry of entries) if (entry.isDirectory() && !entry.name.startsWith(".")) await walk(path.join(root, entry.name), depth + 1);
+  }
+  for (const root of roots) await walk(root);
+  return candidates.filter((item, index, all) => all.findIndex((candidate) => candidate.path === item.path) === index);
 }
 
 async function validateLocalModel(model: any, kind: "embedding" | "reranker") {
@@ -66,24 +94,48 @@ async function validateLocalModel(model: any, kind: "embedding" | "reranker") {
 }
 
 async function current() {
-  const envText = await readFile(ENV, "utf8");
-  const env = Object.fromEntries(envText.split(/\r?\n/).filter((line) => line && !line.trimStart().startsWith("#") && line.includes("=")).map((line) => { const index = line.indexOf("="); return [line.slice(0, index), line.slice(index + 1).trim().replace(/^['"]|['"]$/g, "")]; }));
+  const optionalEnv = async (filename: string) => readFile(filename, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const envText = (await optionalEnv(ENV)) + "\n" + await optionalEnv(OVERLAY);
+  const env = parseModelEnvironment(envText);
   const base = {
-    embedding: { enabled: true, mode: "local", provider: env.EVOLVING_PROFILE_API_EMBEDDINGS_PROVIDER || "onnx", model: env.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_MODEL_ID || "intfloat/multilingual-e5-small", local_path: env.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_MODEL_PATH || "", dimensions: Number(env.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_DIMENSIONS || 384), max_tokens: Number(env.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_MAX_TOKENS || 512), device: "cpu", profile_id: "embedding-default", status: "configured" },
+    embedding: resolveEffectiveEmbedding({ enabled: true, mode: "local", provider: "onnx", model: "intfloat/multilingual-e5-small", local_path: "", dimensions: 384, max_tokens: 512, device: "cpu", profile_id: "embedding-default", status: "configured" },env),
     reranker: { enabled: env.EVOLVING_PROFILE_API_RERANKER_PROVIDER !== "rrf", mode: "local", provider: env.EVOLVING_PROFILE_API_RERANKER_PROVIDER || "rrf", model: env.EVOLVING_PROFILE_API_RERANKER_LOCAL_MODEL || "BAAI/bge-reranker-base", local_path: "", device: "cpu", profile_id: "reranker-default", status: env.EVOLVING_PROFILE_API_RERANKER_PROVIDER === "rrf" ? "configured_but_inactive" : "configured" },
     embedding_profiles: [], reranker_profiles: [],
     fusion: { enabled: true, algorithm: "rrf", profile_id: "fusion-rrf" },
-    judge: { enabled: false, provider: "jev", mode: "api", base_url: "", model: "", api_key: "", timeout_ms: 5000, max_tokens: 600, mode_policy: "off", fallback: "rules", send_scope: "metadata_summary", risk_gate_enabled: false, status: "disabled" },
+    judge: { enabled: false, provider: "jev", mode: "systemone", base_url: JEV_BASE_URL, model: JEV_MODEL, api_key: "", timeout_ms: 5000, max_tokens: 600, mode_policy: "off", fallback: "rules", send_scope: "metadata_summary", risk_gate_enabled: false, status: "disabled" },
   };
   let settings: any = {};
   try { settings = JSON.parse(await readFile(SETTINGS, "utf8")).retrieval_models ?? {}; } catch { /* first-run uses environment defaults */ }
   const result = merge(base, settings);
+  result.configuration_status = envText.trim() || Object.keys(settings).length ? "configured" : "unconfigured";
+  if (result.configuration_status === "unconfigured") {
+    result.embedding.status = "unconfigured";
+    result.reranker.status = "unconfigured";
+  }
+  result.judge = normalizeJevJudge(result.judge);
   if (!Array.isArray(result.embedding_profiles) || result.embedding_profiles.length === 0) result.embedding_profiles = [{ ...result.embedding }];
   if (!Array.isArray(result.reranker_profiles) || result.reranker_profiles.length === 0) result.reranker_profiles = [{ ...result.reranker }];
   result.embedding.api_key = env.EVOLVING_PROFILE_API_EMBEDDINGS_OPENAI_API_KEY || "";
   result.embedding.base_url = env.EVOLVING_PROFILE_API_EMBEDDINGS_OPENAI_BASE_URL || "";
   result.reranker.api_key = env.EVOLVING_PROFILE_API_RERANKER_TEI_API_KEY || "";
   result.reranker.base_url = env.EVOLVING_PROFILE_API_RERANKER_TEI_URL || "";
+  const local_inventory = await discoverLocalModelCandidates();
+  result.local_inventory = local_inventory;
+  for (const kind of ["embedding", "reranker"] as const) {
+    const configured=result[kind];
+    const identityKeys=["model","provider","mode","local_path","dimensions"];
+    const savedIdentity=Object.fromEntries(identityKeys.map(key=>[key,configured[key]]));
+    if(kind==="embedding") result[kind]=resolveEffectiveEmbedding(configured,env);
+    else if(env.EVOLVING_PROFILE_API_RERANKER_PROVIDER==="rrf") result[kind]={...configured,enabled:false,provider:"rrf"};
+    result[kind] = discoverModelProposal(result[kind],local_inventory,kind);
+    const profile=result[`${kind}_profiles`].find((item:any)=>item.profile_id===result[kind].profile_id);
+    result[kind].profile_identity=!result[kind].enabled ? "inactive" : profile && modelIdentityMatches(profile,result[kind]) ? "matches" : "drifted";
+    result[kind].effective_configuration=Object.fromEntries(["model","provider","mode","local_path","dimensions","base_url","enabled"].map(key=>[key,result[kind][key]]));
+    result[kind].configured_identity=savedIdentity;
+  }
   return result;
 }
 
@@ -112,9 +164,8 @@ async function validate(models: any) {
     }
   }
   if (!Number.isInteger(models.embedding.dimensions) || models.embedding.dimensions < 1 || models.embedding.dimensions > 65536) throw new Error("向量维度无效");
-  if (!Number.isInteger(models.judge.timeout_ms) || models.judge.timeout_ms < 500 || models.judge.timeout_ms > 60000) throw new Error("JEV 超时必须在 500 到 60000 毫秒之间");
-  if (!Number.isInteger(models.judge.max_tokens) || models.judge.max_tokens < 32 || models.judge.max_tokens > 8000) throw new Error("JEV 最大输出长度无效");
   if (!["off", "shadow", "assist", "enforce"].includes(models.judge.mode_policy)) throw new Error("JEV 运行模式无效");
+  if (models.judge.base_url !== JEV_BASE_URL || models.judge.model !== JEV_MODEL) throw new Error("JEV 地址和模型由系统固定管理");
   if (!models.judge.enabled && models.judge.risk_gate_enabled) throw new Error("须先启用 JEV，才能启用风险确认门");
 }
 
@@ -131,7 +182,7 @@ function modelEnv(models: any) {
       values.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_MAX_TOKENS = String(embedding.max_tokens || 512);
       if (embedding.local_path) {
         values.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_MODEL_PATH = path.join(embedding.local_path, "onnx/model.onnx");
-        values.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_TOKENIZER_NAME_OR_PATH = embedding.local_path;
+        values.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_TOKENIZER_NAME_OR_PATH = path.join(embedding.local_path, "onnx");
       }
     }
   } else {
@@ -164,9 +215,11 @@ export async function POST(request: Request) {
   const incoming = await request.json();
   const oldModels = await current();
   const models = merge(oldModels, incoming);
-  for (const key of ["embedding", "reranker", "judge"]) if (incoming?.[key]?.api_key?.startsWith("••••")) models[key].api_key = oldModels[key].api_key;
+  models.judge = normalizeJevJudge(models.judge);
+  restoreMaskedRetrievalKeys(incoming, oldModels, models);
   try {
     await validate(models);
+    const retrievalChanged = modelEnv(models) !== modelEnv(oldModels);
     const nextSettings = { ...settingsCurrent, retrieval_models: models, updated_at: new Date().toISOString() };
     await mkdir(path.dirname(SETTINGS), { recursive: true });
     const settingsTemp = `${SETTINGS}.${randomUUID()}.tmp`;
@@ -180,6 +233,8 @@ export async function POST(request: Request) {
       await unlink(settingsTemp).catch(() => undefined);
       await unlink(envTemp).catch(() => undefined);
     }
+    if (!EP_MANAGED_MAC_HOST) return NextResponse.json({ ...mask(models), saved: true, applied: false, apply_status: "unsupported", message: "Configuration saved. Automatic service restart is unavailable for this installation; apply it using this installation's service manager." });
+    if (!retrievalChanged) return NextResponse.json({ ...mask(models), saved: true, applied: true, message: "JEV 设置已保存，新调用生效；检索模型未变化，无需重启 API。" });
     let applied = false;
     let applyMessage = "模型设置已保存；API 服务重启后应用。";
     try {

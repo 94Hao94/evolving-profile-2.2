@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import path from "node:path";
-import { homedir } from "node:os";
 import { spawn } from "node:child_process";
+import { access } from "node:fs/promises";
+import { epStatePath, EP_RUNTIME_PYTHON } from "@/lib/ep-state-paths";
 
 export async function POST(request: Request) {
   const origin = request.headers.get("origin");
@@ -10,9 +10,10 @@ export async function POST(request: Request) {
     const body = await request.text();
     if (body.length > 24000) return NextResponse.json({ error: "修改内容过长" }, { status: 413 });
     JSON.parse(body);
+    const script = epStatePath("runtime/host-adapter/manual_preference_correction.py");
+    if (!await access(EP_RUNTIME_PYTHON).then(() => true).catch(() => false) || !await access(script).then(() => true).catch(() => false)) return NextResponse.json({ code: "runtime_unavailable", error: "Correction runtime is unavailable for this installation." }, { status: 503 });
     const result = await new Promise<{code: number | null; value: any}>((resolve, reject) => {
-      const root = process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(homedir(), ".evolving-profile");
-      const child = spawn(process.env.EP_RUNTIME_PYTHON ?? "python3", [path.join(root, "runtime/host-adapter/manual_preference_correction.py"), path.join(root, "guidance-v1/guidance-v1.json")], { timeout: 8000 });
+      const child = spawn(EP_RUNTIME_PYTHON, [script, epStatePath("guidance-v1/guidance-v1.json")], { timeout: 8000, env: { ...process.env, EVOLVING_PROFILE_STATE_ROOT: epStatePath() } });
       let output = "";
       child.stdout.on("data", (chunk) => { output += chunk; });
       child.on("error", reject);

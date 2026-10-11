@@ -2643,7 +2643,7 @@ def test_chunks_extraction_mode():
             RetainContent(content="Bob fixed the critical bug in the payment service."),
         ]
 
-        facts, chunks, usage = asyncio.get_event_loop().run_until_complete(
+        facts, chunks, usage = asyncio.run(
             extract_facts_from_contents(
                 contents=contents,
                 llm_config=None,  # Must not be called
@@ -2962,7 +2962,7 @@ def test_strategy_overrides_extraction_mode_for_chunks():
         RetainContent(content="Bob reviewed the pull request."),
     ]
 
-    facts, chunks, usage = asyncio.get_event_loop().run_until_complete(
+    facts, chunks, usage = asyncio.run(
         extract_facts_from_contents(
             contents=contents,
             llm_config=None,  # chunks must not call the LLM
@@ -3714,6 +3714,28 @@ class TestFactExtractionQuality:
     that the LLM extracted Alice's role vs. Dave's role correctly.  All tests here
     use memory_real_llm and the LLM judge.
     """
+
+    @pytest.fixture(autouse=True)
+    def english_relevance_contract(self, request, monkeypatch):
+        """Control language for the fixed English-only relevance ranker fixture.
+
+        This case tests ordering, with English sources and an English query.
+        Inheriting a server's Chinese output setting turns it into an accidental
+        cross-language test of ms-marco-MiniLM, which cannot rank that fixture.
+        Multilingual quality has its own tests; the relevance criterion stays
+        unchanged and still requires the Rust preference in the first result.
+        """
+        if request.node.name != "test_recall_surfaces_most_relevant_fact":
+            yield
+            return
+        from evolving_profile_api.config import clear_config_cache
+
+        monkeypatch.setenv("EVOLVING_PROFILE_API_LLM_OUTPUT_LANGUAGE", "English")
+        clear_config_cache()
+        try:
+            yield
+        finally:
+            clear_config_cache()
 
     @pytest.fixture
     def memory(self, memory_real_llm):

@@ -1,10 +1,16 @@
 import json
 import unittest
+from unittest.mock import patch
 from system_probe import plan_history, run_probe, count_tokens
 from recall import route_requires_ep_history
 
 
 class SystemProbeTests(unittest.TestCase):
+    def setUp(self):
+        settings = patch('system_probe._load_probe_runtime_settings', return_value={})
+        settings.start()
+        self.addCleanup(settings.stop)
+
     def test_historical_reference_requires_real_ep_history_route(self):
         self.assertTrue(route_requires_ep_history('河北工业大学采购计算机那个项目需求书，你找到了吗'))
         self.assertTrue(route_requires_ep_history('我上次给你的那段说明'))
@@ -115,7 +121,7 @@ class SystemProbeTests(unittest.TestCase):
         self.assertEqual(plan['recommended_route'],'get_preference')
         self.assertEqual(plan['minimum_action'],'agent_query')
         self.assertEqual(plan['suggested_tools'],['get_preference'])
-        self.assertEqual(plan['required_ep_tool'],'mcp__evolving_profile_controller__get_preference')
+        self.assertEqual(plan['required_ep_tool'],'mcp__evolving_profile_controller__user_preference')
         def forbidden(*_args,**_kwargs):
             raise AssertionError('preference lookup must not be approximated by a generic Bank probe')
         _output,receipt=run_probe(plan,{'auto_probe':True,'probe_max_tokens':500},forbidden,'bank')

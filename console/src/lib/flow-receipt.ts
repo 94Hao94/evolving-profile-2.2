@@ -37,6 +37,8 @@ export type FlowReceipt = {
   finished_at?: string | null;
   candidate_count?: number | null;
   returned_count?: number | null;
+  source_navigation_returned_count?: number | null;
+  source_navigation_returned_ids?: string[];
   delivered_count?: number | null;
   token_count?: number | null;
   source_type?: string | null;
@@ -44,14 +46,27 @@ export type FlowReceipt = {
   evidence_ids?: string[];
   summary?: string | null;
   error?: string | null;
+  relevance_audit?: Record<string, unknown> | null;
+  verification_evidence?: Array<Record<string, unknown>>;
 };
 
 export type FlowLaneSummary = {
   lane: FlowLane;
   status: FlowStatus;
   receipts: FlowReceipt[];
-  counts: { candidates: number; returned: number; delivered: number; tokens: number };
+  counts: FlowCounts;
 };
+
+export type FlowCounts = { candidates: number | null; returned: number | null; delivered: number | null; tokens: number | null };
+
+export function sumObservedCounts(values: Array<number | null | undefined>): number | null {
+  return values.every(value=>typeof value === "number" && Number.isInteger(value) && value >= 0)
+    ? values.reduce<number>((sum,value)=>sum+(value as number),0) : null;
+}
+
+export function sumFlowCounts(counts: FlowCounts[]): FlowCounts {
+  return Object.fromEntries((["candidates","returned","delivered","tokens"] as const).map(key=>[key,sumObservedCounts(counts.map(count=>count[key]))])) as FlowCounts;
+}
 
 export const FLOW_LANES: FlowLane[] = [
   "ingress",
@@ -64,15 +79,7 @@ export const FLOW_LANES: FlowLane[] = [
 ];
 
 export function summarizeFlowLane(lane: FlowLane, receipts: FlowReceipt[]): FlowLaneSummary {
-  const counts = receipts.reduce(
-    (acc, receipt) => ({
-      candidates: acc.candidates + (receipt.candidate_count ?? 0),
-      returned: acc.returned + (receipt.returned_count ?? 0),
-      delivered: acc.delivered + (receipt.delivered_count ?? 0),
-      tokens: acc.tokens + (receipt.token_count ?? 0),
-    }),
-    { candidates: 0, returned: 0, delivered: 0, tokens: 0 },
-  );
+  const counts = sumFlowCounts(receipts.map(receipt=>({candidates:receipt.candidate_count ?? null,returned:receipt.returned_count ?? null,delivered:receipt.delivered_count ?? null,tokens:receipt.token_count ?? null})));
   const status: FlowStatus = receipts.length ? (receipts.some((r) => r.status === "failed") ? "failed" : receipts.some((r) => r.status === "delivered" || r.status === "verified") ? "delivered" : receipts.some((r) => r.status === "observed") ? "observed" : receipts[0].status) : "not_observed";
   return { lane, status, receipts, counts };
 }

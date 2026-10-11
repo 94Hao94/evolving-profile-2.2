@@ -1,33 +1,33 @@
+import { epStatePath, EP_API_ENV, EP_MANAGED_MAC_HOST } from "@/lib/ep-state-paths";
+import { dataplaneBankUrl, DATAPLANE_URL, getDataplaneHeaders } from "@/lib/evolving-client";
+import { GET as getBackupSettings } from "../backup-settings/route";
 import { NextResponse } from "next/server";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import path from "node:path";
-import { homedir } from "node:os";
 import { parseCloudReadbackReceipt, summarizeCloudBackups, summarizeLocalBackups, type BackupFile, type CloudBackupSet } from "@/lib/backup-status";
-import { isScenarioBankScope, summarizeAssociationCoverage, summarizeScenarioStatus } from "@/lib/scenario-status";
-import { projectSessionContextNode } from "@/lib/context-node";
+import { readScenarioSnapshot, scenarioMetadata } from "@/lib/scenario-data";
+import { readProcessSnapshot, processMetadata } from "@/lib/process-graph-data";
 import { resolveConsoleOrigin } from "@/lib/console-origin";
+import { normalizeJevJudge } from "@/lib/jev-provider";
+import { parseModelEnvironment, resolveEffectiveEmbedding, maskRetrievalModels } from "@/lib/retrieval-model-identity";
 
-const STATE_ROOT = process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(process.env.HOME ?? homedir(), ".evolving-profile");
-const ENV_PATH = path.join(STATE_ROOT, "profiles/evolving-profile-api.env");
-const PROFILE_PATH = path.join(STATE_ROOT, "codex.json");
-const LOCAL_BACKUP_PATH = path.join(STATE_ROOT, "backups/managed/daily");
-const WPS_CACHE_PATH = process.env.EVOLVING_PROFILE_WPS_CACHE_PATH ?? path.join(STATE_ROOT, "backups/cloud-mirror");
-const WPS_CLOUD_RECEIPT_PATH = path.join(STATE_ROOT, "runtime/wps-cloud-upload-receipt.json");
+const ENV_PATH = EP_API_ENV;
+const PROFILE_PATH = epStatePath("codex.json");
+const LOCAL_BACKUP_PATH = epStatePath("backups/managed/daily");
+const WPS_CACHE_PATH = process.env.EVOLVING_PROFILE_CLOUD_MIRROR_ROOT || "";
+const WPS_CLOUD_RECEIPT_PATH = epStatePath("runtime/wps-cloud-upload-receipt.json");
 const CLOUD_MIRROR_PATH = WPS_CACHE_PATH;
-const BACKUP_SETTINGS_PATH = path.join(STATE_ROOT, "config/backup-settings.json");
-const GUIDANCE_SETTINGS_PATH = path.join(STATE_ROOT, "config/guidance-settings.json");
-const RUNTIME_SETTINGS_PATH = path.join(STATE_ROOT, "config/runtime-settings.json");
-const CONTEXT_INDEX_PATH = path.join(STATE_ROOT, "context/context-index.json");
-const CONTEXT_PROGRESS_PATH = path.join(STATE_ROOT, "context/context-pipeline-progress.json");
-const CONTEXT_AUDIT_PATH = path.join(STATE_ROOT, "context/context-audit.json");
-const CONTEXT_BANK_ASSOCIATIONS_PATH = path.join(STATE_ROOT, "context/context-bank-associations.json");
-const RELEASE_MANIFEST_PATH = path.join(STATE_ROOT, "config/release-manifest.json");
-const PERSONAL_BANK_ID = "personal-memory";
+const BACKUP_SETTINGS_PATH = epStatePath("config/backup-settings.json");
+const GUIDANCE_SETTINGS_PATH = epStatePath("config/guidance-settings.json");
+const RUNTIME_SETTINGS_PATH = epStatePath("config/runtime-settings.json");
+const CONTEXT_PROGRESS_PATH = epStatePath("context/context-pipeline-progress.json");
+const CONTEXT_AUDIT_PATH = epStatePath("context/context-audit.json");
+const RELEASE_MANIFEST_PATH = epStatePath("config/release-manifest.json");
 const RUNTIME_SETTINGS_DEFAULTS = {
   schema: "evolving-profile.runtime-settings.v1",
-  modules: Object.fromEntries(["facts", "experiences", "entities", "preferences", "scenario_summary", "mental_models", "source_readback", "background_reflection"].map((name) => [name, { record: true, retrieve: true, inject: true }])),
+  modules: Object.fromEntries(["facts", "experiences", "entities", "preferences", "scenario_summary", "mental_models", "source_readback", "background_reflection", "agent_process_memory", "agent_process_trajectory", "agent_process_observation", "agent_process_failure_episode", "agent_process_repair_pattern", "agent_process_capability", "agent_process_strategy", "agent_process_revalidation"].map((name) => [name, { record: true, retrieve: true, inject: true }])),
   routing: { mode: "auto", ep_enabled: true, external_rag_enabled: false, allow_parallel: false, conflict_policy: "show_both" },
   budgets: { ep_total_tokens: 4000, rag_total_tokens: 4000, total_tokens: 6000, preference_tokens: 1200, scenario_tokens: 1200, source_tokens: 2400 },
   rag: { enabled: false, root_path: "", collection: "default", lexical_enabled: true, vector_enabled: true, fusion: "rrf", lexical_weight: 0.5, vector_weight: 0.5, rerank_enabled: true, rerank_provider: "local", rerank_model: "", top_k: 20, score_threshold: 0.35, max_chunks: 8, auto_index: false },
@@ -71,10 +71,11 @@ async function serviceState(url: string) {
   }
 }
 
-async function liveBankRecordTotal(): Promise<number | null> {
+async function liveBankRecordTotal(bankId: string): Promise<number | null> {
+  if (!bankId) return null;
   try {
-    const response = await fetch(`http://127.0.0.1:12088/v1/default/banks/${PERSONAL_BANK_ID}/memories/list?limit=0`, {
-      cache: "no-store", signal: AbortSignal.timeout(1500),
+    const response = await fetch(dataplaneBankUrl(bankId, "/memories/list?limit=0"), {
+      headers: getDataplaneHeaders(), cache: "no-store", signal: AbortSignal.timeout(1500),
     });
     if (!response.ok) return null;
     const total = Number((await response.json()).total);
@@ -99,6 +100,7 @@ async function wpsCloudReadback() {
 }
 
 async function backupJobState() {
+  if (!EP_MANAGED_MAC_HOST) return { loaded: false, running: false, lastExitCode: null, schedule: "", apply_status: "unsupported" };
   try {
     const { stdout } = await execFileAsync("launchctl", ["print", `gui/${process.getuid?.() ?? 501}/com.evolving-profile.backup`], { timeout: 1500 });
     return {
@@ -120,19 +122,16 @@ function scheduleLabel(settings: Record<string, any>) {
 
 export async function GET(request?: Request) {
   const requestedBank = request ? new URL(request.url).searchParams.get("bankId") : null;
-  const scenarioBankVisible = isScenarioBankScope(requestedBank, PERSONAL_BANK_ID);
   let env: Record<string, string> = {};
   let profile: Record<string, unknown> = {};
   let backupSettings: Record<string, unknown> = {};
   let guidanceSettings: Record<string, unknown> = {};
   let runtimeSettings: Record<string, any> = {};
-  let releaseManifest: Record<string, any> = { product_version: "5.0", release_channel: "contribution" };
-  let contextIndex: Record<string, any> = { status: "unavailable", sessions: [], projects: [] };
+  let releaseManifest: Record<string, any> = { product_version: "5.1", release_channel: "development", build_id: "ep51-dev" };
   let contextProgress: Record<string, any> = { status: "unavailable", total: 0, queued: 0, running: 0, retrying: 0, succeeded: 0, failed: 0 };
   let contextAudit: Record<string, any> = { status: "not_run", error_count: null, warning_count: null };
-  let contextAssociations: Record<string, any> = { linked_records: 0, links: [] };
   try {
-    env = parseEnv(await readFile(ENV_PATH, "utf8"));
+    env = parseModelEnvironment((await readFile(ENV_PATH, "utf8")) + "\n" + await readFile(path.join(path.dirname(RUNTIME_SETTINGS_PATH),"retrieval-models.env"),"utf8").catch(()=>""));
   } catch {
     // The page remains truthful when the operator-managed env file is unavailable.
   }
@@ -141,13 +140,19 @@ export async function GET(request?: Request) {
   } catch {
     // The page remains truthful when the operator-managed profile is unavailable.
   }
-  try { backupSettings = JSON.parse(await readFile(BACKUP_SETTINGS_PATH, "utf8")); } catch { /* defaults are shown by the settings panel */ }
+  const configuredBank = String(process.env.EVOLVING_PROFILE_BANK_ID || profile.bankId || "");
+  const scenarioSnapshot = await readScenarioSnapshot(requestedBank).catch(() => null);
+  backupSettings = await (await getBackupSettings()).json();
   const guidanceDefaults = { schema: "evolving-profile.guidance-settings.v1", max_candidates: 6, adaptive_budget: true, auto_probe: true, probe_max_tokens: 500 };
   try { guidanceSettings = { ...guidanceDefaults, ...JSON.parse(await readFile(GUIDANCE_SETTINGS_PATH, "utf8")) }; } catch { guidanceSettings = guidanceDefaults; }
   try { runtimeSettings = mergeSettings(RUNTIME_SETTINGS_DEFAULTS, JSON.parse(await readFile(RUNTIME_SETTINGS_PATH, "utf8"))); } catch { runtimeSettings = RUNTIME_SETTINGS_DEFAULTS; }
   try { releaseManifest = JSON.parse(await readFile(RELEASE_MANIFEST_PATH, "utf8")); } catch { /* use safe fallback */ }
-  runtimeSettings.retrieval_models.embedding = { ...runtimeSettings.retrieval_models.embedding, provider: env.EVOLVING_PROFILE_API_EMBEDDINGS_PROVIDER || runtimeSettings.retrieval_models.embedding.provider, model: env.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_MODEL_ID || runtimeSettings.retrieval_models.embedding.model, dimensions: Number(env.EVOLVING_PROFILE_API_EMBEDDINGS_ONNX_DIMENSIONS || runtimeSettings.retrieval_models.embedding.dimensions) };
-  runtimeSettings.retrieval_models.reranker = { ...runtimeSettings.retrieval_models.reranker, provider: env.EVOLVING_PROFILE_API_RERANKER_PROVIDER === "rrf" ? "local" : env.EVOLVING_PROFILE_API_RERANKER_PROVIDER || runtimeSettings.retrieval_models.reranker.provider, model: env.EVOLVING_PROFILE_API_RERANKER_LOCAL_MODEL || runtimeSettings.retrieval_models.reranker.model };
+  runtimeSettings.retrieval_models.embedding = resolveEffectiveEmbedding(runtimeSettings.retrieval_models.embedding,env);
+  if(runtimeSettings.retrieval_models.embedding.api_key) runtimeSettings.retrieval_models.embedding.api_key=`••••${String(runtimeSettings.retrieval_models.embedding.api_key).slice(-4)}`;
+  runtimeSettings.retrieval_models.reranker = { ...runtimeSettings.retrieval_models.reranker, enabled: env.EVOLVING_PROFILE_API_RERANKER_PROVIDER === "rrf" ? false : runtimeSettings.retrieval_models.reranker.enabled, provider: env.EVOLVING_PROFILE_API_RERANKER_PROVIDER === "rrf" ? "rrf" : env.EVOLVING_PROFILE_API_RERANKER_PROVIDER || runtimeSettings.retrieval_models.reranker.provider, model: env.EVOLVING_PROFILE_API_RERANKER_LOCAL_MODEL || runtimeSettings.retrieval_models.reranker.model };
+  runtimeSettings.retrieval_models.judge = normalizeJevJudge(runtimeSettings.retrieval_models.judge);
+  if (runtimeSettings.retrieval_models.judge.api_key) runtimeSettings.retrieval_models.judge.api_key = `••••${String(runtimeSettings.retrieval_models.judge.api_key).slice(-4)}`;
+  runtimeSettings.retrieval_models=maskRetrievalModels(runtimeSettings.retrieval_models);
   const effectiveProvider = {
     name: String(runtimeSettings.providers?.primary?.name || (env.EVOLVING_PROFILE_API_LLM_BASE_URL?.includes("127.0.0.1:3211") ? "Coding Plan" : env.EVOLVING_PROFILE_API_LLM_PROVIDER || "")),
     base_url: String(runtimeSettings.providers?.primary?.base_url || env.EVOLVING_PROFILE_API_LLM_BASE_URL || ""),
@@ -155,15 +160,14 @@ export async function GET(request?: Request) {
     api_key: runtimeSettings.providers?.primary?.api_key || env.EVOLVING_PROFILE_API_LLM_API_KEY || "",
   };
   runtimeSettings = { ...runtimeSettings, providers: { ...(runtimeSettings.providers || {}), primary: effectiveProvider } };
-  try { contextIndex = JSON.parse(await readFile(CONTEXT_INDEX_PATH, "utf8")); } catch { /* context remains explicitly unavailable */ }
   try { contextProgress = JSON.parse(await readFile(CONTEXT_PROGRESS_PATH, "utf8")); } catch { /* progress remains unavailable */ }
   try { contextAudit = JSON.parse(await readFile(CONTEXT_AUDIT_PATH, "utf8")); } catch { /* audit remains unavailable */ }
-  try { contextAssociations = JSON.parse(await readFile(CONTEXT_BANK_ASSOCIATIONS_PATH, "utf8")); } catch { /* associations remain unavailable */ }
+  const processMemory = await readProcessSnapshot(requestedBank).then(processMetadata).catch(()=>({status:"not_available_for_bank",version:"unavailable",bankId:null,record_count:0,by_kind:{},skill_candidates:0,profiles:0,revalidation_queue:0,updated_at:null,recent:[]}));
 
   const [api, controller, localFiles, cloudReadback, backupJob, liveBankTotal] = await Promise.all([
-    serviceState("http://127.0.0.1:12088/health"),
-    serviceState("http://127.0.0.1:12079/health"),
-    flatFiles(LOCAL_BACKUP_PATH), wpsCloudReadback(), backupJobState(), liveBankRecordTotal(),
+    serviceState(`${DATAPLANE_URL}/health`),
+    serviceState(`${process.env.EVOLVING_PROFILE_CONTROLLER_API_URL || "http://127.0.0.1:12079"}/health`),
+    flatFiles(path.join(String((backupSettings.local as any)?.root || epStatePath("backups/managed")), "daily")), wpsCloudReadback(), backupJobState(), liveBankRecordTotal(configuredBank),
   ]);
   backupJob.schedule = scheduleLabel(backupSettings);
   const localBackup = summarizeLocalBackups(localFiles);
@@ -175,28 +179,6 @@ export async function GET(request?: Request) {
   // filesystem workers, and cache presence is not proof of a completed upload.
   const wpsCache = { present: false, fileCount: 0, timedOut: false, probeSkipped: true };
   const cloudBackup = summarizeCloudBackups(mirrorSets, wpsCache, Date.now(), cloudReadback);
-  const bankLinks = Array.isArray(contextAssociations.links) ? contextAssociations.links : [];
-  const verifiedProjectKeys = new Set((contextIndex.projects ?? []).filter((row: any) => row.identity_status === "verified_project").map((row: any) => row.project_key));
-  const scenarioStatus = summarizeScenarioStatus(contextIndex);
-  const associationCoverage = summarizeAssociationCoverage(Number(contextAssociations.scanned_records ?? 0), liveBankTotal);
-  const bankNodes = bankLinks.slice(0, 500).map((row: any) => ({ id: `bank:${row.record_id}`, type: `bank_${row.record_type}`, label: row.record_id, projectKey: row.project_key, status: "linked" }));
-  const bankEdges = bankLinks.slice(0, 500).flatMap((row: any) => [
-    ...(row.project_key ? [{ source: `project:${row.project_key}`, target: `bank:${row.record_id}`, type: verifiedProjectKeys.has(row.project_key) ? "project_contains_bank_record" : "workspace_links_bank_record" }] : []),
-    ...(row.session_ids ?? []).map((sessionId: string) => ({ source: `session:${sessionId}`, target: `bank:${row.record_id}`, type: "session_supports_bank_record" })),
-  ]);
-  const contextNodes = [
-    ...(Array.isArray(contextIndex.projects) ? contextIndex.projects : []).map((row: any) => ({ id: row.context_id, type: row.identity_status === "verified_project" ? "project" : "workspace", label: row.project_key, identityStatus: row.identity_status ?? "unverified_workspace_bucket", status: row.status, sessionCount: (row.session_ids ?? []).length, summary: row.summary ?? {}, summaryBudget: row.summary_budget ?? {}, sourceIds: row.source_ids ?? [], sessionIds: row.session_ids ?? [] })),
-    ...(Array.isArray(contextIndex.sessions) ? contextIndex.sessions : []).map(projectSessionContextNode),
-    ...bankNodes,
-  ];
-  const contextEdges = [
-    ...(Array.isArray(contextIndex.projects) ? contextIndex.projects : []).flatMap((row: any) => (row.session_ids ?? []).map((sessionId: string) => ({ source: row.context_id, target: `session:${sessionId}`, type: row.identity_status === "verified_project" ? "project_contains_session" : "workspace_contains_session" }))),
-    ...bankEdges,
-  ];
-  const contextTimeline = [
-    [...(contextIndex.projects ?? []), ...(contextIndex.sessions ?? [])].map((row: any) => ({ id: row.context_id, type: row.context_type === "project" && row.identity_status !== "verified_project" ? "workspace" : row.context_type, at: row.updated_at, label: row.context_type === "project" ? row.project_key : row.session_id, status: row.status })),
-    ...bankLinks.slice(0, 500).map((row: any) => ({ id: `bank:${row.record_id}`, type: `bank_${row.record_type}`, at: row.at, label: row.record_id, status: "linked" })),
-  ].flat().sort((a: any, b: any) => String(a.at ?? "").localeCompare(String(b.at ?? "")));
 
   return NextResponse.json({
     schema: "evolving-profile.runtime.v1",
@@ -236,30 +218,18 @@ export async function GET(request?: Request) {
     },
     guidanceSettings,
     runtimeSettings: { ...runtimeSettings, providers: { ...runtimeSettings.providers, primary: { ...runtimeSettings.providers?.primary, api_key: runtimeSettings.providers?.primary?.api_key ? `••••${String(runtimeSettings.providers.primary.api_key).slice(-4)}` : null }, fallbacks: (runtimeSettings.providers?.fallbacks ?? []).map((provider: any) => ({ ...provider, api_key: provider.api_key ? `••••${String(provider.api_key).slice(-4)}` : null })) } },
-    context: scenarioBankVisible ? {
-      status: contextIndex.status ?? "ready",
-      schema: contextIndex.schema ?? "evolving-profile.context-index.v1",
-      sessionCount: Array.isArray(contextIndex.sessions) ? contextIndex.sessions.length : 0,
-      projectCount: Array.isArray(contextIndex.projects) ? contextIndex.projects.length : 0,
-      pendingReview: scenarioStatus.pendingReview,
-      reviewed: scenarioStatus.reviewed,
-      qualityStatus: scenarioStatus.qualityStatus,
-      pipeline: scenarioStatus.pipeline,
-      executionOwner: "deterministic_projection_pending_model_review",
-      externalEpModel: "coding-plan-qwen3.7-plus",
-      sourceOfTruth: contextIndex.source_of_truth ?? "codex_rollout_or_ep_session_index",
-      evidenceRole: "context_navigation_only",
-      updatedAt: contextIndex.updated_at ?? null,
-      progress: contextProgress,
-      audit: contextAudit,
-      graph: { nodes: contextNodes, edges: contextEdges, timeline: contextTimeline, bankRecordLinks: { available: bankLinks.length > 0, linked: Number(contextAssociations.linked_records ?? bankLinks.length), sampled: bankNodes.length, scanned: Number(contextAssociations.scanned_records ?? 0), indexedAt: contextAssociations.indexed_at ?? null, sourceIndexUpdatedAt: contextAssociations.source_index_updated_at ?? null, ...associationCoverage, snapshotOnly: true, reason: bankLinks.length > 0 ? "read_only_snapshot_not_live_bank_coverage" : "association sidecar not available" } },
+    processMemory,
+    payloadMode: "status_only",
+    dataEndpoints: { scenarioGraph: "/api/evolving-profile/scenario/graph", scenarioDetail: "/api/evolving-profile/scenario/detail", scenarioEpisodes: "/api/evolving-profile/scenario/episodes", processGraph: "/api/evolving-profile/process-memory/graph" },
+    context: scenarioSnapshot ? {
+      ...scenarioMetadata(scenarioSnapshot, liveBankTotal),
+      executionOwner: "deterministic_projection_pending_model_review", externalEpModel: effectiveProvider.model,
+      progress: contextProgress, audit: contextAudit,
     } : {
-      status: "not_available_for_bank",
-      schema: "evolving-profile.context-index.v1",
-      sessionCount: 0, projectCount: 0, pendingReview: 0,
-      qualityStatus: "unavailable", pipeline: "当前 Bank 未建立情景摘要索引",
-      sourceOfTruth: "not_available_for_bank", evidenceRole: "none", updatedAt: null,
-      graph: { nodes: [], edges: [], timeline: [], bankRecordLinks: { available: false, linked: 0, sampled: 0, scanned: 0, indexedAt: null, sourceIndexUpdatedAt: null, liveTotal: null, unscanned: null, coverage: "unknown", snapshotOnly: true, reason: "bank_scope_mismatch" } },
+      status: "not_available_for_bank", schema: "evolving-profile.context-index.v1",
+      sessionCount: 0, projectCount: 0, pendingReview: 0, qualityStatus: "unavailable",
+      pipeline: "当前 Bank 未建立情景摘要索引", sourceOfTruth: "not_available_for_bank", evidenceRole: "none", updatedAt: null,
+      graphStats: { nodes: 0, edges: 0, timeline: 0, sessions: 0, workspaces: 0, verifiedProjects: 0, bankRecords: 0, unit: "indexed_nodes_and_snapshot_relations" },
     },
   });
 }

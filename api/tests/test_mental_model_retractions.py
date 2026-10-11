@@ -875,10 +875,10 @@ async def test_real_model_removes_only_the_retracted_claim(retraction_llm):
         STRUCTURED_RETRACTION_SYSTEM_PROMPT,
         build_structured_retraction_prompt,
     )
-    from evolving_profile_api.engine.reflect.structured_doc import parse_markdown, render_document
+    from evolving_profile_api.engine.reflect.structured_doc import render_document, split_markdown
     from tests.llm_judge import assert_meets_criteria
 
-    document = parse_markdown(_RETRACTION_DOC)
+    document = split_markdown(_RETRACTION_DOC)
     prompt = build_structured_retraction_prompt(
         current_document_json=document.model_dump_json(),
         retracted_facts=[

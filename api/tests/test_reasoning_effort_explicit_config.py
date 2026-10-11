@@ -20,6 +20,8 @@ rather than one Hindsight picked (it used to resolve unset to "low").
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from openai.types import CompletionUsage
+
 import pytest
 
 from evolving_profile_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
@@ -57,10 +59,7 @@ async def _capture_call_params(llm: OpenAICompatibleLLM) -> dict:
     # auto-MagicMock is truthy and would look like an error.
     response.error = None
     response.model_dump.return_value = {}
-    response.usage.prompt_tokens = 10
-    response.usage.completion_tokens = 5
-    response.usage.total_tokens = 15
-    response.usage.completion_tokens_details = None
+    response.usage = CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)
     response.choices[0].finish_reason = "stop"
     response.choices[0].message.content = "ok"
     response.choices[0].message.tool_calls = None
@@ -78,10 +77,7 @@ async def _capture_tool_call_params(llm: OpenAICompatibleLLM) -> dict:
     tool_call.function.arguments = json.dumps({"query": "x"})
 
     response = MagicMock()
-    response.usage.prompt_tokens = 120
-    response.usage.completion_tokens = 40
-    response.usage.total_tokens = 160
-    response.usage.completion_tokens_details = None
+    response.usage = CompletionUsage(prompt_tokens=120, completion_tokens=40, total_tokens=160)
     response.choices[0].finish_reason = "tool_calls"
     response.choices[0].message.content = None
     response.choices[0].message.tool_calls = [tool_call]

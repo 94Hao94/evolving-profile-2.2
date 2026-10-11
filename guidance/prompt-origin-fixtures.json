@@ -1,0 +1,16 @@
+[
+  {"name":"ordinary user", "row":{"session_id":"human","prompt_origin":"user_direct"}, "metadata":{"id":"human","source":"vscode","thread_source":"user"}, "expected":"human"},
+  {"name":"voice continuation", "row":{"session_id":"voice","prompt_preview":"嗯，然后呢？"}, "metadata":{"id":"voice","source":"vscode","thread_source":"realtime_voice"}, "expected":"human"},
+  {"name":"user quotes templates", "row":{"session_id":"human","prompt_preview":"Memory Writing Agent: Phase 2; codex://threads/; [SYSTEM_CONTEXT]; test probe"}, "metadata":{"id":"human","source":"cli","thread_source":"user"}, "expected":"human"},
+  {"name":"child shares native parent namespace", "row":{"session_id":"parent","prompt_origin":"user_direct"}, "metadata":{"id":"child","session_id":"parent","parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent","depth":1}}},"thread_source":"subagent"}, "expected":"subagent"},
+  {"name":"uncorroborated claimed parent", "row":{"session_id":"parent"}, "metadata":{"id":"child","session_id":"parent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent","depth":1}}},"thread_source":"subagent"}, "expected":"unknown"},
+  {"name":"human id forged in session alias", "row":{"session_id":"parent"}, "metadata":{"id":"foreign","session_id":"parent","source":"vscode","thread_source":"user"}, "expected":"unknown"},
+  {"name":"host automation", "row":{"session_id":"auto"}, "metadata":{"id":"auto","source":"vscode","thread_source":"automation"}, "expected":"automation"},
+  {"name":"exec user tag is not a natural typed prompt", "row":{"session_id":"exec"}, "metadata":{"id":"exec","source":"exec","thread_source":"user"}, "expected":"automation"},
+  {"name":"maintenance subagent metadata", "row":{"session_id":"memory"}, "metadata":{"id":"memory","source":{"subagent":"memory_consolidation"},"thread_source":"subagent"}, "expected":"memory-maintenance"},
+  {"name":"missing source is unknown even for familiar template", "row":{"session_id":"missing","prompt_origin":"user_direct","prompt_preview":"## Memory Writing Agent: Phase 2"}, "metadata":null, "expected":"unknown"},
+  {"name":"legacy source with no thread attribution", "row":{"session_id":"old"}, "metadata":{"id":"old","source":"vscode"}, "expected":"unknown"},
+  {"name":"unknown future source object", "row":{"session_id":"future"}, "metadata":{"id":"future","source":{"future_host":true},"thread_source":"user"}, "expected":"unknown"},
+  {"name":"explicit hook replay in user session", "row":{"session_id":"human","prompt_origin":"test_probe"}, "metadata":{"id":"human","source":"vscode","thread_source":"user"}, "expected":"automation"},
+  {"name":"ambiguous agent created thread", "row":{"session_id":"created"}, "metadata":{"id":"created","source":"vscode","thread_source":"agent_created_thread"}, "expected":"unknown"}
+]

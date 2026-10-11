@@ -1,0 +1,31 @@
+{
+  "schema": "evolving-profile.memory-recovery-registry.v1",
+  "version": "5.1",
+  "default_mode": "pending",
+  "dimensions": [
+    {"id":"raw_sources","module":"source_readback","stage_id":"raw_capture"},
+    {"id":"facts","module":"facts","stage_id":"retain"},
+    {"id":"experiences","module":"experiences","stage_id":"retain"},
+    {"id":"entities","module":"entities","stage_id":"retain"},
+    {"id":"observations","module":"background_reflection","stage_id":"consolidation"},
+    {"id":"preferences","module":"preferences","stage_id":"preference_models"},
+    {"id":"mental_models","module":"mental_models","stage_id":"preference_models"},
+    {"id":"session_summaries","module":"scenario_summary","stage_id":"scenarios"},
+    {"id":"project_summaries","module":"scenario_summary","stage_id":"scenarios"},
+    {"id":"agent_traces","module":"agent_process_trajectory","stage_id":"agent_process"},
+    {"id":"agent_events","module":"agent_process_observation","stage_id":"agent_process"},
+    {"id":"agent_episodes","module":"agent_process_failure_episode","stage_id":"agent_process"},
+    {"id":"agent_patterns","module":"agent_process_repair_pattern","stage_id":"agent_process"},
+    {"id":"agent_strategies","module":"agent_process_strategy","stage_id":"agent_process"},
+    {"id":"agent_capabilities","module":"agent_process_capability","stage_id":"agent_process"},
+    {"id":"agent_revalidation","module":"agent_process_revalidation","stage_id":"agent_process"}
+  ],
+  "stages": [
+    {"id":"raw_capture","dimensions":["raw_sources"]},
+    {"id":"retain","dimensions":["facts","experiences","entities"]},
+    {"id":"consolidation","dimensions":["observations"]},
+    {"id":"preference_models","dimensions":["preferences","mental_models"]},
+    {"id":"scenarios","dimensions":["session_summaries","project_summaries"]},
+    {"id":"agent_process","dimensions":["agent_traces","agent_events","agent_episodes","agent_patterns","agent_strategies","agent_capabilities","agent_revalidation"]}
+  ]
+}

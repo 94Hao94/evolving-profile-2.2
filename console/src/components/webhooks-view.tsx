@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
@@ -309,6 +311,7 @@ export function WebhooksView() {
   const [loading, setLoading] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [createdFormKey, setCreatedFormKey] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteConfirmWebhook, setDeleteConfirmWebhook] = useState<Webhook | null>(null);
   const [showSecret, setShowSecret] = useState(false);
@@ -331,14 +334,15 @@ export function WebhooksView() {
   const [deliveriesCursor, setDeliveriesCursor] = useState<string | null>(null);
   const [loadingMoreDeliveries, setLoadingMoreDeliveries] = useState(false);
 
-  const loadWebhooks = async () => {
-    if (!currentBank) return;
+  const loadWebhooks = async (throwOnError = false) => {
+    if (!currentBank) return false;
     setLoading(true);
     try {
       const data = await client.listWebhooks(currentBank);
       setWebhooks(data.items || []);
     } catch (error) {
       console.error("Error loading webhooks:", error);
+      if (throwOnError) throw error;
     } finally {
       setLoading(false);
     }
@@ -351,7 +355,7 @@ export function WebhooksView() {
   }, [currentBank]);
 
   const handleCreate = async () => {
-    if (!currentBank || !form.url) return;
+    if (!currentBank || !form.url) return false;
     setCreating(true);
     try {
       await client.createWebhook(currentBank, {
@@ -361,26 +365,29 @@ export function WebhooksView() {
         enabled: form.enabled,
         http_config: buildHttpConfig(form.http_config),
       });
-      setCreateDialogOpen(false);
-      setForm(DEFAULT_FORM);
+      setCreatedFormKey(JSON.stringify(form));
       setShowSecret(false);
       await loadWebhooks();
     } catch (error) {
       // Error toast shown by API client interceptor
+
+      throw error;
     } finally {
       setCreating(false);
     }
   };
 
   const handleDelete = async (webhookId: string) => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
     setDeletingId(webhookId);
-    setDeleteConfirmWebhook(null);
     try {
       await client.deleteWebhook(currentBank, webhookId);
+      setDeleteConfirmWebhook(null);
       await loadWebhooks();
     } catch (error) {
       // Error toast shown by API client interceptor
+
+      throw error;
     } finally {
       setDeletingId(null);
     }
@@ -395,7 +402,7 @@ export function WebhooksView() {
   };
 
   const handleSave = async () => {
-    if (!currentBank || !editingWebhook || !editForm.url) return;
+    if (!currentBank || !editingWebhook || !editForm.url) return false;
     setSaving(true);
     try {
       const patch: Parameters<typeof client.updateWebhook>[2] = {
@@ -410,19 +417,19 @@ export function WebhooksView() {
         patch.secret = editForm.secret;
       }
       await client.updateWebhook(currentBank, editingWebhook.id, patch);
-      setEditDialogOpen(false);
       await loadWebhooks();
-    } catch {
+    } catch (error) {
       // Error toast shown by API client interceptor
+
+      throw error;
     } finally {
       setSaving(false);
     }
   };
 
   const handleViewDeliveries = async (webhook: Webhook) => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
     setSelectedWebhook(webhook);
-    setDeliveriesDialogOpen(true);
     setDeliveries([]);
     setDeliveriesCursor(null);
     setLoadingDeliveries(true);
@@ -430,15 +437,18 @@ export function WebhooksView() {
       const data = await client.listWebhookDeliveries(currentBank, webhook.id, 50);
       setDeliveries(data.items || []);
       setDeliveriesCursor(data.next_cursor ?? null);
+      setDeliveriesDialogOpen(true);
     } catch (error) {
       console.error("Error loading deliveries:", error);
+
+      throw error;
     } finally {
       setLoadingDeliveries(false);
     }
   };
 
   const handleLoadMoreDeliveries = async () => {
-    if (!currentBank || !selectedWebhook || !deliveriesCursor) return;
+    if (!currentBank || !selectedWebhook || !deliveriesCursor) return false;
     setLoadingMoreDeliveries(true);
     try {
       const data = await client.listWebhookDeliveries(
@@ -451,6 +461,8 @@ export function WebhooksView() {
       setDeliveriesCursor(data.next_cursor ?? null);
     } catch (error) {
       console.error("Error loading more deliveries:", error);
+
+      throw error;
     } finally {
       setLoadingMoreDeliveries(false);
     }
@@ -479,8 +491,8 @@ export function WebhooksView() {
         <div>
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-semibold">{t("title")}</h3>
-            <button
-              onClick={() => loadWebhooks()}
+            <ActionButton
+              onAction={() => loadWebhooks(true)}
               className="p-1 rounded hover:bg-muted transition-colors"
               title={t("refreshTitle")}
               aria-label={t("refreshAriaLabel")}
@@ -489,7 +501,7 @@ export function WebhooksView() {
               <RefreshCw
                 className={`w-4 h-4 text-muted-foreground hover:text-foreground ${loading ? "animate-spin" : ""}`}
               />
-            </button>
+            </ActionButton>
           </div>
           <p className="text-sm text-muted-foreground">
             {t("webhookCount", { count: webhooks.length })}
@@ -559,16 +571,16 @@ export function WebhooksView() {
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
-                      <Button
+                      <ActionButton
                         variant="ghost"
                         size="sm"
                         className="h-7 text-xs"
-                        onClick={() => handleViewDeliveries(webhook)}
+                        onAction={() => handleViewDeliveries(webhook)}
                         title={t("viewDeliveriesTitle")}
                       >
                         <Eye className="w-3 h-3 mr-1" />
                         {t("deliveriesButton")}
-                      </Button>
+                      </ActionButton>
                       <Button
                         variant="ghost"
                         size="sm"
@@ -780,7 +792,7 @@ export function WebhooksView() {
             >
               {t("cancel")}
             </Button>
-            <Button onClick={handleCreate} disabled={creating || !form.url}>
+            <ActionButton resetKey={JSON.stringify(form)} onAction={handleCreate} disabled={creating || !form.url || createdFormKey === JSON.stringify(form)}>
               {creating ? (
                 <>
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
@@ -789,7 +801,7 @@ export function WebhooksView() {
               ) : (
                 t("createWebhook")
               )}
-            </Button>
+            </ActionButton>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -990,7 +1002,7 @@ export function WebhooksView() {
             <Button variant="outline" onClick={() => setEditDialogOpen(false)} disabled={saving}>
               {t("cancel")}
             </Button>
-            <Button onClick={handleSave} disabled={saving || !editForm.url}>
+            <ActionButton resetKey={JSON.stringify({ editForm, clearSecret })} onAction={handleSave} disabled={saving || !editForm.url}>
               {saving ? (
                 <>
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
@@ -999,7 +1011,7 @@ export function WebhooksView() {
               ) : (
                 t("saveChanges")
               )}
-            </Button>
+            </ActionButton>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1027,9 +1039,9 @@ export function WebhooksView() {
             <Button variant="outline" onClick={() => setDeleteConfirmWebhook(null)}>
               {t("cancel")}
             </Button>
-            <Button
+            <ActionButton
               variant="destructive"
-              onClick={() => deleteConfirmWebhook && handleDelete(deleteConfirmWebhook.id)}
+              onAction={() => deleteConfirmWebhook ? handleDelete(deleteConfirmWebhook.id) : Promise.resolve(false)}
               disabled={!!deletingId}
             >
               {deletingId ? (
@@ -1040,7 +1052,7 @@ export function WebhooksView() {
               ) : (
                 t("deleteWebhookConfirm")
               )}
-            </Button>
+            </ActionButton>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1099,15 +1111,15 @@ export function WebhooksView() {
               </div>
               {deliveriesCursor && (
                 <div className="flex justify-center pt-2">
-                  <Button
+                  <ActionButton
                     variant="outline"
                     size="sm"
-                    onClick={handleLoadMoreDeliveries}
+                    onAction={handleLoadMoreDeliveries}
                     disabled={loadingMoreDeliveries}
                   >
                     {loadingMoreDeliveries && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
                     {t("loadMore")}
-                  </Button>
+                  </ActionButton>
                 </div>
               )}
             </>

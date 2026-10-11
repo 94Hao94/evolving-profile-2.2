@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { Input } from "@/components/ui/input";
 import { Check, X } from "lucide-react";
 
@@ -29,7 +30,7 @@ interface EditMemoryFormProps {
   };
   busy?: boolean;
   onCancel: () => void;
-  onSave: (fields: EditMemoryFields) => void;
+  onSave: (fields: EditMemoryFields) => Promise<unknown>;
 }
 
 // ISO timestamp -> YYYY-MM-DD for <input type="date">; "" when absent.
@@ -186,17 +187,18 @@ export function EditMemoryForm({ memory, busy, onCancel, onSave }: EditMemoryFor
         <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>
           {t("curationCancel")}
         </Button>
-        <Button
+        <ActionButton
           size="sm"
+          resetKey={JSON.stringify([text, context, factType, occurredStart, occurredEnd, entities, entityDraft])}
           disabled={busy || !text.trim()}
-          onClick={() => {
+          onAction={() => {
             // Fold any unsubmitted draft into the list before saving.
             const finalEntities = entityDraft.trim()
               ? entities.some((e) => e.toLowerCase() === entityDraft.trim().toLowerCase())
                 ? entities
                 : [...entities, entityDraft.trim()]
               : entities;
-            onSave({
+            return onSave({
               text: text.trim(),
               context,
               factType,
@@ -212,7 +214,7 @@ export function EditMemoryForm({ memory, busy, onCancel, onSave }: EditMemoryFor
             <Check className="h-3.5 w-3.5 mr-1.5" />
           )}
           {t("curationSave")}
-        </Button>
+        </ActionButton>
       </div>
     </div>
   );

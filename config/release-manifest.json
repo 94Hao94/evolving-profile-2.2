@@ -1,8 +1,8 @@
 {
   "product": "Evolving Profile",
-  "product_version": "5.0",
+  "product_version": "5.1.0",
   "release_channel": "contribution",
-  "build_id": "ep5-contribution",
+  "build_id": "ep51-release-candidate",
   "schema_versions": {
     "runtime_settings": "1",
     "backup_settings": "1",

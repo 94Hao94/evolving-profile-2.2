@@ -1,9 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { useLocale } from "next-intl";
+import { ActionButton } from "@/components/ui/action-button";
+
+import { useCallback, useEffect, useState } from "react";
+import { useLocale, useTranslations } from "next-intl";
 import { Activity, Bot, Cloud, Database, HardDrive, RefreshCw, Route, ShieldCheck } from "lucide-react";
 import { AgentProcessView } from "./agent-process-view";
+import { ContextMemoryView } from "./context-memory-view";
+import { GraphWindowControls } from "./graph-window-controls";
+import { useWindowedGraph } from "@/lib/use-windowed-graph";
+import { RecallPolicySettings, type RecallPolicyValue, updateRecallPolicy } from "./recall-policy-settings";
+import { normalizeRecallPolicy } from "@/lib/recall-policy";
 
 import { inlineUiText } from "@/lib/inline-i18n";
 type RuntimeState = {
@@ -19,6 +26,7 @@ type RuntimeState = {
   };
   guidanceSettings?: { max_candidates: number; adaptive_budget: boolean; auto_probe: boolean; probe_max_tokens: number };
   runtimeSettings: {
+    recall_policy?: RecallPolicyValue;
     modules: Record<string, { record: boolean; retrieve: boolean; inject: boolean }>;
     routing: { mode: string; ep_enabled: boolean; external_rag_enabled: boolean; allow_parallel?: boolean; conflict_policy?: string };
     budgets: Record<string, number>;
@@ -26,7 +34,7 @@ type RuntimeState = {
     providers: { primary?: { name?: string; base_url?: string; model?: string; api_key?: string | null }; fallbacks?: Array<{ name?: string; base_url?: string; model?: string; api_key?: string | null }> };
   };
   processMemory?: { status: string; record_count: number; by_kind: Record<string, number>; profiles: number; revalidation_queue?: number; updated_at?: string | null; recent?: Array<{ id: string; kind: string; phase: string; maturity: string; outcome: string; task_archetype?: string[]; dimensions?: string[]; model_family?: string | null; at?: string | null; source_count: number }>; graph?: { nodes: Array<{ id: string; type: string; label: string; phase?: string; maturity?: string; status?: string; at?: string | null }>; edges: Array<{ source: string; target: string; type: string }>; timeline: Array<{ id: string; type: string; at?: string | null; label: string; status?: string }> } };
-  context: { status: string; schema: string; sessionCount: number; projectCount: number; pendingReview: number; qualityStatus?: string; pipeline: string; executionOwner?: string; externalEpModel?: string; sourceOfTruth: string; evidenceRole: string; updatedAt: string | null; progress?: { status: string; total: number; queued: number; running: number; retrying: number; succeeded: number; failed: number; review_pending?: number; updated_at?: string }; audit?: { status: string; error_count?: number | null; warning_count?: number | null; audited_at?: string; semantic_sample?: { method?: string } }; graph?: { nodes: Array<{ id: string; type: string; label: string; projectKey?: string; sessionCount?: number; status?: string }>; edges: Array<{ source: string; target: string; type: string }>; timeline: Array<{ id: string; type: string; at?: string; label: string; status?: string }>; bankRecordLinks: { available: boolean; linked: number; sampled?: number; scanned?: number; reason: string } } };
+  context: { bankId?: string; version?: string; graphStats?: { nodes:number;edges:number;timeline:number }; status: string; schema: string; sessionCount: number; projectCount: number; pendingReview: number; qualityStatus?: string; pipeline: string; executionOwner?: string; externalEpModel?: string; sourceOfTruth: string; evidenceRole: string; updatedAt: string | null; progress?: { status: string; total: number; queued: number; running: number; retrying: number; succeeded: number; failed: number; review_pending?: number; updated_at?: string }; audit?: { status: string; error_count?: number | null; warning_count?: number | null; audited_at?: string; semantic_sample?: { method?: string } }; graph?: { nodes: Array<{ id: string; type: string; label: string; projectKey?: string; sessionCount?: number; status?: string }>; edges: Array<{ source: string; target: string; type: string }>; timeline: Array<{ id: string; type: string; at?: string; label: string; status?: string }>; bankRecordLinks: { available: boolean; linked: number; sampled?: number; scanned?: number; reason: string } } };
 };
 
 const STATUS_STYLE: Record<string, string> = {
@@ -50,95 +58,118 @@ const CLOUD_LABEL: Record<string, string> = { observed: "已观测", unverified:
 
 export function EvolvingProfileRuntimeView() {
   const locale = useLocale();
+  const releaseText = useTranslations("releaseUi");
   const english = !locale.startsWith("zh");
   const [state, setState] = useState<RuntimeState | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [savingBackup, setSavingBackup] = useState(false);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [guidanceMessage, setGuidanceMessage] = useState<string | null>(null);
   const [runtimeSettingsMessage, setRuntimeSettingsMessage] = useState<string | null>(null);
-  const [selectedProcessNode, setSelectedProcessNode] = useState<{ id: string; type: string; label: string; phase?: string; maturity?: string; status?: string; at?: string | null } | null>(null);
+  const [processGraphEnabled,setProcessGraphEnabled] = useState(false);
+  const [scenarioGraphEnabled,setScenarioGraphEnabled] = useState(false);
+  const processWindow = useWindowedGraph("/api/evolving-profile/process-memory/graph","",processGraphEnabled);
   const [runtimeTab, setRuntimeTab] = useState<"memory" | "rag" | "providers" | "scenario" | "backup">("memory");
   const [directoryMessage, setDirectoryMessage] = useState<string | null>(null);
+  const [editVersions, setEditVersions] = useState({ runtime: 0, guidance: 0, backup: 0 });
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const response = await fetch("/api/evolving-profile/runtime", { cache: "no-store" });
-      setState(await response.json());
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || inlineUiText("读取失败"));
+      setState(body); setLoadError(null);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : inlineUiText("读取失败"));
+      throw error;
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void load();
+    void load().catch(() => undefined);
   }, [load]);
 
-  const saveBackupSettings = useCallback(async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!state?.backup.settings) return;
+  const saveBackupSettings = useCallback(async () => {
+    if (!state?.backup.settings) return false;
     setSavingBackup(true); setBackupMessage(null);
     try {
       const response = await fetch("/api/evolving-profile/backup-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(state.backup.settings) });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error || inlineUiText("保存失败"));
-      setBackupMessage(inlineUiText("备份设置已保存并应用")); await load();
-    } catch (error) { setBackupMessage(error instanceof Error ? error.message : inlineUiText("保存失败")); }
+      setBackupMessage(inlineUiText("备份设置已保存并应用"));
+    } catch (error) { setBackupMessage(error instanceof Error ? error.message : inlineUiText("保存失败")); throw error; }
     finally { setSavingBackup(false); }
   }, [load, state]);
 
-  const saveGuidanceSettings = useCallback(async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!state?.guidanceSettings) return;
+  const saveGuidanceSettings = useCallback(async () => {
+    if (!state?.guidanceSettings) return false;
     setGuidanceMessage(null);
     try {
       const response = await fetch("/api/evolving-profile/guidance-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(state.guidanceSettings) });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error || inlineUiText("保存失败"));
-      setGuidanceMessage(inlineUiText("检索设置已保存，下次入口读取生效")); await load();
-    } catch (error) { setGuidanceMessage(error instanceof Error ? error.message : inlineUiText("保存失败")); }
+      setGuidanceMessage(inlineUiText("检索设置已保存，下次入口读取生效"));
+    } catch (error) { setGuidanceMessage(error instanceof Error ? error.message : inlineUiText("保存失败")); throw error; }
   }, [load, state]);
 
-  const saveRuntimeSettings = useCallback(async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!state?.runtimeSettings) return;
+  const saveRuntimeSettings = useCallback(async () => {
+    if (!state?.runtimeSettings) return false;
     setRuntimeSettingsMessage(null);
     try {
       const response = await fetch("/api/evolving-profile/runtime-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(state.runtimeSettings) });
       const body = await response.json();
-      if (!response.ok) throw new Error(body.error || inlineUiText("运行配置保存失败"));
+      if (!response.ok || body.saved === false) throw new Error(body.error || inlineUiText("运行配置保存失败"));
       setRuntimeSettingsMessage(inlineUiText("运行配置已保存；新一轮入口读取时生效"));
-      await load();
-    } catch (error) { setRuntimeSettingsMessage(error instanceof Error ? error.message : inlineUiText("运行配置保存失败")); }
+    } catch (error) { setRuntimeSettingsMessage(error instanceof Error ? error.message : inlineUiText("运行配置保存失败")); throw error; }
   }, [load, state]);
+
+  const saveRecallPolicy = useCallback(async () => {
+    if (!state?.runtimeSettings) return false;
+    const submitted = normalizeRecallPolicy(state.runtimeSettings.recall_policy);
+    setRuntimeSettingsMessage(null);
+    try {
+      const response = await fetch("/api/evolving-profile/runtime-settings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ recall_policy: submitted }) });
+      const body = await response.json();
+      if (!response.ok || body.saved === false) throw new Error(body.error || inlineUiText("运行配置保存失败"));
+      const saved = normalizeRecallPolicy(body.recall_policy ?? submitted);
+      setState((previous) => {
+        if (!previous || JSON.stringify(normalizeRecallPolicy(previous.runtimeSettings.recall_policy)) !== JSON.stringify(submitted)) return previous;
+        return { ...previous, runtimeSettings: { ...previous.runtimeSettings, recall_policy: saved } };
+      });
+      setRuntimeSettingsMessage(inlineUiText("运行配置已保存；新一轮入口读取时生效"));
+    } catch (error) { setRuntimeSettingsMessage(error instanceof Error ? error.message : inlineUiText("运行配置保存失败")); throw error; }
+  }, [state]);
 
   const chooseRagDirectory = useCallback(async () => {
     setDirectoryMessage(inlineUiText("正在打开系统目录选择器…"));
     try {
       const response = await fetch("/api/evolving-profile/select-directory", { method: "POST" });
       const body = await response.json();
-      if (body.canceled) { setDirectoryMessage(inlineUiText("已取消选择")); return; }
+      if (body.canceled) { setDirectoryMessage(inlineUiText("已取消选择")); return false; }
       if (!response.ok) throw new Error(body.error || inlineUiText("目录选择失败"));
       setState((previous) => previous ? { ...previous, runtimeSettings: { ...previous.runtimeSettings, routing: { ...previous.runtimeSettings.routing, external_rag_enabled: true }, rag: { ...previous.runtimeSettings.rag, root_path: body.path, enabled: true } } } : previous);
       setDirectoryMessage(inlineUiText("目录已选择，保存后生效"));
-    } catch (error) { setDirectoryMessage(error instanceof Error ? error.message : inlineUiText("目录选择失败")); }
+    } catch (error) { setDirectoryMessage(error instanceof Error ? error.message : inlineUiText("目录选择失败")); throw error; }
   }, []);
 
-  if (loading || !state) {
-    return <div className="rounded-lg border p-6 text-sm text-muted-foreground">{english ? "Loading Evolving Profile runtime configuration..." : inlineUiText("正在读取 Evolving Profile 运行配置…")}</div>;
+  if (!state) {
+    return <div className="rounded-lg border p-6 text-sm text-muted-foreground">{loadError ? <><p role="alert">{loadError}</p><ActionButton onAction={load}>{english ? "Retry" : "重试"}</ActionButton></> : english ? "Loading Evolving Profile runtime configuration..." : inlineUiText("正在读取 Evolving Profile 运行配置…")}</div>;
   }
 
   return (
     <section className="space-y-6">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <h2 className="text-lg font-semibold">{english ? "Evolving Profile 5.0 Runtime Configuration" : inlineUiText("Evolving Profile 5.0 运行配置")}</h2>
+          <h2 className="text-lg font-semibold">{english ? "Evolving Profile 5.1 Runtime Configuration" : inlineUiText("Evolving Profile 5.1 运行配置")}</h2>
           <p className="mt-1 text-sm text-muted-foreground">{inlineUiText("只显示当前系统实际使用的链路；密钥永不在界面显示明文。")}</p>
         </div>
-        <button onClick={() => void load()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted" title={inlineUiText("刷新运行状态")}>
+        <ActionButton variant="outline" size="icon" aria-label={inlineUiText("刷新运行状态")} onAction={() => load()} className="inline-flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted" title={inlineUiText("刷新运行状态")}>
           <RefreshCw className="h-4 w-4" />
-        </button>
+        </ActionButton>
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -176,30 +207,26 @@ export function EvolvingProfileRuntimeView() {
       </div>
 
       <div className="rounded-lg border p-4">
-        <div className="flex items-center justify-between gap-3"><div><div className="flex items-center gap-2 text-sm font-semibold"><Bot className="h-4 w-4 text-primary" />{english ? "Agent Process Memory · EP5.0" : inlineUiText("Agent 过程记忆 · EP5.0")}</div><p className="mt-1 text-xs text-muted-foreground">{english ? "Trajectories, failures, repair patterns, capability profiles, and reusable process strategies are isolated; candidates are gated by maturity and compatibility, and the Agent explicitly requests a hint packet before using them." : inlineUiText("轨迹、失败事件、修复模式、能力画像和可复用过程策略独立保存；候选必须经过成熟度和兼容性门控，过程提示由 Agent 显式请求后再决定是否采用。")}</p></div><span className="text-xs text-muted-foreground">{state.processMemory?.status === "ready" ? (english ? "Ready" : inlineUiText("已就绪")) : (english ? "No records" : inlineUiText("尚无记录"))}</span></div>
+        <div className="flex items-center justify-between gap-3"><div><div className="flex items-center gap-2 text-sm font-semibold"><Bot className="h-4 w-4 text-primary" />{english ? "Agent Process Memory · EP5.1" : inlineUiText("Agent 过程记忆 · EP5.1")}</div><p className="mt-1 text-xs text-muted-foreground">{english ? "Trajectories, failures, repair patterns, capability profiles, and reusable process strategies are isolated; candidates are gated by maturity and compatibility, and the Agent explicitly requests a hint packet before using them." : inlineUiText("轨迹、失败事件、修复模式、能力画像和可复用过程策略独立保存；候选必须经过成熟度和兼容性门控，过程提示由 Agent 显式请求后再决定是否采用。")}</p></div><span className="text-xs text-muted-foreground">{state.processMemory?.status === "ready" ? (english ? "Ready" : inlineUiText("已就绪")) : (english ? "No records" : inlineUiText("尚无记录"))}</span></div>
         <div className="mt-3 grid grid-cols-2 gap-3 text-sm md:grid-cols-5"><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("过程记录")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.record_count ?? 0}</div></div><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("失败事件")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.by_kind?.episode ?? 0}</div></div><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("修复模式")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.by_kind?.pattern ?? 0}</div></div><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("可复用过程策略")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.by_kind?.skill ?? 0}</div></div><div className="rounded border p-3"><div className="text-xs text-muted-foreground">{inlineUiText("待再验证")}</div><div className="mt-1 text-lg font-semibold">{state.processMemory?.revalidation_queue ?? 0}</div></div></div>
         <div className="mt-4 overflow-x-auto rounded border"><table className="w-full min-w-[720px] text-left text-xs"><thead className="bg-muted/50 text-muted-foreground"><tr><th className="px-3 py-2">{inlineUiText("时间")}</th><th className="px-3 py-2">{inlineUiText("类型")}</th><th className="px-3 py-2">{inlineUiText("阶段")}</th><th className="px-3 py-2">{inlineUiText("任务族")}</th><th className="px-3 py-2">{inlineUiText("成熟度")}</th><th className="px-3 py-2">{inlineUiText("来源")}</th></tr></thead><tbody>{(state.processMemory?.recent ?? []).slice(0, 12).map((row) => <tr key={row.id} className="border-t"><td className="px-3 py-2 text-muted-foreground">{row.at ? new Date(row.at).toLocaleString(english ? "en-US" : locale, { hour12: false }) : "—"}</td><td className="px-3 py-2 font-medium">{({ trace: inlineUiText("轨迹"), episode: inlineUiText("失败事件"), pattern: inlineUiText("修复模式"), skill: inlineUiText("可复用过程策略"), capability_observation: inlineUiText("能力观测") } as Record<string, string>)[row.kind] ?? row.kind}</td><td className="px-3 py-2">{({ understand: inlineUiText("理解"), plan: inlineUiText("规划"), retrieve: inlineUiText("检索"), act: inlineUiText("执行"), observe: inlineUiText("观察"), verify: inlineUiText("验证"), recover: inlineUiText("恢复"), deliver: inlineUiText("交付"), reflect: inlineUiText("反思") } as Record<string, string>)[row.phase] ?? row.phase}</td><td className="px-3 py-2">{(row.task_archetype ?? []).join("、") || inlineUiText("其他")}</td><td className="px-3 py-2">{({ observed: inlineUiText("已观察"), diagnosed: inlineUiText("已诊断"), repaired: inlineUiText("已修复"), verified: inlineUiText("已验证"), replicated: inlineUiText("已复现"), generalized: inlineUiText("已泛化"), deprecated: inlineUiText("已弃用") } as Record<string, string>)[row.maturity] ?? row.maturity}</td><td className="px-3 py-2">{row.source_count}</td></tr>)}</tbody></table>{!(state.processMemory?.recent ?? []).length && <div className="px-3 py-4 text-xs text-muted-foreground">{inlineUiText("还没有过程轨迹记录。启用记录后，工具回执会逐步出现在这里。")}</div>}</div>
         <div className="mt-4 rounded border p-3">
-          <div className="flex items-center justify-between text-xs font-semibold"><span>{english ? "Agent process graph and timeline" : inlineUiText("Agent 过程图谱与时间线")}</span><span className="text-muted-foreground">{english ? `${state.processMemory?.graph?.nodes.length ?? 0} nodes · ${state.processMemory?.graph?.edges.length ?? 0} edges` : `节点 ${state.processMemory?.graph?.nodes.length ?? 0} · 边 ${state.processMemory?.graph?.edges.length ?? 0}`}</span></div>
-          <div className="mt-3 grid gap-3 lg:grid-cols-2">
-            <div className="rounded bg-muted/40 p-3"><div className="mb-2 text-[11px] font-medium">{english ? "Process nodes" : inlineUiText("过程节点")}</div><div className="flex max-h-36 flex-wrap gap-1.5 overflow-auto">{(state.processMemory?.graph?.nodes ?? []).slice(-60).map((node) => <button type="button" key={node.id} title={`${node.type} · ${node.maturity ?? ""}`} onClick={() => setSelectedProcessNode(node)} className={`rounded-full border px-2 py-1 text-[10px] hover:ring-2 hover:ring-primary/30 ${node.type.includes("episode") ? "border-rose-200 bg-rose-50 text-rose-800" : node.type.includes("pattern") || node.type.includes("skill") ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-sky-200 bg-sky-50 text-sky-800"}`}>{node.label}</button>)}{!(state.processMemory?.graph?.nodes.length) && <span className="text-[11px] text-muted-foreground">{english ? "No process nodes" : inlineUiText("暂无过程节点")}</span>}</div></div>
-            <div className="rounded bg-muted/40 p-3"><div className="mb-2 text-[11px] font-medium">{english ? "Phase timeline" : inlineUiText("阶段时间线")}</div><div className="max-h-36 space-y-1 overflow-auto text-[11px]">{(state.processMemory?.graph?.timeline ?? []).slice(-20).reverse().map((item) => <div key={item.id} className="flex gap-2 rounded border border-transparent px-1 py-0.5"><span className="shrink-0 font-mono text-[10px] text-muted-foreground">{item.at ? new Date(item.at).toLocaleDateString(english ? "en-US" : "zh-CN") : (english ? "Unknown" : inlineUiText("未知时间"))}</span><span className="truncate" title={item.label}>{item.label}</span></div>)}{!(state.processMemory?.graph?.timeline.length) && <span className="text-muted-foreground">{english ? "No process timeline" : inlineUiText("暂无过程时间线")}</span>}</div></div>
-          </div>
+          <button type="button" className="rounded border px-3 py-2 text-xs" onClick={()=>setProcessGraphEnabled(value=>!value)}>{english ? "Agent process graph and timeline" : inlineUiText("Agent 过程图谱与时间线")}</button>
+          {processGraphEnabled ? <div className="mt-3"><GraphWindowControls windowed={processWindow} />{processWindow.data ? <AgentProcessView key={`${processWindow.data.version}:${processWindow.data.page.offset}`} version={processWindow.data.version} onRefresh={processWindow.refresh} graph={processWindow.data.graph} english={english} /> : null}</div> : null}
           <p className="mt-2 text-[11px] text-muted-foreground">{english ? "Process memory remains separate from Facts, Experiences, and Preferences; edges show derivation only, not fact replacement." : inlineUiText("过程经验与 Facts、Experiences、Preferences 保持分层；连线只表示派生关系，不代表事实覆盖。")}</p>
-          {selectedProcessNode && <div className="mt-3 rounded border bg-background p-3 text-xs"><div className="flex items-center justify-between font-medium"><span>{english ? "Selected process node" : inlineUiText("已选过程节点")}</span><button type="button" className="text-muted-foreground hover:text-foreground" onClick={() => setSelectedProcessNode(null)}>×</button></div><dl className="mt-2 grid grid-cols-[80px_1fr] gap-y-1"><dt className="text-muted-foreground">ID</dt><dd className="break-all font-mono">{selectedProcessNode.id}</dd><dt className="text-muted-foreground">{english ? "Type" : inlineUiText("类型")}</dt><dd>{selectedProcessNode.type}</dd><dt className="text-muted-foreground">{english ? "Phase" : inlineUiText("阶段")}</dt><dd>{selectedProcessNode.phase ?? "—"}</dd><dt className="text-muted-foreground">{english ? "Maturity" : inlineUiText("成熟度")}</dt><dd>{selectedProcessNode.maturity ?? "—"}</dd><dt className="text-muted-foreground">{english ? "Drift" : inlineUiText("漂移状态")}</dt><dd>{selectedProcessNode.status ?? "—"}</dd><dt className="text-muted-foreground">{english ? "Summary" : inlineUiText("摘要")}</dt><dd>{selectedProcessNode.label}</dd></dl></div>}
         </div>
       </div>
 
-      {state.processMemory?.graph && <AgentProcessView graph={state.processMemory.graph} english={english} />}
+      <RecallPolicySettings value={state.runtimeSettings.recall_policy} onChange={(patch) => setState((previous) => previous ? { ...previous, runtimeSettings: updateRecallPolicy(previous.runtimeSettings, patch) } : previous)} onSave={saveRecallPolicy} />
       <article id="ep-memory-settings" className="rounded-lg border p-4">
         <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-semibold">{inlineUiText("模块与外部 RAG")}</h3><p className="mt-1 text-xs text-muted-foreground">{inlineUiText("EP 内部记忆和外部文件 RAG 使用独立来源与预算；关闭模块后，本轮不会调用对应能力。")}</p></div>{runtimeSettingsMessage && <span className="text-xs text-emerald-700">{runtimeSettingsMessage}</span>}</div>
-        <nav className="mt-4 flex flex-wrap gap-1 border-b pb-2" aria-label={inlineUiText("EP5.0 配置分区")}><a href="#ep-memory-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("EP 记忆")}</a><a href="#ep-rag-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("外部 RAG")}</a><a href="#ep-provider-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("Provider 与 Fallback")}</a><a href="#ep-scenario-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("情景摘要")}</a><a href="#ep-backup-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("备份")}</a></nav>
-        <form onSubmit={saveRuntimeSettings} className="mt-4 space-y-5 text-sm">
+        <nav className="mt-4 flex flex-wrap gap-1 border-b pb-2" aria-label={inlineUiText("EP5.1 配置分区")}><a href="#ep-memory-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("EP 记忆")}</a><a href="#ep-rag-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("外部 RAG")}</a><a href="#ep-provider-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("Provider 与 Fallback")}</a><a href="#ep-scenario-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("情景摘要")}</a><a href="#ep-backup-settings" className="rounded px-3 py-2 text-xs text-primary hover:bg-muted">{inlineUiText("备份")}</a></nav>
+        <form onSubmit={(event) => event.preventDefault()} onChangeCapture={() => setEditVersions((previous) => ({ ...previous, runtime: previous.runtime + 1 }))} className="mt-4 space-y-5 text-sm">
           <div><div className="mb-2 text-xs font-semibold text-muted-foreground">{english ? "EP modules: record / retrieve / inject" : inlineUiText("EP 内部模块：记录 / 检索 / 注入")}</div><div className="grid gap-2 md:grid-cols-2">{Object.entries(state.runtimeSettings.modules).map(([name, settings]) => <div key={name} className="rounded border p-3"><div className="mb-2 flex items-center justify-between gap-2 font-medium"><span>{english ? name : ({ facts: inlineUiText("事实"), experiences: inlineUiText("经历"), entities: inlineUiText("实体与关系"), preferences: inlineUiText("多维度偏好"), scenario_summary: inlineUiText("情景摘要"), mental_models: inlineUiText("融合心智模型"), source_readback: inlineUiText("原文回读"), background_reflection: inlineUiText("后台记录与反思"), agent_process_memory: inlineUiText("Agent 过程记忆") } as Record<string, string>)[name] ?? name}</span>{name === "agent_process_memory" && <span className="text-[11px] text-muted-foreground">{english ? "Explicit hint packet + evidence gates" : inlineUiText("显式提示包 + 证据门控")}</span>}</div><div className="flex flex-wrap gap-3 text-xs">{(["record", "retrieve", "inject"] as const).map((action) => <label key={action}><input type="checkbox" checked={settings[action]} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, modules: { ...state.runtimeSettings.modules, [name]: { ...settings, [action]: e.target.checked } } } })} /> {english ? action : ({ record: inlineUiText("记录"), retrieve: inlineUiText("检索"), inject: inlineUiText("注入") } as Record<string, string>)[action]}</label>)}</div></div>)}</div></div>
           <div className="grid gap-4 md:grid-cols-2"><label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("来源路由")}</span><select className="h-9 w-full rounded border bg-background px-2" value={state.runtimeSettings.routing.mode} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, routing: { ...state.runtimeSettings.routing, mode: e.target.value } } })}><option value="auto">{inlineUiText("自动判断")}</option><option value="ep">{inlineUiText("只用 EP 内部记忆")}</option><option value="external_rag">{inlineUiText("只用外部 RAG")}</option><option value="both_isolated">{inlineUiText("两边隔离并行")}</option></select></label><label className="flex items-end gap-2 pb-2 text-xs"><input type="checkbox" checked={state.runtimeSettings.routing.external_rag_enabled} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, routing: { ...state.runtimeSettings.routing, external_rag_enabled: e.target.checked } } })} /> {inlineUiText("允许外部 RAG 路由")}</label></div>
           <div className="rounded border p-3"><div className="mb-3 font-medium">{inlineUiText("外部 RAG")}</div><div className="grid gap-4 md:grid-cols-2"><label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("启用")}</span><input type="checkbox" checked={state.runtimeSettings.rag.enabled} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, rag: { ...state.runtimeSettings.rag, enabled: e.target.checked } } })} /></label><label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("资料目录")}</span><input className="h-9 w-full rounded border bg-background px-2 font-mono text-xs" value={state.runtimeSettings.rag.root_path} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, rag: { ...state.runtimeSettings.rag, root_path: e.target.value } } })} /></label><label className="flex items-end gap-2 text-xs"><input type="checkbox" checked={state.runtimeSettings.rag.lexical_enabled ?? true} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, rag: { ...state.runtimeSettings.rag, lexical_enabled: e.target.checked } } })} /> {inlineUiText("词法检索")}</label><label className="flex items-end gap-2 text-xs"><input type="checkbox" checked={state.runtimeSettings.rag.vector_enabled ?? true} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, rag: { ...state.runtimeSettings.rag, vector_enabled: e.target.checked } } })} /> {inlineUiText("向量检索")}</label><label className="flex items-end gap-2 text-xs"><input type="checkbox" checked={state.runtimeSettings.rag.rerank_enabled ?? true} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, rag: { ...state.runtimeSettings.rag, rerank_enabled: e.target.checked } } })} /> Re-rank</label><label className="space-y-1"><span className="text-xs text-muted-foreground">Top-K</span><input type="number" min="1" max="100" className="h-9 w-24 rounded border bg-background px-2" value={state.runtimeSettings.rag.top_k ?? 20} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, rag: { ...state.runtimeSettings.rag, top_k: Number(e.target.value) } } })} /></label></div></div>
           <div className="grid gap-4 md:grid-cols-3"><label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("EP Token 预算")}</span><input type="number" min="500" max="20000" className="h-9 w-28 rounded border bg-background px-2" value={state.runtimeSettings.budgets.ep_total_tokens ?? 4000} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, budgets: { ...state.runtimeSettings.budgets, ep_total_tokens: Number(e.target.value) } } })} /></label><label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("RAG Token 预算")}</span><input type="number" min="0" max="20000" className="h-9 w-28 rounded border bg-background px-2" value={state.runtimeSettings.budgets.rag_total_tokens ?? 4000} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, budgets: { ...state.runtimeSettings.budgets, rag_total_tokens: Number(e.target.value) } } })} /></label><label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("总 Token 上限")}</span><input type="number" min="500" max="30000" className="h-9 w-28 rounded border bg-background px-2" value={state.runtimeSettings.budgets.total_tokens ?? 6000} onChange={(e) => setState({ ...state, runtimeSettings: { ...state.runtimeSettings, budgets: { ...state.runtimeSettings.budgets, total_tokens: Number(e.target.value) } } })} /></label></div>
-          <button className="rounded bg-primary px-4 py-2 text-primary-foreground">{inlineUiText("保存配置")}</button>
+          <ActionButton type="submit" resetKey={editVersions.runtime} onAction={saveRuntimeSettings} className="rounded bg-primary px-4 py-2 text-primary-foreground">{inlineUiText("保存配置")}</ActionButton>
         </form>
       </article>
 
@@ -212,8 +239,9 @@ export function EvolvingProfileRuntimeView() {
       </article>
 
       <article className="rounded-lg border p-4">
-        <div className="flex items-center justify-between gap-3"><div><div className="flex items-center gap-2 text-sm font-semibold"><Route className="h-4 w-4 text-primary" />{inlineUiText("情景摘要星座图与时间线")}</div><p className="mt-1 text-xs text-muted-foreground">{inlineUiText("工作目录—Session 及部分 Bank 事实/经历是只读关联快照；实体、偏好关联尚未覆盖。")}</p></div><span className="text-xs text-muted-foreground">{inlineUiText("节点")} {state.context.graph?.nodes.length ?? 0} {inlineUiText("· 边")} {state.context.graph?.edges.length ?? 0}</span></div>
-        <div className="mt-4 grid gap-4 lg:grid-cols-2"><div className="rounded-md bg-muted/40 p-3"><div className="mb-2 flex items-center justify-between text-xs font-medium"><span>{inlineUiText("星座关系")}</span><span className="text-muted-foreground">{inlineUiText("展示前 80 条")}</span></div><div className="max-h-48 overflow-auto"><div className="flex flex-wrap gap-1.5">{(state.context.graph?.edges ?? []).slice(0, 80).map((edge) => <span key={`${edge.source}-${edge.target}`} title={`${edge.source} → ${edge.target}`} className={`inline-flex max-w-full items-center gap-1 rounded-full border px-2 py-1 text-[10px] ${edge.type.includes("bank") ? "border-sky-200 bg-sky-50 text-sky-800" : "border-violet-200 bg-violet-50 text-violet-800"}`}><span className="max-w-[120px] truncate font-mono">{edge.source.replace("project:", "P:").replace("session:", "S:")}</span><span>→</span><span className="max-w-[120px] truncate font-mono">{edge.target.replace("project:", "P:").replace("session:", "S:").replace("bank:", "B:")}</span></span>)}{!(state.context.graph?.edges.length) && <div className="text-muted-foreground">{inlineUiText("暂无可视化边")}</div>}</div></div></div><div className="rounded-md bg-muted/40 p-3"><div className="mb-2 flex items-center justify-between text-xs font-medium"><span>{inlineUiText("更新时间线")}</span><span className="text-muted-foreground">{inlineUiText("最近 40 条")}</span></div><div className="max-h-48 space-y-1 overflow-auto text-[11px]">{(state.context.graph?.timeline ?? []).slice(-40).reverse().map((item) => <div key={item.id} className="flex items-center gap-2 rounded border border-transparent px-1 py-0.5 hover:border-border"><span className="shrink-0 rounded bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">{item.at ? new Date(item.at).toLocaleDateString(english ? "en-US" : locale) : inlineUiText("未知时间")}</span><span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${item.type.startsWith("bank_") ? "bg-sky-100 text-sky-800" : "bg-violet-100 text-violet-800"}`}>{item.type.replace("bank_", "Bank ")}</span><span className="truncate" title={item.label}>{item.label}</span></div>)}{!(state.context.graph?.timeline.length) && <div className="text-muted-foreground">{inlineUiText("暂无时间线")}</div>}</div></div></div><p className="mt-3 text-xs text-emerald-700">{inlineUiText("Bank记录关联：")}{state.context.graph?.bankRecordLinks.available ? `${state.context.graph.bankRecordLinks.linked} 条已关联（页面展示 ${state.context.graph.bankRecordLinks.sampled ?? 0} 条样本）` : inlineUiText("尚未接入真实 Bank 记录")}。</p>
+        <div className="flex items-center justify-between gap-3"><div><div className="flex items-center gap-2 text-sm font-semibold"><Route className="h-4 w-4 text-primary" />{inlineUiText("情景摘要星座图与时间线")}</div><p className="mt-1 text-xs text-muted-foreground">{inlineUiText("工作目录—Session 及部分 Bank 事实/经历是只读关联快照；实体、偏好关联尚未覆盖。")}</p></div><span className="text-xs text-muted-foreground">{inlineUiText("节点")} {state.context.graphStats?.nodes ?? 0} {inlineUiText("· 边")} {state.context.graphStats?.edges ?? 0}</span></div>
+        <button type="button" className="mt-3 rounded border px-3 py-2 text-xs" onClick={()=>setScenarioGraphEnabled(value=>!value)}>{releaseText("scenarioGraphLoad")}</button>
+        {scenarioGraphEnabled ? <div className="mt-4"><ContextMemoryView bankId={state.context.bankId || null} /></div> : null}
       </article>
 
       <article className="rounded-lg border p-4">
@@ -235,18 +263,18 @@ export function EvolvingProfileRuntimeView() {
 
       <article className="rounded-lg border p-4">
         <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-semibold">{inlineUiText("记忆检索设置")}</h3><p className="mt-1 text-xs text-muted-foreground">{inlineUiText("每轮先做有界的 Get Preference；涉及历史依赖时先做窄 Recall 探测，再由 Agent 决定是否继续下钻。")}</p></div>{guidanceMessage && <span className="text-xs text-emerald-700">{guidanceMessage}</span>}</div>
-        {state.guidanceSettings && <form onSubmit={saveGuidanceSettings} className="mt-4 grid gap-4 md:grid-cols-3 text-sm">
+        {state.guidanceSettings && <form onSubmit={(event) => event.preventDefault()} onChangeCapture={() => setEditVersions((previous) => ({ ...previous, guidance: previous.guidance + 1 }))} className="mt-4 grid gap-4 md:grid-cols-3 text-sm">
           <label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("Get Preference 候选上限（1-20）")}</span><input type="number" min="1" max="20" className="h-9 w-28 rounded border bg-background px-2" value={state.guidanceSettings.max_candidates} onChange={(e) => setState({...state, guidanceSettings:{...state.guidanceSettings!, max_candidates:Number(e.target.value)}})} /></label>
           <label className="flex items-end gap-2 pb-2 text-xs"><input type="checkbox" checked={state.guidanceSettings.adaptive_budget} onChange={(e) => setState({...state, guidanceSettings:{...state.guidanceSettings!, adaptive_budget:e.target.checked}})} /> {inlineUiText("按任务阶段自适应候选数量")}</label>
           <label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("窄探测 Token 上限（300-1200）")}</span><input type="number" min="300" max="1200" className="h-9 w-32 rounded border bg-background px-2" value={state.guidanceSettings.probe_max_tokens} onChange={(e) => setState({...state, guidanceSettings:{...state.guidanceSettings!, probe_max_tokens:Number(e.target.value)}})} /></label>
           <label className="flex items-end gap-2 pb-2 text-xs"><input type="checkbox" checked={state.guidanceSettings.auto_probe} onChange={(e) => setState({...state, guidanceSettings:{...state.guidanceSettings!, auto_probe:e.target.checked}})} /> {inlineUiText("历史依赖时自动窄探测")}</label>
-          <div className="md:col-span-3"><button className="rounded bg-primary px-4 py-2 text-primary-foreground">{inlineUiText("保存检索设置")}</button></div>
+          <div className="md:col-span-3"><ActionButton type="submit" resetKey={editVersions.guidance} onAction={saveGuidanceSettings} className="rounded bg-primary px-4 py-2 text-primary-foreground">{inlineUiText("保存检索设置")}</ActionButton></div>
         </form>}
       </article>
 
       <article className="rounded-lg border p-4">
         <div className="flex items-center justify-between gap-3"><div><h3 className="text-sm font-semibold">{inlineUiText("备份设置")}</h3><p className="mt-1 text-xs text-muted-foreground">{inlineUiText("本地计划和保留策略可编辑；云端镜像单独管理，不自动覆盖本地规则。")}</p></div>{backupMessage && <span className="text-xs text-emerald-700">{backupMessage}</span>}</div>
-        {state.backup.settings && <form onSubmit={saveBackupSettings} className="mt-4 grid gap-4 md:grid-cols-2 text-sm">
+        {state.backup.settings && <form onSubmit={(event) => event.preventDefault()} onChangeCapture={() => setEditVersions((previous) => ({ ...previous, backup: previous.backup + 1 }))} className="mt-4 grid gap-4 md:grid-cols-2 text-sm">
           <label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("本地备份位置")}</span><input className="h-9 w-full rounded border bg-background px-2 font-mono text-xs" value={state.backup.settings.local?.root ?? ""} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, local:{...state.backup.settings.local, root:e.target.value}}}})} /></label>
           <label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("周期")}</span><select className="h-9 w-full rounded border bg-background px-2" value={state.backup.settings.schedule?.mode ?? "daily"} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, schedule:{...state.backup.settings.schedule, mode:e.target.value}}}})}><option value="daily">{inlineUiText("每日")}</option><option value="weekly">{inlineUiText("每周")}</option><option value="monthly">{inlineUiText("每月")}</option></select></label>
           <label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("执行时间（小时 / 分钟）")}</span><div className="flex gap-2"><input type="number" min="0" max="23" className="h-9 w-20 rounded border bg-background px-2" value={state.backup.settings.schedule?.hour ?? 3} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, schedule:{...state.backup.settings.schedule, hour:Number(e.target.value)}}}})} /><input type="number" min="0" max="59" className="h-9 w-20 rounded border bg-background px-2" value={state.backup.settings.schedule?.minute ?? 25} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, schedule:{...state.backup.settings.schedule, minute:Number(e.target.value)}}}})} /></div></label>
@@ -255,7 +283,7 @@ export function EvolvingProfileRuntimeView() {
           <label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("本地保留天数 / 最大套数")}</span><div className="flex gap-2"><input type="number" min="1" max="3650" className="h-9 w-28 rounded border bg-background px-2" value={state.backup.settings.local?.retention_days ?? 14} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, local:{...state.backup.settings.local, retention_days:Number(e.target.value)}}}})} /><input type="number" min="1" max="1000" className="h-9 w-28 rounded border bg-background px-2" value={state.backup.settings.local?.max_sets ?? 14} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, local:{...state.backup.settings.local, max_sets:Number(e.target.value)}}}})} /></div></label>
           <div className="flex flex-wrap gap-4 text-xs md:col-span-2"><label><input type="checkbox" checked={state.backup.settings.local?.database ?? true} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, local:{...state.backup.settings.local, database:e.target.checked}}}})} /> {inlineUiText("数据库")}</label><label><input type="checkbox" checked={state.backup.settings.local?.config ?? true} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, local:{...state.backup.settings.local, config:e.target.checked}}}})} /> {inlineUiText("加密配置")}</label><label><input type="checkbox" checked={state.backup.settings.local?.capture ?? true} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, local:{...state.backup.settings.local, capture:e.target.checked}}}})} /> {inlineUiText("加密回执")}</label><label><input type="checkbox" checked={state.backup.settings.local?.verify_checksum ?? true} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, local:{...state.backup.settings.local, verify_checksum:e.target.checked}}}})} /> {inlineUiText("SHA-256 校验")}</label></div>
           <label className="space-y-1"><span className="text-xs text-muted-foreground">{inlineUiText("云端预期保留套数（独立策略）")}</span><input type="number" min="0" max="1000" className="h-9 w-32 rounded border bg-background px-2" value={state.backup.settings.cloud?.retention_sets ?? 2} onChange={(e) => setState({...state, backup:{...state.backup, settings:{...state.backup.settings, cloud:{...state.backup.settings.cloud, retention_sets:Number(e.target.value)}}}})} /></label>
-          <div className="flex items-end"><button disabled={savingBackup} className="rounded bg-primary px-4 py-2 text-primary-foreground disabled:opacity-50">{savingBackup ? inlineUiText("保存中…") : inlineUiText("保存并应用")}</button></div>
+          <div className="flex items-end"><ActionButton type="submit" resetKey={editVersions.backup} onAction={saveBackupSettings} disabled={savingBackup} className="rounded bg-primary px-4 py-2 text-primary-foreground disabled:opacity-50">{savingBackup ? inlineUiText("保存中…") : inlineUiText("保存并应用")}</ActionButton></div>
         </form>}
       </article>
 

@@ -13,9 +13,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { Textarea } from "@/components/ui/textarea";
 import { useBank } from "@/lib/bank-context";
-import { Loader2 } from "lucide-react";
 import JsonView from "react18-json-view";
 import "react18-json-view/src/style.css";
 
@@ -46,7 +46,7 @@ export function ExtractDialog({
   }, [open]);
 
   async function run() {
-    if (!currentBank) return;
+    if (!currentBank) return false;
     setLoading(true);
     setError(null);
     setResult(null);
@@ -61,6 +61,7 @@ export function ExtractDialog({
       setResult(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      throw e;
     } finally {
       setLoading(false);
     }
@@ -110,10 +111,9 @@ export function ExtractDialog({
           <Button variant="ghost" disabled={loading} onClick={() => onOpenChange(false)}>
             {tCommon("close")}
           </Button>
-          <Button onClick={run} disabled={loading || !content.trim() || !currentBank}>
-            {loading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+          <ActionButton resetKey={`${open}:${currentBank}:${content}`} onAction={run} disabled={loading || !content.trim() || !currentBank}>
             {t("dryRunExtractionRun")}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>

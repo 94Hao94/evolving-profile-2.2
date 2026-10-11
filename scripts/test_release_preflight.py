@@ -68,6 +68,16 @@ class ReleasePreflightTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("flow_badge_version_mismatch", json.loads(result.stdout)["issues"])
 
+    def test_product_readme_title_can_be_version_neutral(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.mkdir(exist_ok=True)
+            self.fixture(root)
+            (root / "README.md").write_text("# Evolving Profile\n", encoding="utf-8")
+            result = self.run_preflight(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("readme_version_mismatch", json.loads(result.stdout)["issues"])
+
 
 if __name__ == "__main__":
     unittest.main()

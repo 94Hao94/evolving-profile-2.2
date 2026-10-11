@@ -1,6 +1,7 @@
 import unittest
 
 from lib.scenario_episodes import (episode_id_for, partition_source,
+                                   deterministic_size_boundaries,
                                    revalidate_persisted_episode_source, validate_episode_bundle)
 from lib.scenario_state_v3 import validate_state_draft
 
@@ -42,6 +43,26 @@ class ScenarioEpisodePartitionTests(unittest.TestCase):
 
         self.assertEqual(len(episodes), 1)
         self.assertEqual(episodes[0]["message_ids"], ["id1", "id2"])
+
+    def test_long_session_gets_deterministic_source_boundaries_without_splitting_turns(self):
+        original = source([
+            ("user", "任务一", "turn-1"), ("assistant", "答复一", "turn-1"),
+            ("user", "任务二", "turn-2"), ("assistant", "答复二", "turn-2"),
+            ("user", "任务三", "turn-3"), ("assistant", "答复三", "turn-3"),
+            ("user", "任务四", "turn-4"), ("assistant", "答复四", "turn-4"),
+            ("user", "任务五", "turn-5"), ("assistant", "答复五", "turn-5"),
+        ])
+        self.assertEqual(deterministic_size_boundaries(original, max_user_messages=4), ["id9"])
+
+    def test_size_boundaries_defer_when_adjacent_user_messages_share_turn(self):
+        original = source([
+            ("user", "任务一", "turn-1"), ("assistant", "答复一", "turn-1"),
+            ("user", "同轮补充", "turn-1"), ("assistant", "补充答复", "turn-1"),
+            ("user", "任务二", "turn-2"), ("assistant", "答复二", "turn-2"),
+            ("user", "任务三", "turn-3"), ("assistant", "答复三", "turn-3"),
+            ("user", "任务四", "turn-4"), ("assistant", "答复四", "turn-4"),
+        ])
+        self.assertEqual(deterministic_size_boundaries(original, max_user_messages=3), ["id7"])
 
     def test_unknown_duplicate_or_out_of_order_boundaries_are_rejected(self):
         original = source([("user", "任务一", "turn-1"), ("assistant", "答复一", "turn-1"),

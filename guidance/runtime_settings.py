@@ -4,9 +4,14 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "host-adapter"))
+from lib.recall_relevance import normalize_recall_policy, policy_defaults, resolve_min_relevance
+
 SETTINGS_PATH = Path(os.environ.get("EVOLVING_PROFILE_RUNTIME_SETTINGS", str(Path.home() / ".evolving-profile/config/runtime-settings.json")))
+_RECALL_DEFAULTS = policy_defaults()
 
 _MODULE = {"record": True, "retrieve": True, "inject": True}
 _PROCESS_MEMORY_MODULE = {"record": True, "retrieve": True, "inject": True}
@@ -21,6 +26,7 @@ AGENT_PROCESS_MODULES = {
 }
 DEFAULT_SETTINGS = {
     "schema": "evolving-profile.runtime-settings.v1",
+    "recall_policy": _RECALL_DEFAULTS["recall_policy"],
     "modules": {
         "facts": dict(_MODULE), "experiences": dict(_MODULE), "entities": dict(_MODULE),
         "preferences": dict(_MODULE), "scenario_summary": dict(_MODULE),
@@ -33,7 +39,7 @@ DEFAULT_SETTINGS = {
                 "allow_parallel": False, "conflict_policy": "show_both"},
     "budgets": {"ep_total_tokens": 4000, "rag_total_tokens": 4000, "total_tokens": 6000,
                 "preference_tokens": 1200, "scenario_tokens": 1200, "source_tokens": 2400},
-    "rag": {"enabled": False, "root_path": "", "collection": "default", "lexical_enabled": True,
+    "rag": {"enabled": False, "minimum_relevance": _RECALL_DEFAULTS["rag"]["minimum_relevance"], "root_path": "", "collection": "default", "lexical_enabled": True,
             "vector_enabled": True, "fusion": "rrf", "lexical_weight": 0.5, "vector_weight": 0.5,
             "rerank_enabled": True, "rerank_provider": "local", "rerank_model": "",
             "top_k": 20, "score_threshold": 0.35, "max_chunks": 8, "auto_index": False},
@@ -56,9 +62,25 @@ def _merge(base, override):
 def load_runtime_settings(path: Path | None = None) -> dict:
     target = Path(path or SETTINGS_PATH)
     try:
-        return _merge(DEFAULT_SETTINGS, json.loads(target.read_text(encoding="utf-8")))
-    except (OSError, ValueError, TypeError):
+        stored = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return copy.deepcopy(DEFAULT_SETTINGS)
+    if not isinstance(stored, dict):
+        raise ValueError("invalid_runtime_settings_object")
+    if "recall_policy" in stored:
+        if not isinstance(stored["recall_policy"], dict):
+            raise ValueError("invalid_recall_policy_object")
+        normalize_recall_policy(stored["recall_policy"])
+    for field in ("modules", "routing", "budgets", "rag", "providers", "retrieval_models"):
+        if field in stored and not isinstance(stored[field], dict):
+            raise ValueError(f"invalid_{field}_object")
+    providers = stored.get("providers", {})
+    if "fallbacks" in providers and (not isinstance(providers["fallbacks"], list) or any(not isinstance(item, dict) for item in providers["fallbacks"])):
+        raise ValueError("invalid_providers_fallbacks_array")
+    value = _merge(DEFAULT_SETTINGS, stored)
+    value["recall_policy"] = normalize_recall_policy(value["recall_policy"])
+    resolve_min_relevance(value, "external_rag")
+    return value
 
 
 def module_enabled(settings: dict, module: str, action: str = "retrieve") -> bool:

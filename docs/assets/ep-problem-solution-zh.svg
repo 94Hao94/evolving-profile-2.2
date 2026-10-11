@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title desc">
+  <title id="title">从记忆问题到 Evolving Profile</title>
+  <desc id="desc">常见记忆问题与 EP 设计解法逐项对应。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#0b1024"/><stop offset="1" stop-color="#182451"/></linearGradient>
+    <linearGradient id="red" x1="0" x2="1"><stop stop-color="#fb7185"/><stop offset="1" stop-color="#f97316"/></linearGradient>
+    <linearGradient id="green" x1="0" x2="1"><stop stop-color="#2dd4bf"/><stop offset="1" stop-color="#38bdf8"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b8c9ff"/></marker>
+  </defs>
+  <rect width="1400" height="720" rx="28" fill="url(#bg)"/>
+  <text x="70" y="70" fill="#fff" font-family="Inter,Arial,sans-serif" font-size="34" font-weight="700">为什么需要 EP</text>
+  <text x="70" y="105" fill="#a8b7d8" font-family="Inter,Arial,sans-serif" font-size="18">一次命中不等于可信、可用的上下文。</text>
+  <g font-family="Inter,Arial,sans-serif">
+    <rect x="70" y="150" width="470" height="470" rx="24" fill="#28182d" stroke="url(#red)" stroke-width="3"/>
+    <text x="105" y="200" fill="#fff" font-size="26" font-weight="700">常见失真方式</text>
+    <g fill="#ffd1d8" font-size="18">
+      <text x="105" y="250">× 用户事实与智能体临时方案混在一起</text>
+      <text x="105" y="315">× 偏好丢失适用条件和形成原因</text>
+      <text x="105" y="380">× 情景缺失或重新加载成本过高</text>
+      <text x="105" y="445">× 智能体经验没有验证生命周期</text>
+      <text x="105" y="510">× 提炼器越多，延迟和路由混乱越大</text>
+      <text x="105" y="575">× 工具调用被误认为证据已送达</text>
+    </g>
+    <rect x="860" y="150" width="470" height="470" rx="24" fill="#102c35" stroke="url(#green)" stroke-width="3"/>
+    <text x="895" y="200" fill="#fff" font-size="26" font-weight="700">EP 设计回应</text>
+    <g fill="#c6fff4" font-size="18">
+      <text x="895" y="250">✓ 用户记忆与智能体过程记忆分离</text>
+      <text x="895" y="315">✓ 多维度偏好保留范围和原因</text>
+      <text x="895" y="380">✓ 情景摘要选择有界上下文深度</text>
+      <text x="895" y="445">✓ 过程模式要求证据与再验证</text>
+      <text x="895" y="510">✓ 模块、预算和路由可配置</text>
+      <text x="895" y="575">✓ 回执显示候选 → 送达 → 原文回读</text>
+    </g>
+  </g>
+  <path d="M555 385H845" stroke="#b8c9ff" stroke-width="6" marker-end="url(#arrow)"/>
+  <circle cx="700" cy="385" r="46" fill="#5b4bcb" stroke="#fff" stroke-width="3"/>
+  <text x="700" y="393" text-anchor="middle" fill="#fff" font-family="Inter,Arial,sans-serif" font-size="18" font-weight="700">EP</text>
+</svg>

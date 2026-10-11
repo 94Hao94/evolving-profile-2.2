@@ -322,6 +322,8 @@ def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -
     choice = _first_choice_or_error(response, provider=provider, model=model, scope=scope)
     message = _message_for_choice(choice)
     finish_reason = _finish_reason_for_choice(choice)
+    if finish_reason == "length":
+        raise OutputTooLongError("LLM output exceeded token limits (finish_reason=length); split the input batch.")
     if message is None:
         raise ProviderResponseError(
             f"Provider returned a choice without message ({provider}/{model}, scope={scope}, "
@@ -355,6 +357,7 @@ def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cached_tokens=cached_tokens,
+        finish_reason=_finish_reason_for_choice(response.choices[0]) if getattr(response, "choices", None) else None,
     )
 
 
@@ -1015,6 +1018,17 @@ class OpenAICompatibleLLM(LLMInterface):
                     # even though the provider charged for these tokens (#2387).
                     stash_response_usage(_usage_from_openai_response(response))
 
+                    reported_usage = _usage_from_openai_response(response)
+                    token_cap = call_params.get(self._max_tokens_param_name())
+                    if (
+                        token_cap
+                        and reported_usage.output_tokens >= token_cap
+                        and (reported_usage.finish_reason is None or scope == "consolidation")
+                    ):
+                        raise OutputTooLongError(
+                            "LLM output reached the requested token cap; complete structured output cannot be assumed. Split the input batch."
+                        )
+
                     content, first_choice = _content_or_error(
                         response,
                         provider=self.provider,
@@ -1032,7 +1046,13 @@ class OpenAICompatibleLLM(LLMInterface):
                     # Strip markdown code fences if present — any provider may
                     # produce these (confirmed with MiniMax, some Ollama models,
                     # Claude via proxies). No-op when content is already bare JSON.
-                    clean_content = _strip_code_fences(content)
+                    if scope == "consolidation":
+                        # Accept a complete enclosing fence, never a recovered
+                        # JSON span from an unfinished action stream or fence.
+                        fence = re.fullmatch(r"```(?:json)?\s*\n(.*)\n```\s*", content, flags=re.DOTALL)
+                        clean_content = fence.group(1).strip() if fence else content
+                    else:
+                        clean_content = _strip_code_fences(content)
                     try:
                         json_data = json.loads(clean_content)
                     except json.JSONDecodeError:
@@ -1044,6 +1064,8 @@ class OpenAICompatibleLLM(LLMInterface):
                             content_preview = content[:500] if content else "<empty>"
                             if content and len(content) > 700:
                                 content_preview = f"{content[:500]}...TRUNCATED...{content[-200:]}"
+                            if scope == "consolidation":
+                                content_preview = "<consolidation output omitted>"
                             logger.warning(
                                 f"JSON parse error from LLM response (attempt {attempt + 1}/{max_retries + 1}): {json_err}\n"
                                 f"  Model: {self.provider}/{self.model}\n"
@@ -1051,7 +1073,12 @@ class OpenAICompatibleLLM(LLMInterface):
                                 f"  Content preview: {content_preview!r}\n"
                                 f"  Finish reason: {_finish_reason_for_choice(first_choice)}"
                             )
-                            # Retry on JSON parse errors
+                            # Consolidation's outer ladder bisects this input;
+                            # an identical malformed generation adds no evidence.
+                            # Keep transport retries available on the provider.
+                            if scope == "consolidation":
+                                raise json_err
+                            # Other operations retain their JSON retry policy.
                             if attempt < max_retries:
                                 backoff = min(initial_backoff * (2**attempt), max_backoff)
                                 await asyncio.sleep(backoff)

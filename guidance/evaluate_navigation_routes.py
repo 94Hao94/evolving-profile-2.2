@@ -1,6 +1,5 @@
 """Small disclosed navigation regression set; not a blind answer benchmark."""
 import json
-import os
 from pathlib import Path
 from bank_hierarchy import model_json
 from observation_rebuild import load_env,atomic
@@ -40,7 +39,7 @@ def main():
                         'valid_route':route_valid,'disclosed_topic_check':relevant,'sources':[r for v in leaves for r in v['source_locators'][:1]]})
     report={'scope':'six_disclosed_navigation_cases; model-selected_routes; not fact-answer_accuracy_or_blind_test',
             'cases':results,'valid':sum(r['valid_route'] and r['disclosed_topic_check'] and r['source_refs']>0 for r in results),'total':len(results),'model_usage':[cost,cost2]}
-    atomic(Path(os.environ.get('EP_NAVIGATION_EVAL_OUTPUT', 'L0-L1-L2-navigation-route-eval.json')),report)
+    atomic(Path('/Users/apple/Documents/Codex/2026-09-09/hind/outputs/L0-L1-L2-navigation-route-eval-20260920.json'),report)
     print(json.dumps(report,ensure_ascii=False,indent=2))
     if report['valid']!=report['total']:raise SystemExit(1)
 

@@ -77,6 +77,7 @@ async def _instrumented_consolidate(
     config: Any = None,
     remaining_observation_slots: int | None = None,
     max_observations_per_scope: int = -1,
+    observation_source_ids: dict[str, set[str]] | None = None,
 ) -> Any:
     """Wrapper that captures the prompt and response for debugging."""
     if union_observations:
@@ -95,6 +96,7 @@ async def _instrumented_consolidate(
         config=config,
         remaining_observation_slots=remaining_observation_slots,
         max_observations_per_scope=max_observations_per_scope,
+        observation_source_ids=observation_source_ids,
     )
 
     _debug_log.append(

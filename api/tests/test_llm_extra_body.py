@@ -140,10 +140,18 @@ def _make_gemini_provider(extra_body=None, gemini_service_tier=None):
 
 
 def _fake_gemini_response():
+    from google.genai.types import GenerateContentResponseUsageMetadata
+
     r = MagicMock()
     r.text = "hello"
     r.candidates = [MagicMock(finish_reason="STOP")]
-    r.usage_metadata = MagicMock(prompt_token_count=5, candidates_token_count=2)
+    r.usage_metadata = GenerateContentResponseUsageMetadata(
+        prompt_token_count=5,
+        candidates_token_count=2,
+        total_token_count=7,
+        cached_content_token_count=0,
+        thoughts_token_count=0,
+    )
     return r
 
 

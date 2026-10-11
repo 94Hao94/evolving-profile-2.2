@@ -144,6 +144,7 @@ def _request_params(
     scope: str | None = None,
     response_format: Any | None = None,
     tool_choice: LLMToolChoice | None = None,
+    strict_schema: bool | None = None,
 ) -> dict[str, Any] | None:
     """Build the requested-params bag for tracing — only values the caller set.
 
@@ -158,6 +159,9 @@ def _request_params(
         params["temperature"] = temperature
     if response_format is not None:
         params["response_schema"] = getattr(response_format, "__name__", None) or "structured"
+        if strict_schema is not None:
+            params["strict_schema"] = strict_schema
+            params["response_format"] = "json_schema" if strict_schema else "json_object"
     if tool_choice is not None and tool_choice.mode is not LLMToolChoiceMode.AUTO:
         params["tool_choice"] = tool_choice.function_name or tool_choice.mode.value
     return params or None
@@ -1144,6 +1148,7 @@ class LLMProvider:
                 temperature=temperature,
                 scope=scope,
                 response_format=response_format,
+                strict_schema=strict_schema,
             )
         )
         # Cleared per call; the provider stashes real usage once a response is in
@@ -1200,6 +1205,7 @@ class LLMProvider:
                         input_tokens=usage.input_tokens if usage else 0,
                         output_tokens=usage.output_tokens if usage else 0,
                         cached_tokens=usage.cached_tokens if usage else 0,
+                        finish_reason=usage.finish_reason if usage else None,
                         duration=time.monotonic() - call_start,
                         error=e,
                     )

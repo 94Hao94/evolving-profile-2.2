@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useTranslations } from "next-intl";
 import {
   Dialog,
@@ -11,12 +11,13 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { Input } from "@/components/ui/input";
 
 interface InvalidateMemoryDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onConfirm: (reason?: string) => void;
+  onConfirm: (reason?: string) => Promise<unknown>;
   busy?: boolean;
 }
 
@@ -30,6 +31,7 @@ export function InvalidateMemoryDialog({
 }: InvalidateMemoryDialogProps) {
   const t = useTranslations("memoryDetailPanel");
   const [reason, setReason] = useState("");
+  const confirmButton = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!open) setReason("");
@@ -52,7 +54,10 @@ export function InvalidateMemoryDialog({
             placeholder={t("curationReasonPlaceholder")}
             autoFocus
             onKeyDown={(e) => {
-              if (e.key === "Enter") onConfirm(reason.trim() || undefined);
+              if (e.key === "Enter") {
+                e.preventDefault();
+                confirmButton.current?.click();
+              }
             }}
           />
         </div>
@@ -60,13 +65,15 @@ export function InvalidateMemoryDialog({
           <Button variant="ghost" disabled={busy} onClick={() => onOpenChange(false)}>
             {t("curationCancel")}
           </Button>
-          <Button
+          <ActionButton
+            ref={confirmButton}
+            resetKey={`${open}:${reason}`}
             variant="destructive"
             disabled={busy}
-            onClick={() => onConfirm(reason.trim() || undefined)}
+            onAction={() => onConfirm(reason.trim() || undefined)}
           >
             {t("curationInvalidate")}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>

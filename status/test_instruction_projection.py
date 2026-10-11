@@ -21,7 +21,7 @@ class InstructionProjectionTest(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('history_decision_status_test', Path(__file__).with_name('evolving_profile_status_server.py'))
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        ingress={'at':'2026-09-17T06:00:00+00:00','session_id':'session','turn_id':'turn','hook_invocation_id':'hook','prompt_preview':'一个没有历史回执的问题','prompt_fingerprint':'fp'}
+        ingress={'at':'2026-09-17T06:00:00+00:00','session_id':'session','turn_id':'turn','hook_invocation_id':'hook','prompt_preview':'一个没有历史回执的问题','prompt_fingerprint':'fp','origin_kind':'human','origin_status':'verified'}
         with tempfile.TemporaryDirectory() as root:
             with patch.object(module,'STATE_ROOT',Path(root)), patch.object(module,'_prompt_ingress_rows',return_value=[ingress]), patch.object(module,'_hook_output_rows',return_value=[]), patch.object(module,'guidance_delivery_list',return_value={}), patch.object(module,'research_snapshot',return_value={}):
                 row=module.guidance_prompt_list()['items'][0]
@@ -34,7 +34,7 @@ class InstructionProjectionTest(unittest.TestCase):
         module=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         manual={'instruction_version':'recorded-v1','content_sha256':'hash','core_text':'当时提供的说明','source_file':'/source.py','stage':'hook_context_prepared','model_context_visibility':'not_measured'}
-        ingress={'at':'2026-09-17T06:00:00+00:00','session_id':'session','turn_id':'turn','hook_invocation_id':'hook','prompt_preview':'解释一下机制','prompt_fingerprint':'fp'}
+        ingress={'at':'2026-09-17T06:00:00+00:00','session_id':'session','turn_id':'turn','hook_invocation_id':'hook','prompt_preview':'解释一下机制','prompt_fingerprint':'fp','origin_kind':'human','origin_status':'verified'}
         receipt={**ingress,'instruction':manual,'coverage':'partial','entry_context_included_count':1,'model_section_count':0,'deferred_count':1,'result':{'included':[{'id':'a','text':'已输出'},{'id':'b','text':'未输出'}]},'rendered_guidance':{'included':[{'id':'a','text':'已输出'}],'model_sections':[],'deferred':[{'id':'b'}]}}
         with tempfile.TemporaryDirectory() as root:
             target=Path(root)/'audit/guidance-entry-receipts'

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useLocale } from "next-intl";
+import { ActionButton } from "@/components/ui/action-button";
 import { Constellation } from "@/components/constellation";
 import { Graph2D, type GraphNode } from "@/components/graph-2d";
 import {
@@ -186,15 +187,24 @@ export function PreferenceView() {
     setEditError(null);
   };
   const saveEdit = async () => {
-    if (!editingUnit || !editText.trim()) return;
+    if (!editingUnit || !editText.trim()) return false;
     setEditSaving(true); setEditError(null);
     try {
       const response = await fetch("/api/evolving-profile/guidance/manual-correction", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ unit_id: editingUnit.id, text: editText.trim(), applies_when: editApplies.split("\n").map((item) => item.trim()).filter(Boolean), exceptions: editExceptions.split("\n").map((item) => item.trim()).filter(Boolean), reason: editReason.trim() || inlineUiText("用户手动修正") }) });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error || inlineUiText("修正保存失败"));
-      setEditingUnit(null);
-      window.location.reload();
-    } catch (cause) { setEditError(cause instanceof Error ? cause.message : inlineUiText("修正保存失败")); }
+      const [unitResponse, modelResponse] = await Promise.all([
+        fetch("/api/evolving-profile/guidance/units?limit=500&cursor=0", { cache: "no-store" }),
+        fetch("/api/evolving-profile/guidance/models", { cache: "no-store" }),
+      ]);
+      if (!unitResponse.ok || !modelResponse.ok) throw new Error(copy.unavailable);
+      const [unitBody, modelBody] = await Promise.all([unitResponse.json(), modelResponse.json()]);
+      setUnits(unitBody.items ?? []);
+      setModels(modelBody.items ?? []);
+    } catch (cause) {
+      setEditError(cause instanceof Error ? cause.message : inlineUiText("修正保存失败"));
+      throw cause;
+    }
     finally { setEditSaving(false); }
   };
   const eventTime = (at: number) => at ? new Date(at).toLocaleString(language === "zh" ? "zh-CN" : "en-US", { hour12: false }) : "—";
@@ -360,7 +370,7 @@ export function PreferenceView() {
                     {tableRows.map((row) => (
                       <tr key={`${row.kind}:${row.id}`} className="cursor-pointer hover:bg-muted/60" onClick={() => selectRow(row)}>
                         <td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">{row.kind === "model" ? copy.model : preferenceDimensionLabel(row.unit.primary_category, language)}</td>
-                        <td className="max-w-[480px] px-4 py-3 leading-6"><span className="line-clamp-2">{row.title}</span></td>
+                        <td className="max-w-[480px] px-4 py-3 leading-6"><span data-i18n-ignore="true" className="line-clamp-2">{row.title}</span></td>
                         <td className="px-4 py-3 text-xs"><span className="rounded border px-2 py-1">{row.lifecycle === "approved" ? copy.approved : row.lifecycle === "active" ? copy.active : row.lifecycle === "needs_review" ? copy.pending : row.lifecycle === "superseded" ? copy.superseded : row.lifecycle}</span></td>
                         <td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">{eventTime(row.at)}</td>
                       </tr>
@@ -406,7 +416,7 @@ export function PreferenceView() {
                 <div className="font-medium" style={{ color: preferenceDimensionColor(selectedDetail.primary_category) }}>
                   {preferenceDimensionLabel(selectedDetail.primary_category, language)}
                 </div>
-                <p className="leading-6">{selectedDetail.text}</p>
+                <p data-i18n-ignore="true" className="leading-6">{selectedDetail.text}</p>
                 {selectedDetail.applies_when?.length ? <p className="border-l-2 pl-3 text-xs leading-5 text-muted-foreground" style={{ borderColor: preferenceDimensionColor(selectedDetail.primary_category) }}>{copy.applies} {selectedDetail.applies_when.join("；")}</p> : null}
                 {selectedDetail.exceptions?.length ? <p className="border-l-2 pl-3 text-xs leading-5 text-muted-foreground" style={{ borderColor: preferenceDimensionColor(selectedDetail.primary_category) }}>{copy.exceptions} {selectedDetail.exceptions.join("；")}</p> : null}
                 {selectedDetail.effect_on_action ? <p className="text-xs leading-5 text-muted-foreground">{copy.action} {selectedDetail.effect_on_action}</p> : null}
@@ -438,7 +448,7 @@ export function PreferenceView() {
           </aside>
         </div>
       )}
-      {editingUnit && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-label={inlineUiText("手动修正偏好")}><div className="w-full max-w-2xl rounded-xl border bg-background p-5 shadow-2xl"><div className="flex items-start justify-between gap-3"><div><h3 className="text-lg font-semibold">{inlineUiText("手动修正")}</h3><p className="mt-1 text-xs text-muted-foreground">{inlineUiText("保存后会生成新版本，保留原始来源和历史记录，不直接覆盖原文。")}</p></div><button type="button" className="rounded border px-2 py-1 text-sm" onClick={() => setEditingUnit(null)}>{inlineUiText("关闭")}</button></div><div className="mt-4 space-y-3"><label className="block text-sm font-medium">{inlineUiText("偏好内容")}<textarea className="mt-1 min-h-28 w-full rounded-md border bg-background p-3 text-sm" value={editText} onChange={(event) => setEditText(event.target.value)} /></label><div className="grid gap-3 md:grid-cols-2"><label className="block text-sm font-medium">{inlineUiText("适用条件（每行一条）")}<textarea className="mt-1 min-h-24 w-full rounded-md border bg-background p-3 text-sm" value={editApplies} onChange={(event) => setEditApplies(event.target.value)} /></label><label className="block text-sm font-medium">{inlineUiText("例外条件（每行一条）")}<textarea className="mt-1 min-h-24 w-full rounded-md border bg-background p-3 text-sm" value={editExceptions} onChange={(event) => setEditExceptions(event.target.value)} /></label></div><label className="block text-sm font-medium">{inlineUiText("修正说明")}<input className="mt-1 w-full rounded-md border bg-background p-2 text-sm" value={editReason} onChange={(event) => setEditReason(event.target.value)} placeholder={inlineUiText("例如：原条目把一次性项目要求误提炼成全局偏好")} /></label>{editError && <p className="rounded border border-destructive/40 bg-destructive/5 p-2 text-sm text-destructive">{editError}</p>}</div><div className="mt-5 flex justify-end gap-2"><button type="button" className="rounded border px-3 py-2 text-sm" onClick={() => setEditingUnit(null)}>{inlineUiText("取消")}</button><button type="button" disabled={editSaving || !editText.trim()} className="rounded bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50" onClick={() => void saveEdit()}>{editSaving ? inlineUiText("保存中…") : inlineUiText("保存修正")}</button></div></div></div>}
+      {editingUnit && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true" aria-label={inlineUiText("手动修正偏好")}><div className="w-full max-w-2xl rounded-xl border bg-background p-5 shadow-2xl"><div className="flex items-start justify-between gap-3"><div><h3 className="text-lg font-semibold">{inlineUiText("手动修正")}</h3><p className="mt-1 text-xs text-muted-foreground">{inlineUiText("保存后会生成新版本，保留原始来源和历史记录，不直接覆盖原文。")}</p></div><button type="button" className="rounded border px-2 py-1 text-sm" onClick={() => setEditingUnit(null)}>{inlineUiText("关闭")}</button></div><div className="mt-4 space-y-3"><label className="block text-sm font-medium">{inlineUiText("偏好内容")}<textarea className="mt-1 min-h-28 w-full rounded-md border bg-background p-3 text-sm" value={editText} onChange={(event) => setEditText(event.target.value)} /></label><div className="grid gap-3 md:grid-cols-2"><label className="block text-sm font-medium">{inlineUiText("适用条件（每行一条）")}<textarea className="mt-1 min-h-24 w-full rounded-md border bg-background p-3 text-sm" value={editApplies} onChange={(event) => setEditApplies(event.target.value)} /></label><label className="block text-sm font-medium">{inlineUiText("例外条件（每行一条）")}<textarea className="mt-1 min-h-24 w-full rounded-md border bg-background p-3 text-sm" value={editExceptions} onChange={(event) => setEditExceptions(event.target.value)} /></label></div><label className="block text-sm font-medium">{inlineUiText("修正说明")}<input className="mt-1 w-full rounded-md border bg-background p-2 text-sm" value={editReason} onChange={(event) => setEditReason(event.target.value)} placeholder={inlineUiText("例如：原条目把一次性项目要求误提炼成全局偏好")} /></label>{editError && <p className="rounded border border-destructive/40 bg-destructive/5 p-2 text-sm text-destructive">{editError}</p>}</div><div className="mt-5 flex justify-end gap-2"><button type="button" className="rounded border px-3 py-2 text-sm" onClick={() => setEditingUnit(null)}>{inlineUiText("取消")}</button><ActionButton resetKey={JSON.stringify([editingUnit.id, editText, editApplies, editExceptions, editReason])} disabled={editSaving || !editText.trim()} className="rounded bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50" onAction={saveEdit}>{inlineUiText("保存修正")}</ActionButton></div></div></div>}
     </section>
   );
 }

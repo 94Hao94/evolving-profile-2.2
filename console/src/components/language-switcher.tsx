@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
+import { localeSwitchTarget } from "@/lib/locale-location";
 
 export function LanguageSwitcher() {
   const locale = useLocale();
@@ -20,7 +21,7 @@ export function LanguageSwitcher() {
   const pathname = usePathname();
 
   function handleLocaleChange(newLocale: Locale) {
-    router.replace(pathname, { locale: newLocale });
+    router.replace(localeSwitchTarget(pathname, window.location.search, window.location.hash), { locale: newLocale });
   }
 
   return (

@@ -20,7 +20,7 @@ import json
 import re
 from typing import Iterable
 
-from lib.content import extract_user_request
+from lib.content import extract_task_user_request as extract_user_request
 from lib.retention_queue import estimate_tokens
 from lib.relevance import is_association_closure_query
 
@@ -93,6 +93,7 @@ def _partition_user_messages(messages: list[dict], recent_count: int) -> tuple[l
 
 
 def build_profile(prompt: str, messages: list[dict], config: dict) -> dict:
+    prompt = extract_user_request(str(prompt or ""))
     policy = config.get("contextMemoryCoordination") or {}
     recent_count = int(policy.get("recentUserMessages") or 4)
     recent, older = _partition_user_messages(messages, recent_count)
@@ -117,7 +118,7 @@ def build_profile(prompt: str, messages: list[dict], config: dict) -> dict:
         "recent": recent,
         "older": older,
         "provenance_request": any(marker in str(prompt or "") for marker in _PROVENANCE_MARKERS),
-        "prompt": str(prompt or ""),
+        "prompt": extract_user_request(str(prompt or "")),
     }
 
 
@@ -143,6 +144,7 @@ def build_full_prompt_context_slice(prompt: str, messages: list[dict], *, max_by
     window, then add older lexical-topic matches. This is resolver input only,
     never an injection of old dialogue into the answer context.
     """
+    prompt = extract_user_request(str(prompt or ""))
     history = []
     for row in messages or []:
         role = str(row.get("role") or "")
@@ -206,7 +208,7 @@ def build_contextual_intent_envelope(prompt: str, messages: list[dict], config: 
     router while correcting the former opposite error: treating a dependent
     follow-up as a fully self-contained query.
     """
-    current = str(prompt or "").strip()
+    current = extract_user_request(str(prompt or ""))
     policy = config.get("contextMemoryCoordination") or {}
     max_items = max(2, min(8, int(policy.get("intentContextTurns") or 6)))
     max_chars = max(80, min(320, int(policy.get("intentContextItemChars") or 180)))
@@ -485,7 +487,7 @@ def build_contextual_recall_query(
     available, the bounded local envelope may add a search-only hint for a
     dependent turn; it never replays an unbounded transcript as answer context.
     """
-    current = str(prompt or "").strip()
+    current = extract_user_request(str(prompt or ""))
     resolved = str(resolved_full_prompt or "").strip()
     if resolved:
         # Keep a generous but finite request body even if a provider returns a

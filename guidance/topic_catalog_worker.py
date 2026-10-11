@@ -141,7 +141,7 @@ def read_entity_projection(cursor,bank_id,limit):
     ) SELECT e.id::text,e.canonical_name,e.bank_id,e.mention_count,facts.*,types.fact_types
       FROM entities e JOIN facts ON facts.entity_id=e.id JOIN types ON types.entity_id=e.id
       WHERE e.bank_id=%s AND e.canonical_name <> ALL(%s)
-    ''',(bank_id,bank_id,bank_id,['User','助手','用户','user','assistant']))
+    ''',(bank_id,bank_id,bank_id,['示例用户','助手','用户','user','assistant']))
     rows=[dict(row) for row in cursor.fetchall()];selected=select_entities(rows,limit)
     entity_index=[{'id':'entity:'+row['id'],'title':row['canonical_name'],'source_count':row['source_count'],
                    'latest_source_at':row.get('latest_source_at')} for row in rows]

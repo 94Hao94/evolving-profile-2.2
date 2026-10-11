@@ -30,7 +30,8 @@ from itertools import combinations
 from typing import TYPE_CHECKING, Any, Literal
 
 import asyncpg
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from ...config import get_config
 from ...worker.stage import set_stage
@@ -374,6 +375,7 @@ async def _dedup_reconcile_create(
     tags: list[str] | None,
     source_bounds: _TemporalBounds,
     txn=None,
+    merge_outcomes: list[_DedupOutcome] | None = None,
 ) -> str | None:
     """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
 
@@ -443,6 +445,7 @@ async def _dedup_reconcile_create(
                         outcome.best_id[:8],
                     )
                     return None
+                await _refresh_folded_observation_authority(store, conn, bank_id, outcome.best_id)
             else:
                 await _reconcile_merge_via_store(
                     store,
@@ -455,6 +458,8 @@ async def _dedup_reconcile_create(
                     source_bounds,
                     txn=txn,
                 )
+    if merge_outcomes is not None:
+        merge_outcomes.append(outcome)
     return outcome.best_id
 
 
@@ -469,7 +474,7 @@ async def _dedup_reconcile_update(
     updated_emb_str: str | None,
     tags: list[str] | None,
     txn=None,
-) -> None:
+) -> _DedupOutcome | None:
     """Semantic dedup for an UPDATE (after the observation was rewritten + re-embedded).
 
     An UPDATE rewrites an observation's text and re-embeds it, so its vector can drift to
@@ -561,6 +566,7 @@ async def _dedup_reconcile_update(
                     # Twin or updated row vanished during the LLM window — keep the updated row
                     # as a distinct observation instead of deleting it unfolded.
                     return
+                await _refresh_folded_observation_authority(store, conn, bank_id, outcome.best_id)
             else:
                 updated_obs = await store.get_memories(
                     conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[updated_id]
@@ -587,6 +593,7 @@ async def _dedup_reconcile_update(
         outcome.best_id[:8],
         config.consolidation_dedup_threshold,
     )
+    return outcome
 
 
 @dataclass
@@ -639,7 +646,7 @@ def _resolve_obs_tags_list(memory: dict[str, Any]) -> list[list[str]] | None:
     parsed = _parse_observation_scopes(memory)
     tags = list(memory.get("tags") or [])
 
-    if parsed == "per_tag":
+    if parsed in ("per_tag", "each_tag"):
         return [[t] for t in tags] if tags else None
     if parsed == "all_combinations":
         if not tags:
@@ -647,9 +654,29 @@ def _resolve_obs_tags_list(memory: dict[str, Any]) -> list[list[str]] | None:
         return [list(c) for r in range(1, len(tags) + 1) for c in combinations(tags, r)]
     if parsed == "shared":
         return [[]]
+    if parsed == "private":
+        if not tags:
+            raise ValueError("Legacy private observation_scopes requires source tags; global fallback is forbidden")
+        return None
     if parsed == "combined" or parsed is None:
         return None
-    return parsed  # explicit list[list[str]]
+
+    # Legacy imports sometimes stored a single tag or one flat tag set in
+    # this column. These mean ONE exact scope, never a loop over characters
+    # or separate scopes per tag. Preserve each tag byte-for-byte.
+    def valid_tag(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    if isinstance(parsed, str) and valid_tag(parsed):
+        return [[parsed]]
+    if isinstance(parsed, list) and parsed:
+        if all(valid_tag(tag) for tag in parsed):
+            return [list(parsed)]
+        if all(isinstance(scope, list) and all(valid_tag(tag) for tag in scope) for scope in parsed):
+            return [list(scope) for scope in parsed]
+    # Ambiguous/mixed shapes cannot safely fall back to memory tags or the
+    # global scope. Hold the operation before recall or any observation write.
+    raise ValueError("Invalid observation_scopes shape: expected a tag, a nonempty tag set, or nested tag sets")
 
 
 def _resolve_write_scopes(memory: dict[str, Any]) -> list[frozenset[str]]:
@@ -666,23 +693,13 @@ def _resolve_write_scopes(memory: dict[str, Any]) -> list[frozenset[str]]:
     - ``shared``                 -> ``[frozenset()]`` (the single untagged scope)
     - explicit ``list[list[str]]`` -> one frozenset per declared scope
 
-    Empty-tag memories collapse to a single ``frozenset()`` in all modes so they
-    still take exactly one lock and serialise against other untagged work.
+    Empty-tag memories use a single ``frozenset()`` for canonical modes. Legacy
+    private mode requires source tags and is held if no private scope exists.
     """
-    parsed = _parse_observation_scopes(memory)
-    tags = list(memory.get("tags") or [])
-
-    if parsed == "per_tag":
-        return [frozenset([t]) for t in tags] if tags else [frozenset()]
-    if parsed == "all_combinations":
-        if not tags:
-            return [frozenset()]
-        return [frozenset(c) for r in range(1, len(tags) + 1) for c in combinations(tags, r)]
-    if parsed == "shared":
-        return [frozenset()]
-    if parsed == "combined" or parsed is None:
-        return [frozenset(tags)]
-    return [frozenset(s) for s in parsed]  # explicit list[list[str]]
+    scopes = _resolve_obs_tags_list(memory)
+    if scopes is None:
+        return [frozenset(memory.get("tags") or [])]
+    return [frozenset(scope) for scope in scopes]
 
 
 def _scope_sort_key(scope: frozenset[str]) -> tuple[str, ...]:
@@ -975,6 +992,9 @@ def _build_response_model(
     max_creates: int | None = None,
     *,
     supports_max_items: bool = True,
+    observation_ids: set[str] | None = None,
+    source_fact_ids: set[str] | None = None,
+    observation_source_ids: dict[str, set[str]] | None = None,
 ) -> type[_ConsolidationBatchResponse]:
     """Build a response model, optionally constraining creates via JSON schema.
 
@@ -983,14 +1003,80 @@ def _build_response_model(
     can disable the schema hint for those backends; the prompt capacity note and
     post-response truncation still enforce the observation cap.
     """
+    response_model = _ConsolidationBatchResponse
+    if observation_ids is not None or source_fact_ids is not None:
+        # Closure-bound membership keeps the canonical schema unchanged. Never
+        # install an unconditional alias on _DeleteAction: a foreign id is not
+        # evidence of an actionable observation.
+        allowed_observations = frozenset(observation_ids or ())
+        allowed_sources = frozenset(source_fact_ids or ())
+
+        class _BatchBoundConsolidationResponse(_ConsolidationBatchResponse):
+            @model_validator(mode="before")
+            @classmethod
+            def bind_identifiers(cls, value: Any) -> Any:
+                if not isinstance(value, dict):
+                    return value
+                normalized = dict(value)
+                for action in ("creates", "updates", "deletes"):
+                    items = value.get(action, [])
+                    if not isinstance(items, list):
+                        continue  # Pydantic reports the canonical shape error.
+                    copied_items = []
+                    for item in items:
+                        if not isinstance(item, dict):
+                            copied_items.append(item)
+                            continue
+                        copied = dict(item)
+                        if action != "creates" and observation_ids is not None:
+                            if "id" in copied:
+                                alias = copied["id"]
+                                if not isinstance(alias, str) or alias not in allowed_observations:
+                                    raise ValueError("Observation alias is outside this batch")
+                                if "observation_id" in copied and copied["observation_id"] != alias:
+                                    raise ValueError("Conflicting observation identifiers")
+                                copied["observation_id"] = alias
+                                copied.pop("id")
+                            if "observation_id" in copied and (
+                                not isinstance(copied["observation_id"], str)
+                                or copied["observation_id"] not in allowed_observations
+                            ):
+                                raise ValueError("Observation identifier is outside this batch")
+                        if action != "deletes" and source_fact_ids is not None and "source_fact_ids" in copied:
+                            sources = copied["source_fact_ids"]
+                            if isinstance(sources, str):
+                                sources = [sources]
+                            if isinstance(sources, list) and (
+                                not sources or any(not isinstance(s, str) or s not in allowed_sources for s in sources)
+                            ):
+                                raise ValueError("Action must cite nonempty source facts from this batch")
+                            if (
+                                action == "updates"
+                                and observation_source_ids is not None
+                                and isinstance(sources, list)
+                                and "observation_id" in copied
+                                and not set(sources).intersection(
+                                    observation_source_ids.get(copied["observation_id"], set())
+                                )
+                            ):
+                                raise PydanticCustomError(
+                                    "observation_source_relation",
+                                    "Update target is context-only for the cited source facts; use its eligible_source_fact_ids",
+                                )
+                        copied_items.append(copied)
+                    normalized[action] = copied_items
+                return normalized
+
+        response_model = _BatchBoundConsolidationResponse
+
     if not supports_max_items or max_creates is None or max_creates < 0:
-        return _ConsolidationBatchResponse
+        return response_model
 
     from pydantic import Field as PydanticField
 
     clamped = max(max_creates, 0)
 
-    class _ConstrainedConsolidationBatchResponse(_ConsolidationBatchResponse):
+    class _ConstrainedConsolidationBatchResponse(response_model):
         creates: list[_CreateAction] = PydanticField(default=[], max_length=clamped)
 
     return _ConstrainedConsolidationBatchResponse
@@ -1100,6 +1186,8 @@ async def _reconcile_merge_via_store(
     if cur is None:
         return
     merged_sources = list(dict.fromkeys([*(cur.source_memory_ids or []), *(str(s) for s in add_source_ids)]))
+    sources = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=merged_sources)
+    authority_metadata = _derived_observation_metadata(sources, merged_sources, getattr(cur, "metadata", None))
     merged_bounds = _TemporalBounds.of(cur).merged_with(add_bounds)
     embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [merged_text])
     await store.upsert_observation(
@@ -1119,6 +1207,7 @@ async def _reconcile_merge_via_store(
             occurred_end=merged_bounds.occurred_end,
             mentioned_at=merged_bounds.mentioned_at,
             created_at=cur.created_at,
+            metadata=authority_metadata,
         ),
     )
 
@@ -1158,6 +1247,7 @@ async def _fetch_unconsolidated_rows(
             "tags": list(m.tags or []),
             "mentioned_at": m.mentioned_at,
             "observation_scopes": m.observation_scopes,
+            "metadata": m.metadata or {},
         }
         for m in ordered
     ]
@@ -1500,6 +1590,9 @@ async def _run_consolidation_job(
 
             try:
                 pending: list[list[dict[str, Any]]] = [llm_batch_local]
+                # Scope-separated parent recall snapshots survive adaptive
+                # bisection; sibling evidence must remain in the LLM context.
+                observation_context: dict[tuple[str, ...], dict[str, Any]] = {}
                 while pending:
                     sub_batch = pending.pop(0)
 
@@ -1524,6 +1617,7 @@ async def _run_consolidation_job(
                                 config=config,
                                 obs_tags_override=obs_tags,
                                 txn=_batch_txn,
+                                observation_context=observation_context,
                             )
                             sub_deleted += pass_deleted
                             sub_llm_failed = sub_llm_failed or pass_failed
@@ -1561,6 +1655,7 @@ async def _run_consolidation_job(
                             perf=batch_perf,
                             config=config,
                             txn=_batch_txn,
+                            observation_context=observation_context,
                         )
 
                     all_deleted += sub_deleted
@@ -2083,6 +2178,7 @@ async def _process_memory_batch(
     config: Any = None,
     obs_tags_override: list[str] | None = None,
     txn=None,
+    observation_context: dict[tuple[str, ...], dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """
     Process a batch of memories in a single LLM call.
@@ -2147,6 +2243,24 @@ async def _process_memory_batch(
         if recall_result.source_facts:
             union_source_facts.update(recall_result.source_facts)
 
+    parent: dict[str, Any] | None = None
+    if observation_context is not None:
+        scope_key = tuple(
+            sorted(observation_scope_tags if observation_scope_tags is not None else (memories[0].get("tags") or []))
+        )
+        parent = observation_context.setdefault(
+            scope_key, {"observations": {}, "sources": {}, "per_fact": {}, "changed_ids": set()}
+        )
+        for memory_id, ids in per_fact_obs_ids.items():
+            parent["per_fact"].setdefault(memory_id, set()).update(ids)
+            per_fact_obs_ids[memory_id].update(parent["per_fact"][memory_id])
+        parent["observations"].update(
+            {str(obs.id): obs for obs in union_observations if str(obs.id) not in parent["changed_ids"]}
+        )
+        parent["sources"].update(union_source_facts)
+        union_observations = list(parent["observations"].values())
+        union_source_facts = dict(parent["sources"])
+
     # Determine effective tag scope for observations.
     # When obs_tags_override is set, use it; otherwise use the memory's own tags.
     if obs_tags_override is not None:
@@ -2184,10 +2298,32 @@ async def _process_memory_batch(
         config=config,
         remaining_observation_slots=remaining_observation_slots,
         max_observations_per_scope=max_obs,
+        observation_source_ids={
+            str(obs.id): {fid for fid, obs_ids in per_fact_obs_ids.items() if str(obs.id) in obs_ids}
+            for obs in union_observations
+        },
     )
     if perf:
         perf.record_timing("llm", time.time() - t0)
         perf.record_llm_call(llm_result.obs_count, llm_result.prompt_chars)
+
+    # Reject the entire batch before the first delete/write, including providers
+    # which hand back an already-instantiated response and bypass validators.
+    memory_ids = {str(m["id"]) for m in memories}
+    observation_ids = {str(obs.id) for obs in union_observations}
+    invalid_sources = any(
+        not action.source_fact_ids or not set(action.source_fact_ids).issubset(memory_ids)
+        for action in [*llm_result.creates, *llm_result.updates]
+    )
+    invalid_targets = any(
+        action.observation_id not in observation_ids for action in [*llm_result.deletes, *llm_result.updates]
+    )
+    invalid_update_evidence = any(
+        not any(action.observation_id in per_fact_obs_ids.get(fid, set()) for fid in action.source_fact_ids)
+        for action in llm_result.updates
+    )
+    if llm_result.failed or invalid_sources or invalid_targets or invalid_update_evidence:
+        return [{"action": "failed"} for _ in memories], 0, True
 
     # 4. Sequential execution of deletes / updates / creates
     # Deletes run first to free observation slots before creates consume them.
@@ -2196,6 +2332,67 @@ async def _process_memory_batch(
     per_memory_updated: set[str] = set()
 
     mem_by_id = {str(m["id"]): m for m in memories}
+
+    def _remember_observation(
+        observation_id: str, text: str, source_mems: list[dict[str, Any]], agg: _SourceAggregation
+    ) -> None:
+        if parent is None:
+            return
+        from ..response_models import MemoryFact
+
+        previous = parent["observations"].get(observation_id) or MemoryFact(
+            id=observation_id,
+            text=text,
+            fact_type="observation",
+            tags=agg.tags,
+        )
+        snapshot = {
+            "text": text,
+            "tags": list(dict.fromkeys([*(previous.tags or []), *agg.tags])),
+            "source_fact_ids": list(
+                dict.fromkeys([*(previous.source_fact_ids or []), *(str(m["id"]) for m in source_mems)])
+            ),
+        }
+        for name, merge in (("occurred_start", _merge_min), ("occurred_end", _merge_max), ("mentioned_at", _merge_max)):
+            merged = merge(getattr(previous, name), getattr(agg, name))
+            snapshot[name] = merged.isoformat() if merged else None
+        parent["observations"][observation_id] = previous.model_copy(update=snapshot)
+        parent["changed_ids"].add(observation_id)
+        for source in source_mems:
+            temporal = {name: _as_dt(source.get(name)) for name in ("occurred_start", "occurred_end", "mentioned_at")}
+            parent["sources"][str(source["id"])] = MemoryFact(
+                id=str(source["id"]),
+                text=source["text"],
+                fact_type=source.get("fact_type", "experience"),
+                **{name: value.isoformat() if value else None for name, value in temporal.items()},
+            )
+
+    async def _seed_survivor(observation_id: str) -> None:
+        if parent is None or observation_id in parent["observations"]:
+            return
+        from ..response_models import MemoryFact
+
+        # Dedup can find a survivor outside the ranked parent recall. Read that
+        # known address's metadata so its existing source links survive the
+        # staged overlay too; this does not re-run or narrow ranked retrieval.
+        async with acquire_with_retry(pool) as conn:
+            current = await get_memories().get_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
+            )
+        if not current:
+            raise RuntimeError("Dedup survivor disappeared before observation context refresh")
+        survivor = current[0]
+        temporal = {
+            name: _as_dt(getattr(survivor, name)) for name in ("occurred_start", "occurred_end", "mentioned_at")
+        }
+        parent["observations"][observation_id] = MemoryFact(
+            id=observation_id,
+            text=survivor.text,
+            fact_type="observation",
+            tags=list(survivor.tags or []),
+            source_fact_ids=[str(s) for s in (survivor.source_memory_ids or [])],
+            **{name: value.isoformat() if value else None for name, value in temporal.items()},
+        )
 
     # Semantic dedup: when enabled, an observation that is >= the threshold cosine to a DIFFERENT
     # existing observation is reconciled by a focused 1-by-1 LLM merge (anchored on the observation
@@ -2226,6 +2423,9 @@ async def _process_memory_batch(
                     continue
                 await _execute_delete_action(conn=conn, bank_id=bank_id, observation_id=delete.observation_id, txn=txn)
                 deleted_count += 1
+                if parent is not None:
+                    parent["observations"].pop(delete.observation_id, None)
+                    parent["changed_ids"].add(delete.observation_id)
 
     for update in llm_result.updates:
         source_mems = [mem_by_id[fid] for fid in update.source_fact_ids if fid in mem_by_id]
@@ -2252,13 +2452,18 @@ async def _process_memory_batch(
             perf=perf,
             txn=txn,
         )
+        if parent is not None and updated_emb_str is not None:
+            # Cross-store batch writes can remain invisible until the enclosing
+            # write-group commits. Keep the successful sibling's staged state
+            # ahead of stale recall snapshots, including every source reference.
+            _remember_observation(update.observation_id, update.text, source_mems, agg)
         for m in source_mems:
             per_memory_updated.add(str(m["id"]))
         # Reconcile the rewritten observation against its neighbours: the re-embed may have
         # drifted it into a near-twin of another existing observation (the residual-duplicate
         # source). updated_emb_str is None when the update was skipped — nothing to reconcile.
         if dedup_enabled and updated_emb_str is not None:
-            await _dedup_reconcile_update(
+            merged = await _dedup_reconcile_update(
                 pool,
                 memory_engine,
                 bank_id,
@@ -2270,6 +2475,30 @@ async def _process_memory_batch(
                 agg.tags,
                 txn=txn,
             )
+            if parent is not None and merged is not None and merged.best_id is not None:
+                folded = parent["observations"].pop(update.observation_id)
+                await _seed_survivor(merged.best_id)
+                survivor = parent["observations"].get(merged.best_id)
+                survivor = survivor or folded.model_copy(update={"id": merged.best_id, "source_fact_ids": []})
+                changes = {
+                    "text": merged.merged_text,
+                    "source_fact_ids": list(
+                        dict.fromkeys([*(survivor.source_fact_ids or []), *(folded.source_fact_ids or [])])
+                    ),
+                }
+                for name, merge in (
+                    ("occurred_start", _merge_min),
+                    ("occurred_end", _merge_max),
+                    ("mentioned_at", _merge_max),
+                ):
+                    value = merge(getattr(survivor, name), getattr(folded, name))
+                    changes[name] = value.isoformat() if value else None
+                parent["observations"][merged.best_id] = survivor.model_copy(update=changes)
+                parent["changed_ids"].update({update.observation_id, merged.best_id})
+                parent.setdefault("redirects", {})[update.observation_id] = merged.best_id
+                for ids in parent["per_fact"].values():
+                    if update.observation_id in ids:
+                        ids.add(merged.best_id)
 
     # Deterministic dedup guard: map the observations the LLM was SHOWN by their
     # normalised text. The model intermittently emits a CREATE whose text is identical
@@ -2297,16 +2526,52 @@ async def _process_memory_batch(
         # would run off the pre-LLM snapshot and clobber that change (see _dedupe_updates).
         duplicate_of = _duplicate_create_target(create.text, shown_obs_by_text, update_texts)
         if duplicate_of is not None:
-            logger.warning(
-                "[CONSOLIDATION] dropped duplicate observation CREATE — verbatim match of %s; llm_reason=%r",
-                duplicate_of,
-                create.reason or "(none given)",
+            matched = shown_obs_by_text.get(_norm_obs_text(create.text))
+            target_id = (
+                str(matched.id)
+                if matched is not None
+                else next(
+                    u.observation_id
+                    for u in llm_result.updates
+                    if _norm_obs_text(u.text) == _norm_obs_text(create.text)
+                )
             )
-            continue
+            if parent is not None:
+                target_id = parent.get("redirects", {}).get(target_id, target_id)
+                target = parent["observations"].get(target_id)
+                candidates = list(parent["observations"].values())
+            else:
+                target = next((o for o in union_observations if str(o.id) == target_id), None)
+                candidates = union_observations
+                rewrite = next((u.text for u in llm_result.updates if u.observation_id == target_id), None)
+                if target is not None and rewrite is not None:
+                    target = target.model_copy(update={"text": rewrite})
+            # An exact twin's content already exists, but its NEW supporting
+            # sources must still be folded. Keep the latest staged text rather
+            # than replaying an old pre-UPDATE snapshot.
+            if target is not None and not any(d.observation_id == target_id for d in llm_result.deletes):
+                folded = await _execute_update_action(
+                    pool=pool,
+                    memory_engine=memory_engine,
+                    bank_id=bank_id,
+                    source_memory_ids=create_source_ids,
+                    observation_id=target_id,
+                    new_text=target.text,
+                    observations=candidates,
+                    source_fact_tags=agg.tags,
+                    source_bounds=_TemporalBounds.of(agg),
+                    perf=perf,
+                    txn=txn,
+                )
+                if folded is not None:
+                    _remember_observation(target_id, target.text, source_mems, agg)
+                    per_memory_updated.update(str(m["id"]) for m in source_mems)
+                    continue
 
         # Semantic near-duplicate reconciliation: merge this CREATE into an existing
         # near-identical observation (LLM-adjudicated, 1-by-1) instead of inserting a dup.
         if dedup_enabled:
+            merge_outcomes: list[_DedupOutcome] = []
             merged_into = await _dedup_reconcile_create(
                 pool,
                 memory_engine,
@@ -2318,8 +2583,12 @@ async def _process_memory_batch(
                 agg.tags,
                 _TemporalBounds.of(agg),
                 txn=txn,
+                merge_outcomes=merge_outcomes,
             )
             if merged_into is not None:
+                if merge_outcomes:
+                    await _seed_survivor(merged_into)
+                    _remember_observation(merged_into, merge_outcomes[0].merged_text, source_mems, agg)
                 logger.info(
                     "[CONSOLIDATION] dedup-merged observation CREATE into %s (cosine>=%.2f)",
                     merged_into[:8],
@@ -2329,6 +2598,7 @@ async def _process_memory_batch(
                     per_memory_created.add(str(m["id"]))
                 continue
 
+        created_ids: list[str] = []
         action = await _execute_create_action(
             pool=pool,
             memory_engine=memory_engine,
@@ -2342,10 +2612,18 @@ async def _process_memory_batch(
             mentioned_at=agg.mentioned_at,
             perf=perf,
             txn=txn,
+            created_ids=created_ids,
         )
         # Count a memory as created only when an observation was actually written (the
         # source-liveness recheck inside the write txn can skip it connection-free).
         if action == "created":
+            if parent is not None and created_ids:
+                _remember_observation(created_ids[0], create.text, source_mems, agg)
+                # A new derived observation was created within this exact scope
+                # for this original batch. Its siblings can update the staged
+                # observation even when the store hides it until commit.
+                for ids in parent["per_fact"].values():
+                    ids.add(created_ids[0])
             for m in source_mems:
                 per_memory_created.add(str(m["id"]))
 
@@ -2511,6 +2789,12 @@ async def _execute_update_action(
                 return None
             live_ids = live_source_memory_ids
 
+            # Recall may predate a sibling's update or dedup fold. Preserve
+            # persisted sources as well as the staged batch overlay, never
+            # replace lineage with an old ranking snapshot.
+            current = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
+            cur = current[0] if current else None
+
             history_entry = _ObservationHistorySnapshot(
                 previous_text=model.text,
                 previous_tags=list(model.tags or []),
@@ -2520,7 +2804,21 @@ async def _execute_update_action(
                 new_source_memory_ids=[str(mid) for mid in live_ids],
             )
 
-            source_ids = list(model.source_fact_ids or []) + live_ids
+            source_ids = list(
+                dict.fromkeys(
+                    [
+                        *(uuid.UUID(str(s)) for s in ((cur.source_memory_ids or []) if cur else [])),
+                        *(uuid.UUID(str(s)) for s in (model.source_fact_ids or [])),
+                        *live_ids,
+                    ]
+                )
+            )
+            source_records = await store.get_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(s) for s in source_ids]
+            )
+            authority_metadata = _derived_observation_metadata(
+                source_records, source_ids, cur.metadata if cur else None
+            )
 
             # SECURITY: Merge source fact's tags into existing observation tags so all contributors can see it
             existing_tags = set(model.tags or [])
@@ -2545,6 +2843,7 @@ async def _execute_update_action(
                         embedding = $2::vector,
                         source_memory_ids = $3,
                         proof_count = $4,
+                        metadata = $11::jsonb,
                         tags = $10,
                         updated_at = now(),
                         event_date = COALESCE(LEAST(event_date, COALESCE($6, event_date)), $6),
@@ -2563,6 +2862,7 @@ async def _execute_update_action(
                     source_bounds.occurred_end,
                     source_bounds.mentioned_at,
                     merged_tags,
+                    json.dumps(authority_metadata),
                 )
                 # The source-liveness checks above guard the *source* memories; the
                 # observation row itself (WHERE id = $5) can still be invalidated/deleted
@@ -2581,10 +2881,6 @@ async def _execute_update_action(
                 # Upsert overwrites the whole observation, so start from its current state (fetched
                 # from the store) and apply the same merge the SQL does — LEAST/GREATEST on the
                 # times — while preserving fields the update never touches (created_at).
-                current = await store.get_memories(
-                    conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id]
-                )
-                cur = current[0] if current else None
                 # Widen the row the store still holds. If it has vanished, fall back to the
                 # pre-update recall snapshot — ISO strings, and no event_date on that model.
                 current_bounds = (
@@ -2614,6 +2910,7 @@ async def _execute_update_action(
                         occurred_end=merged_bounds.occurred_end,
                         mentioned_at=merged_bounds.mentioned_at,
                         created_at=cur.created_at if cur else None,
+                        metadata=authority_metadata,
                     ),
                 )
 
@@ -2665,6 +2962,7 @@ async def _execute_create_action(
     mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
     txn=None,
+    created_ids: list[str] | None = None,
 ) -> str:
     """
     Create a new observation from one or more source memories.
@@ -2689,6 +2987,8 @@ async def _execute_create_action(
     # Map the new observation onto the consolidation trace as a produced memory.
     new_id = created.get("observation_id")
     if new_id:
+        if created_ids is not None:
+            created_ids.append(str(new_id))
         record_created_memory_ids([new_id])
     logger.debug(f"Created observation from {len(source_memory_ids)} source memories")
     return created["action"]
@@ -2935,6 +3235,89 @@ def _classify_batch_failure(exc: Exception) -> _BatchFailureClass:
     return _BatchFailureClass.RETRY
 
 
+def _source_authority_for_llm(memories: list[dict[str, Any]]) -> dict[str, Any]:
+    origins: set[str] = set()
+    assistant_ids: list[str] = []
+    sources = []
+    for memory in memories:
+        metadata = memory.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except ValueError:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        witness = {
+            key: metadata[key]
+            for key in ("source_role", "statement_kind", "independent_user_evidence", "evidence_group_id")
+            if key in metadata
+        }
+        memory_id = str(memory["id"])
+        sources.append({"source_fact_id": memory_id, **witness})
+        flag = metadata.get("independent_user_evidence")
+        true_flag = flag is True or (isinstance(flag, str) and flag == "true")
+        false_flag = flag is False or (isinstance(flag, str) and flag == "false")
+        if metadata.get("source_role") == "user" and true_flag and metadata.get("evidence_group_id"):
+            origins.add(str(metadata["evidence_group_id"]))
+        if metadata.get("source_role") == "assistant" or false_flag:
+            assistant_ids.append(memory_id)
+    return {
+        "source_lineage_count": len(memories),
+        "independent_user_origin_count": len(origins),
+        "assistant_source_ids": assistant_ids,
+        "sources": sources,
+        "boundary": "Lineage count is not independent human support. Unknown legacy authorship is not confirmed user testimony.",
+    }
+
+
+def _derived_observation_metadata(
+    source_records: list[Any], source_ids: list[Any], previous: Any = None
+) -> dict[str, str]:
+    if isinstance(previous, str):
+        try:
+            previous = json.loads(previous)
+        except ValueError:
+            previous = {}
+    result = dict(previous) if isinstance(previous, dict) else {}
+    authority = _source_authority_for_llm(
+        [
+            {"id": row.unit_id, "metadata": getattr(row, "metadata", None) or {}}
+            for row in source_records
+            if getattr(row, "unit_id", None)
+        ]
+    )
+    result.update(
+        {
+            "source_authority_version": "source-authority.v1",
+            "source_role": "inferred_projection",
+            "statement_kind": "derived_observation",
+            "independent_user_evidence": "false",
+            "source_lineage_count": str(len(set(map(str, source_ids)))),
+            "independent_user_origin_count": str(authority["independent_user_origin_count"]),
+            "supporting_source_authority": json.dumps(authority, ensure_ascii=False, sort_keys=True),
+        }
+    )
+    return result
+
+
+async def _refresh_folded_observation_authority(store, conn, bank_id: str, observation_id: str) -> None:
+    """Read the SQL fold's final source union while its row lock is still held."""
+    current = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[observation_id])
+    if not current:
+        raise RuntimeError("Folded observation vanished before source authority refresh")
+    survivor = current[0]
+    ids = [str(s) for s in survivor.source_memory_ids or []]
+    sources = await store.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=ids)
+    metadata = _derived_observation_metadata(sources, ids, getattr(survivor, "metadata", None))
+    await conn.execute(
+        f"UPDATE {fq_table('memory_units')} SET metadata=$3::jsonb WHERE id=$1::uuid AND bank_id=$2",
+        uuid.UUID(observation_id),
+        bank_id,
+        json.dumps(metadata),
+    )
+
+
 async def _consolidate_batch_with_llm(
     llm_config: Any,
     memories: list[dict[str, Any]],
@@ -2943,12 +3326,17 @@ async def _consolidate_batch_with_llm(
     config: Any,
     remaining_observation_slots: int | None = None,
     max_observations_per_scope: int = -1,
+    observation_source_ids: dict[str, set[str]] | None = None,
 ) -> _BatchLLMResult:
     """Single LLM call for a batch of facts against a pooled set of observations."""
     if config is None:
         raise ValueError("config is required for _consolidate_batch_with_llm")
     if union_observations:
         obs_list = _build_observations_for_llm(union_observations, union_source_facts)
+        if observation_source_ids is not None:
+            for obs in obs_list:
+                obs["eligible_source_fact_ids"] = sorted(observation_source_ids.get(str(obs["id"]), set()))
+                obs["update_eligible"] = bool(obs["eligible_source_fact_ids"])
         observations_text = json.dumps(obs_list, indent=2, ensure_ascii=False)
     else:
         observations_text = "[]"
@@ -2999,6 +3387,14 @@ async def _consolidate_batch_with_llm(
         observations_mission=config.observations_mission,
         observation_capacity_note=observation_capacity_note,
     )
+    user_content += (
+        "\nSOURCE AUTHORITY (preserve authorship and origin groups):\n"
+        + json.dumps(_source_authority_for_llm(memories), ensure_ascii=False)
+        + "\nAssistant proposals and recalled repetitions are source claims, not new user confirmations. "
+        "Do not turn them into confirmed user rules or independent votes. Preserve uncertainty and author attribution. "
+        "An observation's proof_count is a lineage count, not a human-testimony count. "
+        "Use eligible_source_fact_ids for updates; other observations remain contextual evidence only."
+    )
 
     # Opt into context caching of the stable system prefix when the provider
     # supports it (gemini/vertexai with the flag on). response_schema is NOT
@@ -3019,12 +3415,16 @@ async def _consolidate_batch_with_llm(
     response_model = _build_response_model(
         max_creates=remaining_observation_slots,
         supports_max_items=config.llm_supports_max_items,
+        observation_ids={str(obs.id) for obs in union_observations},
+        source_fact_ids={str(m["id"]) for m in memories},
+        observation_source_ids=observation_source_ids,
     )
 
     max_attempts = config.consolidation_max_attempts
     inner_max_retries = config.consolidation_llm_max_retries
     last_exc: Exception | None = None
     attempts_made = 0
+    schema_correction: str | None = None
     # Pre-compute a stable identifier set for the batch so failure logs name the
     # exact memories whose consolidation is failing — without this, an opaque
     # "LLM batch call failed" line gives operators no way to find the offending
@@ -3052,6 +3452,8 @@ async def _consolidate_batch_with_llm(
                 # without forcing strict schema on operations whose model can't satisfy it.
                 "strict_schema": config.llm_strict_schema_consolidation,
             }
+            if schema_correction is not None:
+                call_kwargs["messages"].append({"role": "user", "content": schema_correction})
             # Only request an explicit output budget when configured. Left unset by default the key is
             # omitted, so each provider keeps its implicit default (backwards compatible). Operators on
             # providers with a low hidden cap (notably Bedrock imported models, which truncate structured
@@ -3081,6 +3483,33 @@ async def _consolidate_batch_with_llm(
                 prompt_chars=len(system_prompt) + len(user_content),
             )
         except Exception as exc:
+            # One targeted, changed-input correction for a missing canonical
+            # observation field or a valid target/source pairing. Conflicts/foreign IDs/source errors never enter
+            # this lane, and truncated JSON is never repaired or partially used.
+            if isinstance(exc, ValidationError) and schema_correction is None and attempt < max_attempts:
+                errors = exc.errors(include_input=False)
+                missing_target = errors and all(
+                    e["type"] == "missing"
+                    and len(e["loc"]) == 3
+                    and e["loc"][0] in {"updates", "deletes"}
+                    and e["loc"][-1] == "observation_id"
+                    for e in errors
+                )
+                mismatched_relation = errors and all(e["type"] == "observation_source_relation" for e in errors)
+                if missing_target or mismatched_relation:
+                    schema_correction = (
+                        (
+                            "The previous response paired an UPDATE with a context-only observation for its cited sources. "
+                            "Use only the eligible_source_fact_ids listed on that observation. Parent-only observations "
+                            "remain read-only context; do not invent a source relationship. "
+                            if mismatched_relation
+                            else "The previous response omitted observation_id in an UPDATE or DELETE. "
+                        )
+                        + "Return a complete response matching the provided schema. Use observation_id "
+                        "copied exactly from an existing observation; keep all source_fact_ids and evidence. "
+                        "Do not invent identifiers or omit actions to conceal a schema error."
+                    )
+                    continue
             failure_class = _classify_batch_failure(exc)
             if failure_class is _BatchFailureClass.PROPAGATE:
                 logger.warning(
@@ -3172,6 +3601,10 @@ async def _create_observation_directly(
                 logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted concurrently")
                 return {"action": "skipped", "reason": "sources_deleted"}
             source_memory_ids = live_source_memory_ids
+            source_records = await store.get_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(s) for s in source_memory_ids]
+            )
+            authority_metadata = _derived_observation_metadata(source_records, source_memory_ids)
 
             t0 = time.time()
             if store.writes_memory_rows_in_sql_for(bank_id):
@@ -3184,9 +3617,9 @@ async def _create_observation_directly(
                     query = f"""
                         INSERT INTO {fq_table("memory_units")} (
                             id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                            tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
+                            tags, event_date, occurred_start, occurred_end, mentioned_at, metadata, search_vector
                         )
-                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
+                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10, $11::jsonb,
                                 tokenize($3, 'llmlingua2')::bm25_catalog.bm25vector)
                         RETURNING id
                     """
@@ -3199,9 +3632,9 @@ async def _create_observation_directly(
                     query = f"""
                         INSERT INTO {fq_table("memory_units")} (
                             id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                            tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
+                            tags, event_date, occurred_start, occurred_end, mentioned_at, metadata, search_vector
                         )
-                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
+                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10, $11::jsonb,
                                 to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($3, '')))
                         RETURNING id
                     """
@@ -3209,9 +3642,9 @@ async def _create_observation_directly(
                     query = f"""
                         INSERT INTO {fq_table("memory_units")} (
                             id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
-                            tags, event_date, occurred_start, occurred_end, mentioned_at
+                            tags, event_date, occurred_start, occurred_end, mentioned_at, metadata
                         )
-                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10)
+                        VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10, $11::jsonb)
                         RETURNING id
                     """
 
@@ -3227,6 +3660,7 @@ async def _create_observation_directly(
                     obs_occurred_start,
                     obs_occurred_end,
                     obs_mentioned_at,
+                    json.dumps(authority_metadata),
                 )
                 created_id = row["id"]
 
@@ -3258,6 +3692,7 @@ async def _create_observation_directly(
                         occurred_end=obs_occurred_end,
                         mentioned_at=obs_mentioned_at,
                         created_at=now,
+                        metadata=authority_metadata,
                     ),
                 )
                 created_id = observation_id

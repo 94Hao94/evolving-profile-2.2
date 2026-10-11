@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { TagList } from "@/components/ui/tag-list";
 import {
   Copy,
@@ -172,6 +173,7 @@ export function MemoryDetailPanel({
 }: MemoryDetailPanelProps) {
   const t = useTranslations("memoryDetailPanel");
   const tModal = useTranslations("memoryDetailModal");
+  const tCommon = useTranslations("common");
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [modalType, setModalType] = useState<"document" | "chunk" | null>(null);
   const [modalId, setModalId] = useState<string | null>(null);
@@ -180,6 +182,7 @@ export function MemoryDetailPanel({
   const [sourceMemoryModalId, setSourceMemoryModalId] = useState<string | null>(null);
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [curating, setCurating] = useState(false);
+  const [restoredMemoryId, setRestoredMemoryId] = useState<string | null>(null);
   const [askingReason, setAskingReason] = useState(false);
   const [editingText, setEditingText] = useState(false);
   const [savingText, setSavingText] = useState(false);
@@ -233,6 +236,7 @@ export function MemoryDetailPanel({
       setTimeout(() => setCopiedId(null), 2000);
     } catch (err) {
       console.error("Failed to copy:", err);
+      throw err;
     }
   };
 
@@ -253,7 +257,7 @@ export function MemoryDetailPanel({
 
   const handleCurate = async (nextState: "valid" | "invalidated", reason?: string) => {
     const id = displayMemory?.id || displayMemory?.node_id;
-    if (!id || !bankId || curating) return;
+    if (!id || !bankId || curating) return false;
     setCurating(true);
     try {
       await client.updateMemory(id, bankId, {
@@ -262,9 +266,10 @@ export function MemoryDetailPanel({
       });
       const refreshed = await client.getMemory(id, bankId);
       setFullMemory(refreshed);
-      setAskingReason(false);
+      if (nextState === "valid") setRestoredMemoryId(id);
     } catch (err) {
       console.error("Failed to curate memory:", err);
+      throw err;
     } finally {
       setCurating(false);
     }
@@ -274,7 +279,7 @@ export function MemoryDetailPanel({
   // observations server-side; the previous text is kept in history.
   const handleSaveEdit = async (fields: EditMemoryFields) => {
     const id = displayMemory?.id || displayMemory?.node_id;
-    if (!id || !bankId || savingText) return;
+    if (!id || !bankId || savingText) return false;
     setSavingText(true);
     try {
       await client.updateMemory(id, bankId, {
@@ -287,9 +292,9 @@ export function MemoryDetailPanel({
       });
       const refreshed = await client.getMemory(id, bankId);
       setFullMemory(refreshed);
-      setEditingText(false);
     } catch (err) {
       console.error("Failed to edit memory:", err);
+      throw err;
     } finally {
       setSavingText(false);
     }
@@ -374,22 +379,24 @@ export function MemoryDetailPanel({
                     {t("curationActions")}
                   </div>
                   <div className="flex items-center gap-2">
-                    {isInvalidated ? (
+                    {isInvalidated || restoredMemoryId === memoryId ? (
                       <>
-                        <Button
+                        <ActionButton
                           variant="secondary"
                           size="sm"
-                          disabled={curating}
-                          onClick={() => handleCurate("valid")}
+                          resetKey={memoryId}
+                          disabled={curating || !isInvalidated}
+                          onAction={() => handleCurate("valid")}
                         >
                           <RotateCcw className="h-4 w-4 mr-1.5" />
                           {t("curationRevert")}
-                        </Button>
-                        <span className="inline-flex items-center rounded-full bg-muted text-muted-foreground px-2 py-0.5 text-xs font-medium">
+                        </ActionButton>
+                        {isInvalidated && <span className="inline-flex items-center rounded-full bg-muted text-muted-foreground px-2 py-0.5 text-xs font-medium">
                           {t("curationStateInvalidated")}
-                        </span>
+                        </span>}
                       </>
-                    ) : (
+                    ) : null}
+                    {!isInvalidated && (
                       <Button
                         variant="destructive"
                         size="sm"
@@ -525,7 +532,7 @@ export function MemoryDetailPanel({
                             {t("sourceViewButton")}
                           </Button>
                         </div>
-                        <p className="text-sm text-foreground mb-3">{source.text}</p>
+                        <p data-i18n-ignore="true" className="text-sm text-foreground mb-3">{source.text}</p>
                         {source.context && (
                           <p className="text-xs text-muted-foreground mb-3 italic">
                             {t("sourceContextPrefix", { context: source.context })}
@@ -605,18 +612,20 @@ export function MemoryDetailPanel({
                   </div>
                   <div className="flex items-center gap-2">
                     <code className="text-xs font-mono text-muted-foreground">{memoryId}</code>
-                    <Button
+                    <ActionButton
                       variant="ghost"
-                      size="sm"
+                      resetKey={memoryId}
+                      size="icon"
+                      aria-label={tCommon("copy")}
                       className="h-5 w-5 p-0"
-                      onClick={() => copyToClipboard(memoryId)}
+                      onAction={() => copyToClipboard(memoryId)}
                     >
                       {copiedId === memoryId ? (
                         <Check className="h-3 w-3 text-green-600" />
                       ) : (
                         <Copy className="h-3 w-3 text-muted-foreground" />
                       )}
-                    </Button>
+                    </ActionButton>
                   </div>
                 </div>
               )}
@@ -651,7 +660,7 @@ export function MemoryDetailPanel({
           open={askingReason}
           onOpenChange={setAskingReason}
           onConfirm={(reason) => handleCurate("invalidated", reason)}
-          busy={curating}
+          busy={curating || isInvalidated}
         />
       </>
     );
@@ -840,7 +849,7 @@ export function MemoryDetailPanel({
                           {t("sourceViewButton")}
                         </Button>
                       </div>
-                      <p className={`${textSize} mb-1`}>{source.text}</p>
+                      <p data-i18n-ignore="true" className={`${textSize} mb-1`}>{source.text}</p>
                       {source.context && (
                         <p className="text-[10px] text-muted-foreground italic">
                           {t("sourceContextPrefix", { context: source.context })}
@@ -864,11 +873,13 @@ export function MemoryDetailPanel({
                   >
                     {memoryId}
                   </code>
-                  <Button
+                  <ActionButton
                     variant="ghost"
-                    size="sm"
+                    resetKey={memoryId}
+                    size="icon"
+                    aria-label={tCommon("copy")}
                     className={`${compact ? "h-4 w-4" : "h-5 w-5"} p-0`}
-                    onClick={() => copyToClipboard(memoryId)}
+                    onAction={() => copyToClipboard(memoryId)}
                   >
                     {copiedId === memoryId ? (
                       <Check className={`${compact ? "h-2.5 w-2.5" : "h-3 w-3"} text-green-600`} />
@@ -877,7 +888,7 @@ export function MemoryDetailPanel({
                         className={`${compact ? "h-2.5 w-2.5" : "h-3 w-3"} text-muted-foreground`}
                       />
                     )}
-                  </Button>
+                  </ActionButton>
                 </div>
               </div>
             )}

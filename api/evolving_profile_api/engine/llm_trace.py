@@ -105,6 +105,7 @@ class LLMResponseUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
+    finish_reason: str | None = None
 
 
 # Per-call provider usage, set by providers right after a response is received.

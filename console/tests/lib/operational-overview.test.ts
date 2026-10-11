@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildOperationalOverview } from "@/lib/operational-overview";
+import { buildOperationalOverview, classifyOperationalError } from "@/lib/operational-overview";
 
 const now = Date.parse("2026-09-20T12:00:00Z");
 const runtime = {
@@ -9,6 +9,73 @@ const runtime = {
 };
 
 describe("operational overview", () => {
+  it.each([
+    ["6 validation errors for ConsolidationResponse\ndeletes.0.observation_id\n Field required [type=missing, input_value={'id': 'obs-1'}]", "schema_validation"],
+    ["JSONDecodeError: Expecting ',' delimiter", "invalid_json"],
+    ["1 validation error for ConsolidationResponse\nInvalid JSON: EOF while parsing [type=json_invalid]", "invalid_json"],
+    ["finish_reason=length; max_completion_tokens reached", "output_truncated"],
+    ["AuthenticationError: incorrect API key (401)", "authentication"],
+  ])("classifies actual string errors without assigning schema failures to API keys", (error, expected) => {
+    expect(classifyOperationalError(error)).toBe(expected);
+  });
+
+  const evidence = { now, runtime, backupEvents: [], map: { status: "ready", checked_at: "2026-09-20T11:59:00Z" }, operations: { status: "observed" as const, items: [] } };
+  const failed = { id: "fail-1", trace_id: "run-a", scope: "consolidation", operation: "consolidation", status: "error", started_at: "2026-09-20T10:00:00Z", error: "ValidationError: deletes.0.observation_id Field required" };
+  const success = { id: "success-1", trace_id: "run-a", scope: "consolidation", operation: "consolidation", status: "success", started_at: "2026-09-20T11:00:00Z" };
+
+  it("groups failed attempts by trace and class, preserves locators and exact sample coverage", () => {
+    const view = buildOperationalOverview({ ...evidence, llm: { status: "observed", total: 190, groupTotal: 41, items: [failed, { ...failed, id: "fail-2" }, success] } });
+    expect(view.attemptHistory).toHaveLength(1);
+    expect(view.attemptHistory[0]).toMatchObject({ attemptCount: 2, requestIds: ["fail-1", "fail-2"], errorClass: "schema_validation", recovery: "later_attempt_succeeded", traceComplete: false });
+    expect(view.scan.llmFailures).toMatchObject({ returned: 2, total: 190, coverage: "partial" });
+    expect(view.scan.llmFailureGroups.total).toBe(41);
+    expect(view.lanes.find((lane) => lane.id === "model")?.state).toBe("healthy");
+  });
+
+  it("does not recover a trace using unrelated or differently scoped success", () => {
+    const view = buildOperationalOverview({ ...evidence, llm: { status: "observed", items: [failed, { ...success, trace_id: "run-b" }, { ...success, id: "other-scope", scope: "reflect" }] } });
+    expect(view.attemptHistory[0].recovery).toBe("unresolved");
+    expect(view.attemptHistory[0].traceComplete).toBe(false);
+  });
+
+  it("keeps recovery unknown when trace IDs or success evidence are missing", () => {
+    const view = buildOperationalOverview({ ...evidence, llm: { status: "observed", relatedSuccessStatus: "unavailable", items: [{ ...failed, trace_id: null }, success] } });
+    expect(view.attemptHistory[0].recovery).toBe("unknown");
+    expect(view.scan.relatedSuccess.coverage).toBe("unavailable");
+  });
+
+  it("keeps failed and pending source memories visible after an unrelated recent success", () => {
+    const view = buildOperationalOverview({ ...evidence, bankStats: { status: "observed", failed_consolidation: 8, pending_consolidation: 17130, operations_by_status: { processing: 2, pending: 3 } }, llm: { status: "observed", items: [failed, { ...success, trace_id: "run-b" }] } });
+    expect(view.pipeline).toMatchObject({ failedMemories: 8, pendingMemories: 17130, processingOperations: 2, queuedOperations: 3, state: "critical" });
+    expect(view.lanes.find((lane) => lane.id === "retention")?.state).toBe("critical");
+    expect(view.incidents.find((issue) => issue.id === "retention:failed-memories")?.count).toBe(8);
+  });
+  it("summarizes the pending backlog instead of claiming a fresh retain receipt is unverified", () => {
+    const view = buildOperationalOverview({ ...evidence,
+      operations: { status: "observed", items: [{ id: "fresh-retain", task_type: "retain", status: "completed", created_at: "2026-09-20T11:36:00Z" }] },
+      bankStats: { status: "observed", failed_consolidation: 0, pending_consolidation: 20 },
+      llm: { status: "observed", items: [success] },
+    });
+    const lane = view.lanes.find((entry) => entry.id === "retention");
+    expect(lane?.state).toBe("warning");
+    expect(lane?.summary).toBe("待处理 20 条源记忆");
+    expect(lane).toMatchObject({ summaryKey: "pendingMemories", summaryCount: 20 });
+    expect(lane?.detail).toContain("fresh-retain");
+    expect(lane?.summary).not.toContain("未核验");
+  });
+
+  it("does not claim a complete audit when totals or bank statistics are unavailable", () => {
+    const view = buildOperationalOverview({ ...evidence, llm: { status: "observed", items: [failed], total: null }, bankStats: { status: "unavailable" } });
+    expect(view.scan.llmFailures.coverage).toBe("unknown");
+    expect(view.pipeline.state).toBe("unknown");
+    expect(view.sourceCoverage.sourceAudit).toBe("not_performed");
+  });
+  it("keeps raw validation payloads and credentials out of failed operation summaries", () => {
+    const view = buildOperationalOverview({ ...evidence, operations: { status: "observed", items: [{ id: "op-private", task_type: "consolidation", status: "failed", created_at: "2026-09-20T11:00:00Z", error_message: "ValidationError input_value={'text':'PRIVATE SOURCE BODY', 'token':'SECRET'}" }] }, llm: { status: "observed", items: [] } });
+    expect(JSON.stringify(view)).not.toContain("PRIVATE SOURCE BODY");
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    expect(view.incidents.find((issue) => issue.sourceId === "op-private")?.detailKey).toBe("advice.schema_validation");
+  });
   it("shows yesterday's failed backup even when a later backup succeeded", () => {
     const view = buildOperationalOverview({ now, runtime, backupEvents: [
       { at: "2026-09-19T15:00:00Z", status: "failed", code: "backup_exit_1", detail: "数据库导出失败" },

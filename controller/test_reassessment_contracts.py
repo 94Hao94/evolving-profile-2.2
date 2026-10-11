@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, '/tmp/ep-test-user/.hindsight/custom-codex/scripts')
+sys.path.insert(0, '/Users/apple/.hindsight/custom-codex/scripts')
 import recall
 from lib.memory_packet import build_memory_packet
 from fast_bank import FastMemoryBank

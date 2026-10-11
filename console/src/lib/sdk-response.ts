@@ -93,6 +93,9 @@ export function respondWithSdk<T>(
     typeof successStatusOrOptions === "number" ? options : successStatusOrOptions;
 
   if (result.error !== undefined || result.data === undefined) {
+    if (result.error && typeof result.error === "object" && (result.error as Record<string, unknown>).error === "dataplane_endpoint_unavailable") {
+      return NextResponse.json({ error: "dataplane_endpoint_unavailable", code: "dataplane_endpoint_unavailable" }, { status: 503 });
+    }
     const upstreamStatus = result.response?.status ?? DEFAULT_UPSTREAM_STATUS;
     const exposeDetails = upstreamStatus >= 400 && upstreamStatus < 500;
     const details = exposeDetails ? extractErrorDetail(result.error ?? null) : null;

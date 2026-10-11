@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Loader2, RefreshCw } from "lucide-react";
@@ -42,9 +44,15 @@ export function LlmHealthDialog({
   const run = async () => {
     setTesting(true);
     try {
-      setResult(await client.testBankLlm(bankId));
-    } catch {
+      const nextResult = await client.testBankLlm(bankId);
+      setResult(nextResult);
+      const configured = nextResult.operations.filter((operation) => operation.status !== "not_configured");
+      if (!configured.length) return false;
+      const failures = configured.filter((operation) => !operation.ok || operation.status !== "connected");
+      if (failures.length) throw new Error(failures.map((operation) => `${opLabel[operation.operation] ?? operation.operation}: ${statusLabel[operation.status] ?? operation.status}`).join("; "));
+    } catch (error) {
       // Error toast is shown by the API client interceptor.
+      throw error;
     } finally {
       setTesting(false);
     }
@@ -53,7 +61,7 @@ export function LlmHealthDialog({
   // Probe automatically when the dialog opens; reset when it closes.
   useEffect(() => {
     if (open) {
-      run();
+      void run().catch(() => undefined);
     } else {
       setResult(null);
     }
@@ -114,14 +122,14 @@ export function LlmHealthDialog({
         </div>
 
         <DialogFooter>
-          <Button variant="outline" size="sm" onClick={run} disabled={testing} className="gap-1.5">
+          <ActionButton variant="outline" size="sm" onAction={run} disabled={testing} className="gap-1.5">
             {testing ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
               <RefreshCw className="w-3.5 h-3.5" />
             )}
             {testing ? t("testingLlm") : t("llmRetest")}
-          </Button>
+          </ActionButton>
         </DialogFooter>
       </DialogContent>
     </Dialog>

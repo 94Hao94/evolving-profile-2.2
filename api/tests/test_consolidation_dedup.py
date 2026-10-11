@@ -5,6 +5,7 @@ guard the fix in CI — unlike the real-LLM integration test, which only trigger
 the path stochastically.
 """
 
+import json
 import logging
 import types
 import uuid
@@ -108,6 +109,7 @@ class _DedupConn:
         # (keeps every pre-existing test, which never sets these, behaving as before).
         self.current_twin_text = None  # survivor/twin row's current text (create + update folds)
         self.current_updated_text = None  # updated row's current text (update snapshot + fold)
+        self.folded_source_ids = []
         self.fetchval = AsyncMock(side_effect=self._fetchval)
         self.fetch = AsyncMock(side_effect=self._fetch)
         self.fetchrow = AsyncMock(side_effect=self._fetchrow)
@@ -138,10 +140,39 @@ class _DedupConn:
             assert "AND text = $4" in query, "create fold must keep the twin text guard (AND text = $4)"
             if self.current_twin_text is not None and args[3] != self.current_twin_text:
                 return None
+        if self.fetchval_result is not None:
+            incoming = args[5] if "u.text" in query else args[1]
+            self.folded_source_ids = list(dict.fromkeys([*self.folded_source_ids, *incoming]))
         return self.fetchval_result
 
     async def _fetch(self, query, source_ids, bank_id):
         assert self._in_txn, "live-source filter must run inside the fold transaction"
+        if "bank_id = $1 AND id = ANY($2::uuid[])" in query:
+            # Address reads used by the authority refresh are not liveness
+            # filters. Keep the actual FOR SHARE assertion below unchanged.
+            return [
+                {
+                    "id": str(mid),
+                    "text": "source",
+                    "fact_type": "observation" if str(mid) == _TWIN_ID else "experience",
+                    "context": None,
+                    "document_id": None,
+                    "chunk_id": None,
+                    "tags": [],
+                    "metadata": {},
+                    "proof_count": len(self.folded_source_ids),
+                    "event_date": None,
+                    "occurred_start": None,
+                    "occurred_end": None,
+                    "mentioned_at": None,
+                    "created_at": None,
+                    "updated_at": None,
+                    "source_memory_ids": self.folded_source_ids if str(mid) == _TWIN_ID else [],
+                    "observation_scopes": None,
+                    "edited_at": None,
+                }
+                for mid in bank_id
+            ]
         assert "FOR SHARE" in query, "live-source filter must hold FOR SHARE on the source rows"
         if self.live_rows is not None:
             return self.live_rows
@@ -447,10 +478,15 @@ async def test_dedup_update_merge_folds_into_twin_and_deletes_updated() -> None:
     assert fold_args[6] == conn.fetchrow_result["source_memory_ids"]  # only live updated-row sources
     # Then the updated row is deleted: DELETE of the row, and DELETE of its observation_history
     # (no longer cascaded from memory_units — that FK was dropped).
-    assert conn.execute.await_count == 2
-    delete_args = conn.execute.await_args_list[0].args
+    writes = conn.execute.await_args_list
+    authority_writes = [call for call in writes if "SET metadata=" in call.args[0]]
+    assert len(authority_writes) == 1
+    assert json.loads(authority_writes[0].args[3])["independent_user_evidence"] == "false"
+    deletes = [call for call in writes if call.args[0].lstrip().startswith("DELETE")]
+    assert len(deletes) == 2
+    delete_args = deletes[0].args
     assert delete_args[1] == uuid.UUID(_UPDATED_ID)  # the updated row is deleted
-    history_delete_args = conn.execute.await_args_list[1].args
+    history_delete_args = deletes[1].args
     assert history_delete_args[2] == uuid.UUID(_UPDATED_ID)  # its history is reclaimed too
 
 

@@ -1,5 +1,7 @@
 "use client";
 
+import { ActionButton } from "@/components/ui/action-button";
+
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
@@ -116,6 +118,7 @@ const STATUS_FILTER_VALUES = [
 
 export function BankOperationsView() {
   const t = useTranslations("bankOperations");
+  const tAction = useTranslations("actionFeedback");
   const { currentBank } = useBank();
   const [operations, setOperations] = useState<Operation[]>([]);
   const [totalOperations, setTotalOperations] = useState(0);
@@ -312,9 +315,10 @@ export function BankOperationsView() {
     async (
       newStatusFilter: string | null = statusFilter,
       newOffset: number = offset,
-      newTaskTypeFilter: string | null = taskTypeFilter
+      newTaskTypeFilter: string | null = taskTypeFilter,
+      throwOnError = false
     ) => {
-      if (!currentBank) return;
+      if (!currentBank) return false;
 
       setLoading(true);
       try {
@@ -332,6 +336,7 @@ export function BankOperationsView() {
         setNowMs(Date.now());
       } catch (error) {
         console.error("Error loading operations:", error);
+        if (throwOnError) throw error;
       } finally {
         setLoading(false);
       }
@@ -342,7 +347,7 @@ export function BankOperationsView() {
   const handleFilterChange = (newFilter: string | null) => {
     setStatusFilter(newFilter);
     setOffset(0);
-    loadOperations(newFilter, 0, taskTypeFilter);
+    return loadOperations(newFilter, 0, taskTypeFilter, true);
   };
 
   const handleTaskTypeFilterChange = (newTaskType: string | null) => {
@@ -353,11 +358,11 @@ export function BankOperationsView() {
 
   const handlePageChange = (newOffset: number) => {
     setOffset(newOffset);
-    loadOperations(statusFilter, newOffset, taskTypeFilter);
+    return loadOperations(statusFilter, newOffset, taskTypeFilter, true);
   };
 
   const handleCancelOperation = async (operationId: string) => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setCancellingOpId(operationId);
     try {
@@ -365,13 +370,15 @@ export function BankOperationsView() {
       await loadOperations();
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setCancellingOpId(null);
     }
   };
 
   const handleRetryOperation = async (operationId: string) => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setRetryingOpId(operationId);
     try {
@@ -379,13 +386,15 @@ export function BankOperationsView() {
       await loadOperations();
     } catch (error) {
       // Error toast is shown automatically by the API client interceptor
+
+      throw error;
     } finally {
       setRetryingOpId(null);
     }
   };
 
   const handleOperationClick = async (operationId: string) => {
-    if (!currentBank) return;
+    if (!currentBank) return false;
 
     setLoadingDetails(true);
     setDialogOpen(true);
@@ -396,13 +405,15 @@ export function BankOperationsView() {
     } catch (error) {
       console.error("Error loading operation details:", error);
       setSelectedOperation({ error: t("operationDetailsLoadError") });
+
+      throw error;
     } finally {
       setLoadingDetails(false);
     }
   };
 
   const handleLoadRaw = async () => {
-    if (!currentBank || !selectedOperation?.operation_id) return;
+    if (!currentBank || !selectedOperation?.operation_id) return false;
 
     setLoadingPayload(true);
     try {
@@ -414,6 +425,8 @@ export function BankOperationsView() {
       setPayloadLoadedFor(opId);
     } catch (error) {
       console.error("Error loading raw payload:", error);
+
+      throw error;
     } finally {
       setLoadingPayload(false);
     }
@@ -479,8 +492,8 @@ export function BankOperationsView() {
         <div>
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-semibold">{t("title")}</h3>
-            <button
-              onClick={() => loadOperations()}
+            <ActionButton
+              onAction={() => loadOperations(statusFilter, offset, taskTypeFilter, true)}
               className="p-1 rounded hover:bg-muted transition-colors"
               title={t("refreshOperations")}
               disabled={loading}
@@ -488,7 +501,7 @@ export function BankOperationsView() {
               <RefreshCw
                 className={`w-4 h-4 text-muted-foreground hover:text-foreground ${loading ? "animate-spin" : ""}`}
               />
-            </button>
+            </ActionButton>
           </div>
           <p className="text-sm text-muted-foreground">
             {t("operationCount", { count: totalOperations })}
@@ -519,8 +532,9 @@ export function BankOperationsView() {
           <div className="flex gap-1 bg-muted p-1 rounded-lg">
             {STATUS_FILTER_VALUES.map((filter) => (
               <button
+                type="button"
                 key={filter ?? "all"}
-                onClick={() => handleFilterChange(filter)}
+                onClick={() => { void handleFilterChange(filter).catch(() => undefined); }}
                 className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
                   statusFilter === filter
                     ? "bg-background shadow-sm"
@@ -565,7 +579,7 @@ export function BankOperationsView() {
                             ? "bg-red-500/5"
                             : ""
                       }`}
-                      onClick={() => handleOperationClick(op.id)}
+                      onClick={() => { void handleOperationClick(op.id).catch(() => undefined); }}
                     >
                       <TableCell className="font-mono text-xs text-muted-foreground">
                         {op.id.substring(0, 8)}
@@ -583,7 +597,7 @@ export function BankOperationsView() {
                         {op.updated_at ? formatHeartbeat(op.updated_at) : "—"}
                       </TableCell>
                       <TableCell className="w-[300px]">
-                        <div className="flex items-center gap-2 whitespace-nowrap">
+                        <div className="flex items-center gap-2 whitespace-nowrap" onClick={(event) => event.stopPropagation()}>
                           {renderStatusBadge(op.status, op.error_message)}
                           {op.status === "processing" &&
                             renderProgress(op.progress, { compact: true })}
@@ -591,14 +605,11 @@ export function BankOperationsView() {
                       </TableCell>
                       <TableCell className="w-[110px] whitespace-nowrap">
                         {op.status === "pending" && (
-                          <Button
+                          <ActionButton
                             variant="ghost"
                             size="sm"
                             className="h-7 text-xs text-muted-foreground hover:text-red-600 dark:hover:text-red-400"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleCancelOperation(op.id);
-                            }}
+                            onAction={() => handleCancelOperation(op.id)}
                             disabled={cancellingOpId === op.id}
                           >
                             {cancellingOpId === op.id ? (
@@ -607,17 +618,14 @@ export function BankOperationsView() {
                               <X className="w-3 h-3 mr-1" />
                             )}
                             {cancellingOpId === op.id ? "" : t("action.cancel")}
-                          </Button>
+                          </ActionButton>
                         )}
                         {(op.status === "failed" || op.status === "cancelled") && (
-                          <Button
+                          <ActionButton
                             variant="ghost"
                             size="sm"
                             className="h-7 text-xs text-muted-foreground hover:text-blue-600 dark:hover:text-blue-400"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleRetryOperation(op.id);
-                            }}
+                            successLabel={tAction("submitted")} onAction={() => handleRetryOperation(op.id)}
                             disabled={retryingOpId === op.id}
                           >
                             {retryingOpId === op.id ? (
@@ -626,7 +634,7 @@ export function BankOperationsView() {
                               <RotateCcw className="w-3 h-3 mr-1" />
                             )}
                             {retryingOpId === op.id ? "" : t("action.retry")}
-                          </Button>
+                          </ActionButton>
                         )}
                       </TableCell>
                     </TableRow>
@@ -645,22 +653,22 @@ export function BankOperationsView() {
                   })}
                 </p>
                 <div className="flex gap-2">
-                  <Button
+                  <ActionButton
                     variant="outline"
                     size="sm"
-                    onClick={() => handlePageChange(Math.max(0, offset - limit))}
+                    preserveLabel onAction={() => handlePageChange(Math.max(0, offset - limit))}
                     disabled={offset === 0}
                   >
                     {t("paginationPrevious")}
-                  </Button>
-                  <Button
+                  </ActionButton>
+                  <ActionButton
                     variant="outline"
                     size="sm"
-                    onClick={() => handlePageChange(offset + limit)}
+                    preserveLabel onAction={() => handlePageChange(offset + limit)}
                     disabled={offset + limit >= totalOperations}
                   >
                     {t("paginationNext")}
-                  </Button>
+                  </ActionButton>
                 </div>
               </div>
             )}
@@ -779,11 +787,11 @@ export function BankOperationsView() {
                     selectedOperation.status === "cancelled") && (
                     <div className="flex gap-2">
                       {selectedOperation.status === "pending" && (
-                        <Button
+                        <ActionButton
                           variant="outline"
                           size="sm"
                           className="text-xs"
-                          onClick={() => handleCancelOperation(selectedOperation.operation_id)}
+                          onAction={() => handleCancelOperation(selectedOperation.operation_id)}
                           disabled={cancellingOpId === selectedOperation.operation_id}
                         >
                           {cancellingOpId === selectedOperation.operation_id ? (
@@ -792,15 +800,15 @@ export function BankOperationsView() {
                             <X className="w-3 h-3 mr-1" />
                           )}
                           {t("action.cancel")}
-                        </Button>
+                        </ActionButton>
                       )}
                       {(selectedOperation.status === "failed" ||
                         selectedOperation.status === "cancelled") && (
-                        <Button
+                        <ActionButton
                           variant="outline"
                           size="sm"
                           className="text-xs"
-                          onClick={() => handleRetryOperation(selectedOperation.operation_id)}
+                          successLabel={tAction("submitted")} onAction={() => handleRetryOperation(selectedOperation.operation_id)}
                           disabled={retryingOpId === selectedOperation.operation_id}
                         >
                           {retryingOpId === selectedOperation.operation_id ? (
@@ -809,7 +817,7 @@ export function BankOperationsView() {
                             <RotateCcw className="w-3 h-3 mr-1" />
                           )}
                           {t("action.retry")}
-                        </Button>
+                        </ActionButton>
                       )}
                     </div>
                   )}
@@ -889,11 +897,11 @@ export function BankOperationsView() {
                             {t("rawPayload")}
                           </div>
                           {!loadedThisOp && (
-                            <Button
+                            <ActionButton
                               variant="outline"
                               size="sm"
                               className="h-7 text-xs"
-                              onClick={handleLoadRaw}
+                              onAction={handleLoadRaw}
                               disabled={loadingPayload}
                             >
                               {loadingPayload ? (
@@ -902,7 +910,7 @@ export function BankOperationsView() {
                                 <Code className="w-3 h-3 mr-1" />
                               )}
                               {t("loadRaw")}
-                            </Button>
+                            </ActionButton>
                           )}
                         </div>
                         {hasPayload ? (

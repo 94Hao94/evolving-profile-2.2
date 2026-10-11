@@ -8,6 +8,31 @@ from runtime_settings import DEFAULT_SETTINGS, load_runtime_settings, module_ena
 
 
 class RuntimeSettingsTest(unittest.TestCase):
+    def test_missing_relevance_settings_normalize_without_enabling_rag(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "settings.json"
+            path.write_text(json.dumps({"rag": {"enabled": False}, "custom": {"keep": 1}}), encoding="utf-8")
+            value = load_runtime_settings(path)
+        self.assertEqual(value["recall_policy"], {"default_min_relevance": "weak", "user_memory": "inherit", "agent_memory": "inherit", "advanced": {"allow_transferable_methods": True, "allow_background": True, "historical_mode": "reference_only", "scope_unknown_mode": "keep_navigation", "adaptive_enabled": True}})
+        self.assertEqual(value["rag"]["minimum_relevance"], "weak")
+        self.assertFalse(value["rag"]["enabled"])
+        self.assertEqual(value["custom"], {"keep": 1})
+
+    def test_invalid_explicit_relevance_setting_does_not_fall_back_to_weak(self):
+        for override in ({"recall_policy": {"default_min_relevance": "strict"}}, {"recall_policy": []}, {"recall_policy": None}, {"rag": {"minimum_relevance": "inherit"}}, [], {"providers": {"fallbacks": {}}}):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / "settings.json"
+                path.write_text(json.dumps(override), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_runtime_settings(path)
+
+    def test_malformed_settings_file_does_not_silently_broaden_policy(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "settings.json"
+            path.write_text('{"recall_policy":', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_runtime_settings(path)
+
     def test_defaults_keep_ep_modules_on_and_external_rag_off(self):
         with tempfile.TemporaryDirectory() as root, patch("runtime_settings.SETTINGS_PATH", Path(root) / "settings.json"):
             value = load_runtime_settings()
@@ -39,7 +64,8 @@ class RuntimeSettingsTest(unittest.TestCase):
         self.assertFalse(policy["rag_enabled"])
 
     def test_provider_profiles_keep_fallbacks_out_of_ep_module_switches(self):
-        value = load_runtime_settings()
+        with tempfile.TemporaryDirectory() as root:
+            value = load_runtime_settings(Path(root) / "settings.json")
         value["providers"]["fallbacks"] = [{"name": "backup", "api_key": "secret"}]
         self.assertTrue(module_enabled(value, "preferences", "retrieve"))
         self.assertEqual(value["providers"]["fallbacks"][0]["name"], "backup")

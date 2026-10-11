@@ -1,10 +1,14 @@
 """Bounded, read-only Hook discovery. No Controller expansion or foreground LLM."""
 from functools import lru_cache
 import json
+import os
 import re
+import sys
 import time
 import urllib.parse
+from pathlib import Path
 from lib.memory_policy import classify_memory_policy, _instruction_text
+from lib.recall_relevance import apply_relevance_policy, resolve_min_relevance
 from source_safety import mask_text
 
 
@@ -163,7 +167,7 @@ def plan_history(prompt, task=None):
         'context_source':'bounded_task_context' if context else 'current_prompt_only',
         'required_slots':['time_range','activities','completion_state','sources'] if inventory else [],
         'suggested_tools':[] if skip or live_audit else [route] if route != 'agent_decides' else [],
-        'required_ep_tool': None if skip else 'mcp__evolving_profile_controller__get_preference' if route == 'get_preference' else 'mcp__evolving_profile_controller__research' if route == 'research' else 'mcp__evolving_profile_controller__recall' if route == 'recall' else 'mcp__evolving_profile_controller__audit_thread_history' if route == 'live_audit' else None,
+           'required_ep_tool': None if skip else 'mcp__evolving_profile_controller__user_preference' if route == 'get_preference' else 'mcp__evolving_profile_controller__user_research' if route == 'research' else 'mcp__evolving_profile_controller__user_recall' if route == 'recall' else 'mcp__evolving_profile_controller__audit_thread_history' if route == 'live_audit' else None,
         'allow_native_memory': bool(explicit_native_memory),
         'boundary':'routing_hint_not_fact_or_coverage_verdict',
         'focus_terms':focus_terms,
@@ -189,28 +193,52 @@ def count_tokens(text):
     return len(text.encode('utf-8')), 'utf8_bytes_conservative_upper_bound'
 
 
-def run_probe(plan, settings, api, bank):
+def _load_probe_runtime_settings():
+    """Read the same local settings as the tools, without a service call."""
+    guidance = os.environ.get('EVOLVING_PROFILE_GUIDANCE_SRC', str(Path(__file__).resolve().parents[1] / 'guidance'))
+    if guidance not in sys.path:
+        sys.path.insert(0, guidance)
+    from runtime_settings import load_runtime_settings
+    state_root = Path(os.environ.get('EVOLVING_PROFILE_STATE_ROOT', str(Path.home() / '.evolving-profile')))
+    path = Path(os.environ.get('EVOLVING_PROFILE_RUNTIME_SETTINGS', str(state_root / 'config/runtime-settings.json')))
+    return load_runtime_settings(path)
+
+
+def run_probe(plan, settings, api, bank, *, runtime_settings=None):
     """A single direct Bank call; only previews enter the final token budget."""
     limit = max(300,min(1200,int(settings.get('probe_max_tokens',500))))
     from lib.candidate_audit import snapshot, mark_delivery
     receipt = {'actor':'system_probe','state':'skipped','calls':0,'candidate_count':None,
                'returned_count':0,'items':[],'max_tokens':limit,'context_tokens':0,
                'text_returned_count':0,'locator_returned_count':0,'candidate_audit':[],
-               'token_counter':'not_injected','answer_use':'not_measured'}
+               'token_counter':'not_injected','answer_use':'not_measured',
+               'relevance_audit': {'status':'not_run','reason':'retrieval_not_run','level_counts':None,'kept_count':None,'excluded_count':None}}
     if not settings.get('auto_probe',True) or plan['minimum_action'] != 'recall_probe':
         receipt['reason'] = 'disabled' if not settings.get('auto_probe',True) else plan['minimum_action']
         receipt['admission'] = {'mode': plan.get('candidate_policy') or 'not_run', 'admitted_count': 0,
                                 'rejected_count': 0, 'reason': receipt['reason']}
         return '',receipt
     started=time.monotonic()
-    receipt['calls']=1
     try:
+        runtime = runtime_settings if runtime_settings is not None else settings.get('runtime_settings')
+        if runtime is None:
+            runtime = settings if 'recall_policy' in settings else _load_probe_runtime_settings()
+        if not isinstance(runtime, dict):
+            raise ValueError('invalid_probe_runtime_settings')
+        if 'recall_policy' in runtime and not isinstance(runtime['recall_policy'], dict):
+            raise ValueError('invalid_probe_recall_policy')
+        policy = resolve_min_relevance(runtime, 'user_memory')
+        receipt['relevance_audit'].update(policy)
+        if not (runtime.get('routing') or {}).get('ep_enabled', True) or not (((runtime.get('modules') or {}).get('facts') or {}).get('retrieve', True)):
+            receipt['reason'] = 'disabled_by_runtime_settings'
+            return '', receipt
+        receipt['calls']=1
         data=api('/v1/default/banks/'+urllib.parse.quote(bank,safe='')+'/memories/recall',
                  {'query':plan['query'],'budget':'low','max_tokens':limit},timeout=5)
         rows=data.get('results')
         if not isinstance(rows,list):raise ValueError('malformed_recall_response')
         receipt.update(state='returned' if rows else 'empty',candidate_count=len(rows))
-        items=[]; rejected=0
+        items=[]; rejected=0; scoped=[]
         focus_terms=[str(term).casefold() for term in plan.get('focus_terms') or [] if str(term).strip()]
         negative_focus_terms=[str(term).casefold() for term in plan.get('negative_focus_terms') or [] if str(term).strip()]
         required_matches=1 if len(focus_terms)<=1 else 2
@@ -225,12 +253,24 @@ def run_probe(plan, settings, api, bank):
                 rejected += 1
                 receipt['candidate_audit'].append(snapshot(row,outcome='scope_uncertain',reason='insufficient_literal_overlap'))
                 continue
+            scoped.append({**row, 'id':str(row['id']), '_preview_text':text, '_focus_matches':matched_terms[:8]})
+        admitted, relevance_audit = apply_relevance_policy(plan['query'], scoped, policy, main_query=plan['query'])
+        receipt['relevance_audit'] = {**relevance_audit, 'status':'ok', 'audit_scope':'scope_admitted_probe_candidates', 'source_scope_rejected_count':rejected}
+        admitted_by_id = {row['id']:row for row in admitted}
+        for row in scoped:
+            if row['id'] not in admitted_by_id:
+                receipt['candidate_audit'].append(snapshot(row,outcome='relevance_excluded',reason='relevance_below_policy'))
+        for row in admitted:
             if len(items)>=3:
                 receipt['candidate_audit'].append(snapshot(row,outcome='budget_deferred',reason='probe_preview_budget'))
                 continue
-            receipt['candidate_audit'].append(snapshot(row,outcome='prepared',reason='literal_overlap'))
-            items.append({'id':str(row['id']),'text':text,'preview':True,'admission':'positive_anchor_overlap',
-                          'matched_focus_terms':matched_terms[:8]})
+            receipt['candidate_audit'].append(snapshot(row,outcome='prepared',reason='scope_and_relevance_admitted'))
+            items.append({'id':row['id'],'text':row['_preview_text'],'preview':True,'admission':'positive_anchor_overlap',
+                          'matched_focus_terms':row['_focus_matches'], 'relevance_level':row['relevance_level']})
+        if rows and not items:
+            receipt['state'] = 'filtered_empty'
+        discovery_order = {str(row['id']): index for index, row in enumerate(rows) if isinstance(row, dict) and row.get('id')}
+        receipt['candidate_audit'].sort(key=lambda row: discovery_order.get(row['id'], len(rows)))
         receipt['admission'] = {
             'mode': plan.get('candidate_policy') or 'positive_anchor_overlap',
             'focus_terms': focus_terms[:12],
@@ -238,10 +278,12 @@ def run_probe(plan, settings, api, bank):
             'required_match_count':required_matches,
             'admitted_count': len(items),
             'rejected_count': rejected,
+            'relevance_rejected_count':relevance_audit['excluded_count'],
             'reason': '候选必须匹配当前正向实体/主题锚点；多锚点问题至少匹配两个，明确否定的实体不参与准入。',
         }
     except Exception as error:
         items=[];receipt.update(state='unavailable',error_type=type(error).__name__)
+        receipt['relevance_audit'].update(status='unavailable',reason='probe_unavailable',level_counts=None,kept_count=None,excluded_count=None)
     def render(compact=False, rows=None):
         rows = items if rows is None else rows
         admission=receipt.get('admission') or {}
@@ -277,4 +319,5 @@ def run_probe(plan, settings, api, bank):
     receipt.update(items=delivered_items,returned_count=len(delivered_items),context_tokens=count,token_counter=method,
                    text_returned_count=text_count,locator_returned_count=len(delivered_items)-text_count,
                    elapsed_ms=round((time.monotonic()-started)*1000,1),delivery_stage='context_prepared')
+    receipt['relevance_audit']['returned_count'] = len(delivered_items)
     return output,receipt

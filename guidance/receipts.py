@@ -78,7 +78,7 @@ def _json_value(value):
 
 def record_host_tool_response(root: str | Path, host_event: dict) -> dict:
     tool = str(host_event.get("tool_name") or host_event.get("tool") or host_event.get("name") or "")
-    if "get_preference" not in tool:
+    if "user_preference" not in tool and "get_preference" not in tool:
         return {"state": "ignored_non_guidance_tool", "tool_name": tool}
     payload = _json_value(host_event.get("tool_response", host_event.get("tool_result", host_event.get("result"))))
     if not payload:

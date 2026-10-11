@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.evolving-profile.context-worker</string>
+<key>ProgramArguments</key><array>
+<string>/Users/apple/.evolving-profile/runtime/python-3.11/bin/python</string>
+<string>/Users/apple/.evolving-profile/runtime/host-adapter/context-incremental-worker.py</string>
+<string>--state-root</string><string>/Users/apple/.evolving-profile</string>
+<string>--session-root</string><string>/Users/apple/.codex/sessions</string>
+<string>--process</string><string>--max-jobs</string><string>1</string>
+<string>--scan-limit</string><string>128</string>
+<string>--new-after</string><string>2026-10-08T00:00:00Z</string>
+<string>--bank-id</string><string>personal-memory</string>
+</array>
+<key>RunAtLoad</key><true/>
+<key>StartInterval</key><integer>30</integer>
+<key>ProcessType</key><string>Background</string>
+<key>StandardOutPath</key><string>/Users/apple/.evolving-profile/logs/context-worker.log</string>
+<key>StandardErrorPath</key><string>/Users/apple/.evolving-profile/logs/context-worker.error.log</string>
+</dict></plist>

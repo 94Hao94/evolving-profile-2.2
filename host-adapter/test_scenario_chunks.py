@@ -130,7 +130,7 @@ class ScenarioChunksTest(unittest.TestCase):
 
     def test_long_file_locator_does_not_hide_the_following_correction(self):
         data = source()
-        text = '/tmp/ep-test-user/Projects/' + 'long-directory/' * 7 + 'proposal.docx 现在删除GB指标，其他内容保留。'
+        text = '/Users/apple/Projects/' + 'long-directory/' * 7 + 'proposal.docx 现在删除GB指标，其他内容保留。'
         data['messages'][-1]['text'] = text
         result = {'source_revision': 'revision', 'events': [
             {'kind': 'user_goal', 'message_id': 'id1', 'quote': 'A' * 80},

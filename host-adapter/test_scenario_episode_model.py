@@ -1,6 +1,7 @@
 import io
 import json
 import tempfile
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -38,6 +39,19 @@ def response(content):
 
 
 class EpisodeModelTests(unittest.TestCase):
+    def test_same_native_turn_local_user_rows_join_before_model_boundary_classification(self):
+        original = source([('t1','Native prompt context','unused'),('t1','Actual request','Assistant reports reply')])
+        original['messages'] = [row for row in original['messages'] if row['evidence_id'] != 'id2']
+        original['source_revision'] = revision_for_messages(original['messages'])
+        opener,sent = self.fake_opener({'id3':'new_episode'})
+        bundle = request_episode_bundle(original,base_url='https://example.invalid',api_key='test',model='test',opener=opener)
+        self.assertEqual([row['message_ids'] for row in bundle['episodes']],[['id1','id3','id4']])
+        self.assertEqual(bundle['boundary_decisions'],[{'message_id':'id3','decision':'same_episode','method':'same_turn_join'}])
+        self.assertFalse(any(row.get('request_type') == 'episode_boundary_classification' for row in sent))
+        from lib.scenario_episodes import partition_source
+        with self.assertRaisesRegex(ValueError,'scenario_episode_turn_split'):
+            partition_source(original,['id3'])
+
     def test_source_message_id_validation_error_stays_specific_in_cli_receipt(self):
         self.assertEqual(safe_validation_error_code(ValueError("scenario_source_message_ids_invalid")),
                          "scenario_source_message_ids_invalid")
@@ -66,8 +80,7 @@ class EpisodeModelTests(unittest.TestCase):
                                                  "message_ids": [users[0]["message_id"]]},
                                     "goal": {"text": "完成该段任务", "message_ids": [users[0]["message_id"]]},
                                     "phase": "assistant_reported" if assistants else "requested",
-                                    "constraints": [{"text": "保留已确认的项目条件",
-                                                    "message_ids": [users[0]["message_id"]]}],
+                                    "constraints": [],
                                     "corrections": [],
                                     "assistant_reports": ([{"text": "助手报告该段已答复",
                                                              "message_ids": [assistants[-1]["message_id"]]}]
@@ -94,6 +107,39 @@ class EpisodeModelTests(unittest.TestCase):
         self.assertEqual(sent[0]["target_message_ids"], ["id3", "id5"])
         self.assertEqual([row["draft"]["schema"] for row in bundle["episodes"]],
                          ["evolving-profile.scenario-draft.v3"] * 2)
+
+    def test_long_session_uses_size_boundary_even_when_model_keeps_all_topics_together(self):
+        original = source([(f"t{i}", f"同一项目的第{i}轮补充要求", f"第{i}轮已记录")
+                           for i in range(1, 7)])
+        opener, sent = self.fake_opener({})
+        bundle = request_episode_bundle(original, base_url="https://example.invalid", api_key="test",
+                                        model="test-model", opener=opener)
+        self.assertGreaterEqual(len(bundle["episodes"]), 2)
+        self.assertEqual(bundle["episodes"][1]["start_message_id"], "id9")
+        boundary = next(row for row in bundle["boundary_decisions"] if row["message_id"] == "id9")
+        self.assertEqual(boundary["decision"], "new_episode")
+        self.assertEqual(boundary["method"], "deterministic_size_boundary")
+
+    def test_long_session_uses_source_linked_fallback_when_episode_state_model_is_invalid(self):
+        original = source([(f"t{i}", f"同一项目的第{i}轮补充要求", f"第{i}轮已记录")
+                           for i in range(1, 7)])
+        calls = []
+        def invalid_state_opener(request, timeout):
+            payload = json.loads(request.data)
+            calls.append(payload["messages"][0]["content"])
+            if '"state":' in payload["messages"][0]["content"]:
+                raw=payload["messages"][0]["content"].rsplit("输入：", 1)[1].lstrip()
+                envelope,_=json.JSONDecoder().raw_decode(raw)
+                revision=envelope["source_revision"]
+                return response({"source_revision": revision,
+                                 "state": {"constraints": [{"wrong": "shape"}]}})
+            return self.fake_opener({})[0](request, timeout)
+        bundle = request_episode_bundle(original, base_url="https://example.invalid", api_key="test",
+                                        model="test-model", opener=invalid_state_opener)
+        self.assertGreaterEqual(len(bundle["episodes"]), 2)
+        self.assertTrue(all(row["draft"].get("summary_model") == "source-linked-deterministic-fallback"
+                            or row["draft"].get("summary_model") == "test-model"
+                            for row in bundle["episodes"]))
 
     def test_uncertain_boundary_blocks_episode_summaries(self):
         original = source([("t1", "项目甲方案", "已完成"), ("t2", "这件事再细化", "已细化")])

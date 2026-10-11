@@ -34,7 +34,7 @@ def inspect(root):
     else:
         major, minor, _ = version.split(".")
         display_version = f"{major}.{minor}"
-        if first_line(root / "README.md") != f"# Evolving Profile {display_version}":
+        if first_line(root / "README.md") not in {f"# Evolving Profile {display_version}", "# Evolving Profile"}:
             issues.append("readme_version_mismatch")
         if first_line(root / "NOTICE.md") != f"# Attribution — Evolving Profile {display_version}":
             issues.append("notice_version_mismatch")

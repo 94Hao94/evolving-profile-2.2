@@ -9,10 +9,69 @@ from unittest.mock import patch
 
 import pre_tool_use
 import recall
-from memory_turn_check import local_memory_access_guard, observe_tool, register_route
+from memory_turn_check import local_memory_access_guard, observe_tool, register_route, process_memory_route_hint, declare, retrieval_preflight, scenario_completion_gate
 
 
 class PreToolUseMemoryGuardTest(unittest.TestCase):
+    def test_process_route_hint_prefers_agent_recall_for_execution_failures(self):
+        hint = process_memory_route_hint("我过去反复遇到页面修复失败和走弯路，现在请参考Agent过去的执行经验")
+        self.assertTrue(hint["required"])
+        self.assertEqual(hint["primary_tool"], "agent_recall")
+        self.assertEqual(hint["escalation_tool"], "agent_research")
+
+    def test_process_route_hint_escalates_cross_project_patterns_to_agent_research(self):
+        hint = process_memory_route_hint("请比较跨项目重复失败的Agent修复模式，并评估模型迁移泛化")
+        self.assertTrue(hint["required"])
+        self.assertEqual(hint["primary_tool"], "agent_research")
+
+    def test_process_route_hint_does_not_hijack_ordinary_user_history(self):
+        hint = process_memory_route_hint("我以前对备份配置有哪些要求？")
+        self.assertFalse(hint["required"])
+
+    def test_process_prompt_requires_agent_lane_before_user_research(self):
+        with tempfile.TemporaryDirectory() as root:
+            register_route({"invocation_id": "route-process", "session_id": "s-process", "turn_id": "t-process", "raw_prompt": "过去反复遇到页面修复过程，请参考Agent执行经验", "required_ep_tool": "mcp__evolving_profile_controller__user_research"}, root=root)
+            declaration = declare("route-process", "过去反复遇到页面修复过程，请参考Agent执行经验", "required", "需要历史过程经验", root=root)
+            blocked = retrieval_preflight({"tool_name": "mcp__evolving_profile_controller__user_research", "tool_use_id": "research-1", "session_id": "s-process", "turn_id": "t-process", "tool_input": {"check_id": "route-process", "query": "过去页面修复"}}, root=root)
+            self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn("agent_recall", blocked["hookSpecificOutput"]["permissionDecisionReason"])
+            observe_tool({"tool_name": "mcp__evolving_profile_controller__agent_recall", "tool_use_id": "agent-1", "session_id": "s-process", "turn_id": "t-process", "tool_input": {"check_id": "route-process", "query": "过去页面修复"}, "tool_response": {"content": [{"type": "text", "text": "{}"}]}}, root=root)
+            allowed = retrieval_preflight({"tool_name": "mcp__evolving_profile_controller__user_research", "tool_use_id": "research-2", "session_id": "s-process", "turn_id": "t-process", "tool_input": {"check_id": "route-process", "query": "用户历史约束"}}, root=root)
+            self.assertEqual(allowed["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_scenario_followup_gates_source_read_until_scope_is_checked(self):
+        with tempfile.TemporaryDirectory() as root:
+            register_route({"invocation_id": "route-scenario", "session_id": "s-scenario", "turn_id": "t-scenario", "raw_prompt": "比较不同项目过去的Agent修复过程", "required_ep_tool": "mcp__evolving_profile_controller__agent_recall"}, root=root)
+            declare("route-scenario", "比较不同项目过去的Agent修复过程", "required", "需要过程经验", root=root)
+            observe_tool({"tool_name": "mcp__evolving_profile_controller__agent_recall", "tool_use_id": "agent-1", "session_id": "s-scenario", "turn_id": "t-scenario", "tool_input": {"check_id": "route-scenario", "query": "修复过程"}, "tool_response": {"content": [{"type": "text", "text": json.dumps({"scenario_followup": {"required": True, "next_tool": "search_scenario_summary", "scenarios": []}})}]}}, root=root)
+            blocked = retrieval_preflight({"tool_name": "mcp__evolving_profile_controller__read_source", "tool_use_id": "source-1", "session_id": "s-scenario", "turn_id": "t-scenario", "tool_input": {"check_id": "route-scenario", "memory_id": "a"}}, root=root)
+            self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+            scenario = retrieval_preflight({"tool_name": "mcp__evolving_profile_controller__search_scenario_summary", "tool_use_id": "scenario-1", "session_id": "s-scenario", "turn_id": "t-scenario", "tool_input": {"check_id": "route-scenario", "query": "项目范围"}}, root=root)
+            self.assertEqual(scenario["hookSpecificOutput"]["permissionDecision"], "allow")
+            observe_tool({"tool_name": "mcp__evolving_profile_controller__search_scenario_summary", "tool_use_id": "scenario-1", "session_id": "s-scenario", "turn_id": "t-scenario", "tool_input": {"check_id": "route-scenario", "query": "项目范围"}, "tool_response": {"content": [{"type": "text", "text": json.dumps({"source": "scenario_context_index", "items": [{"scenario_id": "s1"}]})}]}}, root=root)
+            allowed = retrieval_preflight({"tool_name": "mcp__evolving_profile_controller__read_source", "tool_use_id": "source-2", "session_id": "s-scenario", "turn_id": "t-scenario", "tool_input": {"check_id": "route-scenario", "memory_id": "a"}}, root=root)
+            self.assertEqual(allowed["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_scenario_completion_gate_blocks_once_then_releases_after_tool(self):
+        with tempfile.TemporaryDirectory() as root:
+            register_route({"invocation_id": "route-stop-scenario", "session_id": "s-stop", "turn_id": "t-stop", "raw_prompt": "比较不同项目的Agent修复过程", "required_ep_tool": "mcp__evolving_profile_controller__agent_recall"}, root=root)
+            declare("route-stop-scenario", "比较不同项目的Agent修复过程", "required", "需要过程经验", root=root)
+            observe_tool({"tool_name": "mcp__evolving_profile_controller__agent_recall", "tool_use_id": "agent-stop", "session_id": "s-stop", "turn_id": "t-stop", "tool_input": {"check_id": "route-stop-scenario", "query": "修复过程"}, "tool_response": {"content": [{"type": "text", "text": json.dumps({"scenario_followup": {"required": True, "next_tool": "search_scenario_summary"}})}]}}, root=root)
+            first = scenario_completion_gate({"session_id": "s-stop", "turn_id": "t-stop"}, enabled=True, root=root)
+            self.assertEqual(first["decision"], "block")
+            second = scenario_completion_gate({"session_id": "s-stop", "turn_id": "t-stop"}, enabled=True, root=root)
+            self.assertEqual(second, {})
+            observe_tool({"tool_name": "mcp__evolving_profile_controller__search_scenario_summary", "tool_use_id": "scenario-stop", "session_id": "s-stop", "turn_id": "t-stop", "tool_input": {"check_id": "route-stop-scenario", "query": "项目范围"}, "tool_response": {"content": [{"type": "text", "text": json.dumps({"source": "scenario_context_index", "items": [{"scenario_id": "s1"}]})}]}}, root=root)
+            self.assertEqual(scenario_completion_gate({"session_id": "s-stop", "turn_id": "t-stop"}, enabled=True, root=root), {})
+
+    def test_agent_process_id_cannot_be_sent_to_user_source_readback(self):
+        with tempfile.TemporaryDirectory() as root:
+            register_route({"invocation_id": "route-readback", "session_id": "s-readback", "turn_id": "t-readback", "raw_prompt": "查看过去的Agent修复经验", "required_ep_tool": "mcp__evolving_profile_controller__agent_recall"}, root=root)
+            declare("route-readback", "查看过去的Agent修复经验", "required", "需要过程经验", root=root)
+            blocked = retrieval_preflight({"tool_name": "mcp__evolving_profile_controller__read_source", "tool_use_id": "source-process", "session_id": "s-readback", "turn_id": "t-readback", "tool_input": {"check_id": "route-readback", "memory_id": "pm_trace_123"}}, root=root)
+            self.assertEqual(blocked["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn("read_agent_process_memory", blocked["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_guard_retries_a_transient_missing_receipt(self):
         calls = []
         def guard(_hook):
@@ -27,7 +86,7 @@ class PreToolUseMemoryGuardTest(unittest.TestCase):
     def test_missing_receipt_reason_is_distinguished_from_policy_block(self):
         with tempfile.TemporaryDirectory() as root:
             hook = {"tool_name": "exec", "session_id": "s", "turn_id": "t",
-                    "tool_input": {"command": "rg x /tmp/ep-test-user/.codex/memories/MEMORY.md"}}
+                    "tool_input": {"command": "rg x /Users/apple/.codex/memories/MEMORY.md"}}
             reason = local_memory_access_guard(hook, root=root)
         self.assertIn("回执暂缺", reason)
 
@@ -38,7 +97,7 @@ class PreToolUseMemoryGuardTest(unittest.TestCase):
             "tool_use_id": "call-1",
             "session_id": "session-1",
             "turn_id": "turn-1",
-            "tool_input": {"command": "rg -n 优优 /tmp/ep-test-user/.codex/memories/MEMORY.md"},
+            "tool_input": {"command": "rg -n 优优 /Users/apple/.codex/memories/MEMORY.md"},
         }
         output = io.StringIO()
         with patch.object(pre_tool_use, "load_config", return_value={}), \
@@ -70,18 +129,18 @@ class PreToolUseMemoryGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             register_route({
                 "invocation_id": "route-1", "session_id": "session-1", "turn_id": "turn-1",
-                "raw_prompt": "我和天津农学院是什么关系？", "required_ep_tool": "mcp__evolving_profile_controller__recall",
+                "raw_prompt": "我和天津农学院是什么关系？", "required_ep_tool": "mcp__evolving_profile_controller__user_recall",
                 "allow_native_memory": False, "recommended_route": "recall",
             }, root=root)
             hook = {
                 "tool_name": "exec", "session_id": "session-1", "turn_id": "turn-1",
-                "tool_input": {"command": "rg 学校 /tmp/ep-test-user/.codex/memories/MEMORY.md"},
+                "tool_input": {"command": "rg 学校 /Users/apple/.codex/memories/MEMORY.md"},
             }
             reason = local_memory_access_guard(hook, root=root)
-            self.assertIn("mcp__evolving_profile_controller__recall", reason)
+            self.assertIn("mcp__evolving_profile_controller__user_recall", reason)
 
             observe_tool({
-                "tool_name": "mcp__evolving_profile_controller__recall", "session_id": "session-1",
+                "tool_name": "mcp__evolving_profile_controller__user_recall", "session_id": "session-1",
                 "turn_id": "turn-1", "tool_use_id": "ep-call-1", "tool_input": {"query": "天津农学院关系"},
                 "tool_response": {"content": [{"type": "text", "text": "{}"}]},
             }, root=root)
@@ -91,15 +150,15 @@ class PreToolUseMemoryGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             register_route({
                 "invocation_id": "route-2", "session_id": "session-1", "turn_id": "turn-2",
-                "raw_prompt": "按我习惯记录的公文格式有哪些？", "required_ep_tool": "mcp__evolving_profile_controller__get_preference",
+                "raw_prompt": "按我习惯记录的公文格式有哪些？", "required_ep_tool": "mcp__evolving_profile_controller__user_preference",
                 "allow_native_memory": False, "recommended_route": "get_preference",
             }, root=root)
             hook = {"tool_name": "exec", "session_id": "session-1", "turn_id": "turn-2",
-                    "tool_input": {"command": "rg 格式 /tmp/ep-test-user/.codex/memories/MEMORY.md"}}
-            observe_tool({"tool_name": "mcp__evolving_profile_controller__recall", "session_id": "session-1",
+                    "tool_input": {"command": "rg 格式 /Users/apple/.codex/memories/MEMORY.md"}}
+            observe_tool({"tool_name": "mcp__evolving_profile_controller__user_recall", "session_id": "session-1",
                           "turn_id": "turn-2", "tool_use_id": "wrong-tool", "tool_response": {"content": []}}, root=root)
-            self.assertIn("get_preference", local_memory_access_guard(hook, root=root))
-            observe_tool({"tool_name": "mcp__evolving_profile_controller__get_preference", "session_id": "session-1",
+            self.assertIn("user_preference", local_memory_access_guard(hook, root=root))
+            observe_tool({"tool_name": "mcp__evolving_profile_controller__user_preference", "session_id": "session-1",
                           "turn_id": "turn-2", "tool_use_id": "right-tool", "tool_response": {"content": [{"type": "text", "text": "{}"}]}}, root=root)
             self.assertIsNone(local_memory_access_guard(hook, root=root))
 
@@ -107,11 +166,11 @@ class PreToolUseMemoryGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             register_route({
                 "invocation_id": "route-3", "session_id": "session-1", "turn_id": "turn-3",
-                "raw_prompt": "请搜索 Codex 原生 Memory 里的内容", "required_ep_tool": "mcp__evolving_profile_controller__recall",
+                "raw_prompt": "请搜索 Codex 原生 Memory 里的内容", "required_ep_tool": "mcp__evolving_profile_controller__user_recall",
                 "allow_native_memory": True, "recommended_route": "recall",
             }, root=root)
             hook = {"tool_name": "exec", "session_id": "session-1", "turn_id": "turn-3",
-                    "tool_input": {"command": "rg 记忆 /tmp/ep-test-user/.codex/memories/MEMORY.md"}}
+                    "tool_input": {"command": "rg 记忆 /Users/apple/.codex/memories/MEMORY.md"}}
             self.assertIsNone(local_memory_access_guard(hook, root=root))
 
     def test_user_prompt_hook_registers_required_ep_tool_before_shell_fallback(self):
@@ -126,9 +185,9 @@ class PreToolUseMemoryGuardTest(unittest.TestCase):
             )
             reason=local_memory_access_guard({
                 'tool_name':'exec','session_id':'session-2','turn_id':'turn-2',
-                'tool_input':{'command':'rg 格式 /tmp/ep-test-user/.codex/memories/MEMORY.md'},
+                'tool_input':{'command':'rg 格式 /Users/apple/.codex/memories/MEMORY.md'},
             },root=root)
-        self.assertIn('get_preference',reason)
+        self.assertIn('user_preference',reason)
 
 
 if __name__ == "__main__":

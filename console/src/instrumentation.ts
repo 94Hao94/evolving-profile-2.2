@@ -3,10 +3,11 @@
  * https://nextjs.org/docs/app/building-your-application/optimizing/instrumentation
  */
 export async function register() {
-  const dataplaneUrl = process.env.EVOLVING_PROFILE_DATAPLANE_API_URL || "http://localhost:8888";
+  if (process.env.NEXT_RUNTIME === "edge") return;
+  const { DATAPLANE_URL: dataplaneUrl } = await import("@/lib/evolving-client");
   const apiKey = process.env.EVOLVING_PROFILE_DATAPLANE_API_KEY || "";
 
-  console.log(`[Control Plane] Connecting to dataplane at: ${dataplaneUrl}`);
+  console.log(dataplaneUrl ? `[Control Plane] Connecting to dataplane at: ${dataplaneUrl}` : "[Control Plane] Dataplane endpoint unconfigured");
   if (apiKey) {
     console.log("[Control Plane] Using API key authentication");
   } else {

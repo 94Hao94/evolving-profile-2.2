@@ -1,21 +1,20 @@
 import { NextResponse } from "next/server";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile, rename, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { homedir } from "node:os";
+import { epStatePath, EP_BACKUP_PLIST, EP_MANAGED_MAC_HOST, EP_RUNTIME_PYTHON } from "@/lib/ep-state-paths";
 
-const EP_ROOT = process.env.EVOLVING_PROFILE_STATE_ROOT ?? path.join(process.env.HOME ?? homedir(), ".evolving-profile");
-const SETTINGS_PATH = path.join(EP_ROOT, "config/backup-settings.json");
-const PLIST_PATH = path.join(process.env.HOME ?? homedir(), "Library/LaunchAgents/com.evolving-profile.backup.plist");
+const SETTINGS_PATH = epStatePath("config/backup-settings.json");
+const PLIST_PATH = EP_BACKUP_PLIST;
 const execFileAsync = promisify(execFile);
 
 const defaults = {
   schema: "evolving-profile.backup-settings.v1",
   enabled: true,
   schedule: { mode: "daily", hour: 3, minute: 25, weekday: 1, day: 1, interval_days: 1 },
-  local: { root: path.join(EP_ROOT, "backups/managed"), retention_days: 14, max_sets: 14, min_successful_sets: 2, auto_cleanup: true, database: true, config: true, capture: true, verify_checksum: true },
+  local: { root: epStatePath("backups/managed"), retention_days: 14, max_sets: 14, min_successful_sets: 2, auto_cleanup: true, database: true, config: true, capture: true, verify_checksum: true },
   cloud: { enabled: true, provider: "WPS mirror", retention_sets: 2, encryption: "AES-256-CBC + PBKDF2-SHA256" },
 };
 
@@ -54,7 +53,14 @@ export async function POST(request: Request) {
     const settings = { ...defaults, ...incoming, schedule: { ...defaults.schedule, ...incoming.schedule }, local: { ...defaults.local, ...incoming.local }, cloud: { ...defaults.cloud, ...incoming.cloud }, updated_at: new Date().toISOString() };
     validate(settings);
     await mkdir(path.dirname(SETTINGS_PATH), { recursive: true });
-    await writeFile(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", { mode: 0o600 });
+    const temporary = `${SETTINGS_PATH}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, JSON.stringify(settings, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+      await rename(temporary, SETTINGS_PATH);
+    } finally { await unlink(temporary).catch(() => undefined); }
+    if (!EP_MANAGED_MAC_HOST || !await access(PLIST_PATH).then(() => true).catch(() => false) || !await access(EP_RUNTIME_PYTHON).then(() => true).catch(() => false)) {
+      return NextResponse.json({ ...settings, saved: true, applied: false, apply_status: "unsupported", message: "Backup policy saved. Scheduling is unavailable until a service manager is installed for this installation." });
+    }
     const plistUpdater = [
       "import json, os, plistlib, sys, uuid",
       "from pathlib import Path",
@@ -72,10 +78,14 @@ export async function POST(request: Request) {
       "temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')",
       "temporary.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_XML, sort_keys=False)); os.chmod(temporary, 0o600); os.replace(temporary,path)",
     ].join("\n");
-    await execFileAsync(process.env.EP_RUNTIME_PYTHON ?? "python3", ["-c", plistUpdater, PLIST_PATH, JSON.stringify(settings)], { timeout: 10000 });
-    await execFileAsync("launchctl", ["bootout", `gui/${process.getuid?.() ?? 501}/com.evolving-profile.backup`]).catch(() => undefined);
-    if (settings.enabled) await execFileAsync("launchctl", ["bootstrap", `gui/${process.getuid?.() ?? 501}`, PLIST_PATH]);
-    return NextResponse.json({ ...settings, applied: true });
+    try {
+      await execFileAsync(EP_RUNTIME_PYTHON, ["-c", plistUpdater, PLIST_PATH, JSON.stringify(settings)], { timeout: 10000 });
+      await execFileAsync("launchctl", ["bootout", `gui/${process.getuid?.() ?? 501}/com.evolving-profile.backup`]).catch(() => undefined);
+      if (settings.enabled) await execFileAsync("launchctl", ["bootstrap", `gui/${process.getuid?.() ?? 501}`, PLIST_PATH]);
+    } catch {
+      return NextResponse.json({ ...settings, saved: true, applied: false, apply_status: "failed", message: "Backup policy saved, but its service schedule could not be applied. Check this installation's service manager." });
+    }
+    return NextResponse.json({ ...settings, saved: true, applied: true });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : "backup_settings_failed" }, { status: 400 });
   }

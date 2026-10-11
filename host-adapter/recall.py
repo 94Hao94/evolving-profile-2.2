@@ -298,9 +298,15 @@ def qwen_full_prompt_fallback(prompt: str, messages: list[dict], *, timeout_ms: 
 
 
 def _with_entry_guidance(context: str = "") -> str:
-    if not ENTRY_GUIDANCE_CONTEXT:
-        return str(context or "")
-    return ENTRY_GUIDANCE_CONTEXT + ("\n" + str(context or "") if context else "")
+    combined = ENTRY_GUIDANCE_CONTEXT + ("\n" + str(context or "") if ENTRY_GUIDANCE_CONTEXT and context else str(context or ""))
+    # Bind before lengthy instructions/candidates can be truncated by a host.
+    match = re.search(r'<evolving_profile_memory_route[^>]*check_id="([a-f0-9]{32})"', combined)
+    if match:
+        return ('<ep_prompt_binding check_id="' + match.group(1) + '">'
+                'Use this ID for every EP tool call and follow-up read in this Prompt, not a later Prompt. '
+                'Candidate return, original-source readback and verified outcome are separate.'
+                '</ep_prompt_binding>\n' + combined)
+    return combined
 
 
 def emit_hook_output(context: str = "") -> None:
@@ -605,7 +611,7 @@ def is_shadow_replay() -> bool:
 
 
 SHADOW_REPLAY_FIXTURE_ROOT = Path(HAM_SOURCE_ROOT) / "tests" / "fixtures" / "hindsight-replay"
-LEGACY_SHADOW_REPLAY_FIXTURE_ROOT = Path(os.environ.get("EVOLVING_PROFILE_LEGACY_FIXTURE_ROOT", str(Path.home() / ".evolving-profile/fixtures/hindsight-replay")))
+LEGACY_SHADOW_REPLAY_FIXTURE_ROOT = Path("/Users/apple/Documents/Codex/2026-07-11/ag/hindsight-memory-os/tests/fixtures/hindsight-replay")
 
 
 def allow_shadow_fixture_transcript(transcript_path: str) -> bool:
@@ -1396,7 +1402,7 @@ def append_recall_audit(config: dict, payload: dict) -> None:
         pass
 
 
-def record_prompt_ingress(config: dict, prompt: str, session_id: str, cwd: str, *, turn_id=None, hook_invocation_id=None, prompt_origin="user_direct") -> None:
+def record_prompt_ingress(config: dict, prompt: str, session_id: str, cwd: str, *, turn_id=None, hook_invocation_id=None, prompt_origin="user_direct", transcript_path=None, model=None, model_provider=None) -> None:
     """Append a local, model-free receipt before any recall branch can return.
 
     The receipt is deliberately separate from a Controller trace: it proves that
@@ -1417,6 +1423,10 @@ def record_prompt_ingress(config: dict, prompt: str, session_id: str, cwd: str, 
             "turn_id": turn_id,
             "hook_invocation_id": hook_invocation_id,
             "host_id": "codex",
+            "cwd": str(cwd or ''),
+            "transcript_path": str(transcript_path) if transcript_path else None,
+            "model": str(model) if model else None,
+            "model_provider": str(model_provider) if model_provider else None,
             "prompt_origin": prompt_origin,
             "project_key": hashlib.sha256(str(cwd or "").encode("utf-8")).hexdigest()[:16] if cwd else "",
             "prompt_preview": normalized[:600],
@@ -1476,11 +1486,11 @@ def format_memory_route_context(value: dict) -> str:
              'catalog_status':probe.get('status'),'catalog_coverage':probe.get('catalog_coverage'),'matched_entities':entities,'catalog_hints':hints,'agent_may_override':True,
              'catalog_miss_does_not_prove_bank_absence':True}
     route_instruction = (
-        "单点历史问题必须实际调用 EP Recall；若为空、主体不匹配或时间/范围不足，升级一次 Research。"
+        "单点历史问题必须实际调用 user_recall；若为空、主体不匹配或时间/范围不足，升级一次 user_research。"
         if route == "recall" else
-        "这是开放盘点或多实体时间线，必须实际调用 EP Research，并继续分页或回读原文。"
+        "这是开放盘点或多实体时间线，必须实际调用 user_research，并继续分页或回读原文。"
         if route == "research" else
-        "这是对用户已记录偏好、格式或协作习惯的询问；必须实际调用 Get Preference，并按返回的适用条件和例外回答。"
+        "这是对用户已记录偏好、格式或协作习惯的询问；必须实际调用 user_preference，并按返回的适用条件和例外回答。"
         if route == "get_preference" else
         "这是实时链路审计，优先调用 audit_thread_history（若当前宿主已挂载）并读取 Hook 回执和 MCP 活动记录，不查询普通历史 Bank。"
         if route == "live_audit" else
@@ -2348,7 +2358,7 @@ def filter_timeline_evidence(query: str, results: list[dict]) -> tuple[list[dict
     )
     narrative_prefixes = (
         "助手解释", "助理解释", "助手建议", "助理建议", "助手澄清", "助理澄清", "回答用户",
-        "User询问", "User请求", "用户询问", "用户要求", "用户希望", "用户提出", "用户指出",
+        "示例用户询问", "示例用户请求", "用户询问", "用户要求", "用户希望", "用户提出", "用户指出",
         "用户认为", "用户担忧", "用户偏好", "用户决定", "用户设定", "对用户当前场景的判断", "当前问题",
     )
     realization_terms = ("已完成", "完成", "已实现", "实现", "已上线", "上线", "已启用", "启用", "已生效", "生效", "正式启用", "正式切换", "生产切换", "生产运行", "已切换", "切换成功", "部署完成", "验证通过", "测试通过", "落地", "运行中")
@@ -2405,7 +2415,7 @@ def filter_question_echo_evidence(query: str, results: list[dict]) -> tuple[list
         return list(results or []), []
     narrative_prefixes = (
         "用户询问", "用户提问", "用户问题", "用户请求", "用户要求", "用户希望",
-        "User询问", "User提问", "User请求", "User要求", "当前问题",
+        "示例用户询问", "示例用户提问", "示例用户请求", "示例用户要求", "当前问题",
     )
     # Do not use generic words such as "解决" or "验证" here: a historical
     # *question* can ask for a solution or verification and would then evade
@@ -2415,7 +2425,7 @@ def filter_question_echo_evidence(query: str, results: list[dict]) -> tuple[list
         "当前运行态", "当前正式架构运行态", "独立公司", "独立主体", "不是同一实体",
         "版本为", "版本号", "故障已修复", "修复已完成",
     )
-    # A historical user-led sentence can start with “用户要求/User要求”
+    # A historical user-led sentence can start with “用户要求/示例用户要求”
     # and still contain a durable rule rather than merely echoing a question.
     # These governance markers describe an ordering, prohibition, scope or
     # expiry condition that independently answers the current request.  The
@@ -2676,7 +2686,8 @@ def main():
     # trace coverage can be audited without treating a skipped recall as bad.
     capture_hook_cassette(config, hook_input, raw_prompt, prompt)
     if not is_shadow_replay():
-        record_prompt_ingress(config, prompt, session_id, str(hook_input.get("cwd") or ""),turn_id=hook_input.get('turn_id'),hook_invocation_id=hook_invocation_id,prompt_origin=prompt_origin)
+        record_prompt_ingress(config, prompt, session_id, str(hook_input.get("cwd") or ""),turn_id=hook_input.get('turn_id'),hook_invocation_id=hook_invocation_id,prompt_origin=prompt_origin,
+                              transcript_path=hook_input.get('transcript_path'), model=hook_input.get('model'),model_provider=hook_input.get('model_provider'))
         route_probe=record_memory_route_probe(hook_input, prompt, config, hook_invocation_id)
         ENTRY_GUIDANCE_CONTEXT += '\n'+format_memory_route_context(route_probe)
         reconcile_native_context_async(hook_input)

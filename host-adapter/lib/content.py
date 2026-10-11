@@ -24,7 +24,9 @@ import json
 import hashlib
 import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from pathlib import PureWindowsPath
 
 # Maximum length for tool output content in JSON format.
 _MAX_TOOL_OUTPUT_CHARS = 2000
@@ -73,7 +75,7 @@ _USER_REQUEST_MARKER = re.compile(
 )
 
 
-def extract_user_request(content: str) -> str:
+def extract_user_request(content: str, *, structural_context_only: bool = False) -> str:
     """Return only the user-authored request from a Codex prompt envelope.
 
     Codex can prepend attachment manifests and ambient UI blocks to the actual
@@ -81,7 +83,7 @@ def extract_user_request(content: str) -> str:
     input, but must not become the semantic recall query or the trace title.
     """
     value = strip_memory_tags(str(content or ""))
-    value = strip_ambient_context(value)
+    value = _strip_leading_task_metadata(value) if structural_context_only else strip_ambient_context(value)
     matches = list(_USER_REQUEST_MARKER.finditer(value))
     if matches:
         value = value[matches[-1].end() :]
@@ -98,6 +100,107 @@ def extract_user_request(content: str) -> str:
         value,
     )
     return value.strip()
+
+
+def _native_environment_shape(element) -> bool:
+    def whitespace(value):
+        return not str(value or '').strip()
+
+    def container(node, allowed):
+        children = list(node)
+        return (not node.attrib and whitespace(node.text) and bool(children)
+                and len({child.tag for child in children}) == len(children)
+                and all(child.tag in allowed and whitespace(child.tail) for child in children))
+
+    def leaf(node):
+        return not node.attrib and not list(node) and bool(str(node.text or '').strip())
+
+    def absolute_path(node):
+        value = str(node.text or '').strip()
+        return leaf(node) and '\x00' not in value and '\n' not in value and (os.path.isabs(value) or PureWindowsPath(value).is_absolute())
+
+    if not container(element, {'cwd', 'shell', 'current_date', 'timezone', 'filesystem'}):
+        return False
+    for child in element:
+        value = str(child.text or '').strip()
+        if child.tag == 'cwd' and not absolute_path(child):
+            return False
+        if child.tag == 'shell' and (not leaf(child) or value not in {'zsh', 'bash', 'sh', 'fish', 'pwsh', 'powershell', '/bin/zsh', '/bin/bash', '/bin/sh', '/usr/bin/fish'}):
+            return False
+        if child.tag == 'current_date':
+            if not leaf(child) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+                return False
+            try:
+                datetime.strptime(value, '%Y-%m-%d')
+            except ValueError:
+                return False
+        if child.tag == 'timezone' and (not leaf(child) or not re.fullmatch(r'(?:UTC|GMT|[A-Za-z_+-]+(?:/[A-Za-z0-9_+-]+){1,2})', value)):
+            return False
+        if child.tag == 'filesystem':
+            if not container(child, {'workspace_roots', 'permission_profile'}):
+                return False
+            for group in child:
+                if group.tag == 'workspace_roots':
+                    if group.attrib or not whitespace(group.text) or not list(group) or any(root.tag != 'root' or not whitespace(root.tail) or not absolute_path(root) for root in group):
+                        return False
+                else:
+                    # This is the actual native disabled/unrestricted profile.
+                    # Unknown permission schemas remain text until understood.
+                    entries = list(group)
+                    if group.attrib != {'type': 'disabled'} or not whitespace(group.text) or len(entries) != 1:
+                        return False
+                    entry = entries[0]
+                    if entry.tag != 'file_system' or entry.attrib != {'type': 'unrestricted'} or list(entry) or not whitespace(entry.text) or not whitespace(entry.tail):
+                        return False
+    return True
+
+
+def _strip_leading_task_metadata(content: str) -> str:
+    """Only complete, leading native envelopes can be ambient task metadata.
+
+    A quoted/fenced example, malformed envelope, or unknown schema stays user
+    content. This is task projection only; the historical/source/Origin query
+    normalization contract continues using extract_user_request's default.
+    """
+    value = str(content or '')
+    # Only schemas confirmed by native examples are eligible. A tag name or
+    # arbitrary JSON object cannot prove that its content is non-semantic.
+    tags = ('external_codex_apps_open_page', 'environment_context')
+    pattern = r'^\s*<(' + '|'.join(re.escape(tag) for tag in tags) + r')>(.*?)</\1>'
+    while (match := re.match(pattern, value, re.S)):
+        tag, body = match.group(1), match.group(2)
+        recognized = False
+        if tag == 'external_codex_apps_open_page':
+            try:
+                def unique_keys(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError('duplicate_native_context_key')
+                        result[key] = value
+                    return result
+                payload = json.loads(body, object_pairs_hook=unique_keys)
+                recognized = isinstance(payload, dict) and set(payload) == {'page_id'} and (payload['page_id'] is None or
+                    (isinstance(payload['page_id'], str) and bool(re.fullmatch(r'[A-Za-z0-9:_-]+', payload['page_id']))))
+            except (ValueError, TypeError):
+                pass
+        elif tag == 'environment_context':
+            try:
+                if '<!' in body or '<?' in body:
+                    break  # Comments/declarations may contain semantic text.
+                element = ET.fromstring(match.group(0).strip())
+                recognized = _native_environment_shape(element)
+            except ET.ParseError:
+                pass
+        if not recognized:
+            break
+        value = value[match.end():]
+    return value.strip()
+
+
+def extract_task_user_request(content: str) -> str:
+    """Semantic task text, with native metadata excluded at a structural seam."""
+    return extract_user_request(content, structural_context_only=True)
 
 
 def is_synthetic_codex_user_message(content: str) -> bool:
